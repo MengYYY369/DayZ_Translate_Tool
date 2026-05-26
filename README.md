@@ -31,6 +31,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 脚本优先使用 `.venv\Scripts\python.exe`，没有虚拟环境时回退到 PATH 里的 `python`。打包产物输出到 `release\DayZTranslateTool.exe`。
 
+`build.ps1` 会先检查当前 Python 是否能正常初始化 `tkinter` 和 Tcl/Tk。检查失败时不会继续打包，因为 PyInstaller 会排除 `tkinter` 并生成启动即崩溃的 EXE。遇到这种情况，请用完整安装且勾选 Tcl/Tk 的 Python 重新创建 `.venv`。
+
 ## 测试
 
 ```powershell

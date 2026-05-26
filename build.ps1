@@ -11,17 +11,26 @@ if (-not (Test-Path -LiteralPath $ReleaseDir)) {
     New-Item -ItemType Directory -Path $ReleaseDir | Out-Null
 }
 
-& $Python -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --onefile `
-    --name DayZTranslateTool `
-    --windowed `
-    --distpath $ReleaseDir `
-    --workpath $BuildDir `
-    --specpath $Root `
-    --add-data "stringtable.csv;." `
+& $Python -m dayz_translate_tool.build_checks
+if ($LASTEXITCODE -ne 0) {
+    throw "Current Python cannot package a ttkbootstrap/Tkinter app. Recreate .venv with a full Python installation that includes Tcl/Tk, then run build.ps1 again."
+}
+
+$PyInstallerArgs = @(
+    "-m", "PyInstaller",
+    "--noconfirm",
+    "--clean",
+    "--onefile",
+    "--name", "DayZTranslateTool",
+    "--windowed",
+    "--distpath", $ReleaseDir,
+    "--workpath", $BuildDir,
+    "--specpath", $Root,
+    "--add-data", "stringtable.csv;.",
     "main.py"
+)
+
+& $Python @PyInstallerArgs
 
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed with exit code $LASTEXITCODE"
