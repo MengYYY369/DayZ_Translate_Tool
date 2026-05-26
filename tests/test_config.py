@@ -18,7 +18,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_opencode_model_settings_round_trip(self):
         config = AppConfig(
-            opencode_attach_url="http://127.0.0.1:31319",
+            opencode_port=31319,
             opencode_model="opencode-go/deepseek-v4-flash",
             opencode_models=["opencode-go/deepseek-v4-flash"],
         )
@@ -28,7 +28,7 @@ class ConfigTests(unittest.TestCase):
             save_config(config, path)
             loaded = load_config(path)
 
-        self.assertEqual("http://127.0.0.1:31319", loaded.opencode_attach_url)
+        self.assertEqual(31319, loaded.opencode_port)
         self.assertEqual("opencode-go/deepseek-v4-flash", loaded.opencode_model)
         self.assertEqual(["opencode-go/deepseek-v4-flash"], loaded.opencode_models)
 

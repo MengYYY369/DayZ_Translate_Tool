@@ -90,7 +90,7 @@ class DayZTranslateApp(ttk.Window):
         self.model_var = tk.StringVar(value=self.config_data.model)
         self.opencode_path_var = tk.StringVar(value=self.config_data.opencode_path)
         self.opencode_args_var = tk.StringVar(value=self.config_data.opencode_args)
-        self.opencode_attach_url_var = tk.StringVar(value=self.config_data.opencode_attach_url)
+        self.opencode_port_var = tk.IntVar(value=self.config_data.opencode_port)
         self.opencode_model_var = tk.StringVar(value=self.config_data.opencode_model)
         self.autosave_var = tk.IntVar(value=self.config_data.autosave_every)
         self.max_workers_var = tk.IntVar(value=self.config_data.max_workers)
@@ -120,8 +120,8 @@ class DayZTranslateApp(ttk.Window):
         ttk.Label(opencode, text="程序").grid(row=0, column=0, sticky="w")
         ttk.Entry(opencode, textvariable=self.opencode_path_var).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(opencode, text="选择程序", command=self.choose_opencode_program, bootstyle="secondary").grid(row=0, column=2, padx=4)
-        ttk.Label(opencode, text="服务 URL").grid(row=0, column=3, sticky="w")
-        ttk.Entry(opencode, textvariable=self.opencode_attach_url_var).grid(row=0, column=4, sticky="ew", padx=6)
+        ttk.Label(opencode, text="本地端口").grid(row=0, column=3, sticky="w")
+        ttk.Spinbox(opencode, from_=1, to=65535, textvariable=self.opencode_port_var, width=10).grid(row=0, column=4, sticky="w", padx=6)
         ttk.Label(opencode, text="模型").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.opencode_model_combo = ttk.Combobox(opencode, textvariable=self.opencode_model_var, values=self.config_data.opencode_models, state="normal")
         self.opencode_model_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
@@ -445,7 +445,7 @@ class DayZTranslateApp(ttk.Window):
                 executable_path=self.opencode_path_var.get(),
                 extra_args=self.opencode_args_var.get(),
                 timeout_seconds=int(self.config_data.timeout_seconds),
-                attach_url=self.opencode_attach_url_var.get(),
+                port=max(1, int(self.opencode_port_var.get())),
                 model=self.opencode_model_var.get(),
             )
         return OpenAICompatibleTranslator(
@@ -548,7 +548,7 @@ class DayZTranslateApp(ttk.Window):
         self.config_data.model = self.model_var.get()
         self.config_data.opencode_path = self.opencode_path_var.get()
         self.config_data.opencode_args = self.opencode_args_var.get()
-        self.config_data.opencode_attach_url = self.opencode_attach_url_var.get()
+        self.config_data.opencode_port = max(1, int(self.opencode_port_var.get()))
         self.config_data.opencode_model = self.opencode_model_var.get()
         self.config_data.autosave_every = max(1, int(self.autosave_var.get()))
         self.config_data.max_workers = max(1, int(self.max_workers_var.get()))

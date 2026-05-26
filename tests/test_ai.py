@@ -133,7 +133,7 @@ class AITests(unittest.TestCase):
         self.assertIn("源文本: Hello", command[-1])
         self.assertEqual("", run.call_args.kwargs["input"])
 
-    def test_opencode_translator_attaches_to_running_server_and_uses_selected_model(self):
+    def test_opencode_translator_uses_local_port_and_selected_model_without_attach(self):
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="译文\n", stderr="")
         request = TranslationRequest(
             key="STR_A",
@@ -145,14 +145,15 @@ class AITests(unittest.TestCase):
         with patch("dayz_translate_tool.ai.subprocess.run", return_value=completed) as run:
             OpencodeCliTranslator(
                 "opencode",
-                attach_url="http://127.0.0.1:31319",
+                port=31319,
                 model="opencode-go/deepseek-v4-flash",
             ).translate(request)
 
         command = run.call_args.args[0]
         self.assertEqual("run", command[1])
-        self.assertIn("--attach", command)
-        self.assertIn("http://127.0.0.1:31319", command)
+        self.assertNotIn("--attach", command)
+        self.assertIn("--port", command)
+        self.assertIn("31319", command)
         self.assertIn("--model", command)
         self.assertIn("opencode-go/deepseek-v4-flash", command)
 

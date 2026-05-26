@@ -214,34 +214,36 @@ class OpenAICompatibleTranslator(AITranslator):
 
 
 class OpencodeCliTranslator(AITranslator):
-    def __init__(self, executable_path: str, extra_args: str = "", timeout_seconds: int = 120, attach_url: str = "", model: str = ""):
+    def __init__(self, executable_path: str, extra_args: str = "", timeout_seconds: int = 120, port: int = 0, model: str = ""):
         self.executable_path = executable_path.strip()
         self.extra_args = extra_args.strip()
         self.timeout_seconds = timeout_seconds
-        self.attach_url = attach_url.strip()
+        self.port = max(0, int(port))
         self.model = model.strip()
+        self._lock = threading.Lock()
 
     def translate(self, request: TranslationRequest) -> str:
         if not self.executable_path:
             raise ValueError("缺少 Opencode 可执行文件路径")
         command = [self.executable_path, "run"]
-        if self.attach_url:
-            command.extend(["--attach", self.attach_url])
+        if self.port:
+            command.extend(["--port", str(self.port)])
         if self.model:
             command.extend(["--model", self.model])
         if self.extra_args:
             command.extend(shlex.split(self.extra_args, posix=False))
         prompt = build_translation_prompt(request)
         command.append(prompt)
-        completed = subprocess.run(
-            command,
-            input="",
-            text=True,
-            capture_output=True,
-            timeout=self.timeout_seconds,
-            check=False,
-            **hidden_subprocess_kwargs(),
-        )
+        with self._lock:
+            completed = subprocess.run(
+                command,
+                input="",
+                text=True,
+                capture_output=True,
+                timeout=self.timeout_seconds,
+                check=False,
+                **hidden_subprocess_kwargs(),
+            )
         if completed.returncode != 0:
             stderr = clean_process_error(completed.stderr)
             raise RuntimeError(f"Opencode 退出码 {completed.returncode}: {stderr}")
