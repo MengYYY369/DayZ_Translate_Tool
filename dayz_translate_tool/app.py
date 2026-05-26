@@ -25,9 +25,28 @@ class DayZTranslateApp(ttk.Window):
         self.current_path: Path | None = None
         self.dirty = False
         self.column_ids: list[str] = []
+        self.target_vars: dict[str, tk.BooleanVar] = {}
         self.edit_entry: tk.Entry | None = None
+        self._configure_styles()
         self._build_ui()
         self._load_default_csv()
+
+    def _configure_styles(self) -> None:
+        self.style.configure(
+            "Grid.Treeview",
+            rowheight=30,
+            borderwidth=1,
+            relief="solid",
+            fieldbackground="#ffffff",
+            background="#ffffff",
+        )
+        self.style.configure(
+            "Grid.Treeview.Heading",
+            borderwidth=1,
+            relief="solid",
+            padding=(8, 7),
+            font=("Segoe UI", 9, "bold"),
+        )
 
     def _build_ui(self) -> None:
         self._build_header()
@@ -117,8 +136,10 @@ class DayZTranslateApp(ttk.Window):
         self.source_combo = ttk.Combobox(frame, textvariable=self.source_var, width=18, state="readonly")
         self.source_combo.pack(side=LEFT, padx=4)
         ttk.Label(frame, text="目标语言可多选").pack(side=LEFT, padx=(10, 0))
-        self.target_listbox = tk.Listbox(frame, selectmode=tk.MULTIPLE, height=4, exportselection=False, width=42)
-        self.target_listbox.pack(side=LEFT, padx=4)
+        target_panel = ttk.Frame(frame, padding=(8, 4), borderwidth=1, relief="solid")
+        target_panel.pack(side=LEFT, fill=X, expand=True, padx=6)
+        self.target_checks_frame = ttk.Frame(target_panel)
+        self.target_checks_frame.pack(fill=X)
         ttk.Button(frame, text="全选目标", command=self.select_all_targets, bootstyle="secondary").pack(side=LEFT, padx=4)
         self.translate_selected_button = ttk.Button(frame, text="翻译选中行", command=self.translate_selected_rows, bootstyle="primary")
         self.translate_selected_button.pack(side=LEFT, padx=4)
@@ -126,12 +147,14 @@ class DayZTranslateApp(ttk.Window):
         self.translate_all_button.pack(side=LEFT, padx=4)
 
     def _build_table(self, parent) -> None:
-        frame = ttk.Frame(parent)
+        frame = ttk.Frame(parent, borderwidth=1, relief="solid")
         frame.pack(fill=BOTH, expand=True)
-        self.tree = ttk.Treeview(frame, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(frame, show="headings", selectmode="extended", style="Grid.Treeview")
         yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         xscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.tree.tag_configure("odd", background="#f7f9fc")
+        self.tree.tag_configure("even", background="#ffffff")
         self.tree.pack(side=LEFT, fill=BOTH, expand=True)
         yscroll.pack(side=RIGHT, fill=Y)
         xscroll.pack(side="bottom", fill=X)
@@ -222,10 +245,11 @@ class DayZTranslateApp(ttk.Window):
         self._start_translation([row_index])
 
     def select_all_targets(self) -> None:
-        self.target_listbox.select_set(0, END)
+        for column, variable in self.target_vars.items():
+            variable.set(column != self.source_var.get())
 
     def _selected_target_columns(self) -> list[str]:
-        return [self.target_listbox.get(index) for index in self.target_listbox.curselection()]
+        return [column for column, variable in self.target_vars.items() if variable.get()]
 
     def _start_translation(self, indices) -> None:
         if not self.table:
@@ -324,18 +348,26 @@ class DayZTranslateApp(ttk.Window):
                 self.tree.heading(column_id, text=heading)
                 self.tree.column(column_id, width=150 if index else 190, minwidth=80, stretch=True)
         for row_index, row in enumerate(self.table.rows):
-            self.tree.insert("", END, iid=str(row_index), values=row + ["翻译"])
+            tag = "odd" if row_index % 2 else "even"
+            self.tree.insert("", END, iid=str(row_index), values=row + ["翻译"], tags=(tag,))
         columns = self.table.language_columns()
         self.source_combo.configure(values=columns)
-        self.target_listbox.delete(0, END)
-        for column in columns:
-            self.target_listbox.insert(END, column)
         if not self.source_var.get() and "english" in columns:
             self.source_var.set("english")
-        configured_targets = self.config_data.target_columns or ["chinesesimp"]
+        self._reload_target_checks(columns)
+
+    def _reload_target_checks(self, columns: list[str]) -> None:
+        previous_selection = set(self._selected_target_columns())
+        configured_targets = set(self.config_data.target_columns or ["chinesesimp"])
+        selected = previous_selection or configured_targets
+        for child in self.target_checks_frame.winfo_children():
+            child.destroy()
+        self.target_vars = {}
         for index, column in enumerate(columns):
-            if column in configured_targets:
-                self.target_listbox.select_set(index)
+            variable = tk.BooleanVar(value=column in selected)
+            self.target_vars[column] = variable
+            check = ttk.Checkbutton(self.target_checks_frame, text=column or "(空列)", variable=variable, bootstyle="primary")
+            check.grid(row=index // 6, column=index % 6, sticky="w", padx=5, pady=3)
 
     def _on_table_double_click(self, event) -> None:
         if not self.table:
