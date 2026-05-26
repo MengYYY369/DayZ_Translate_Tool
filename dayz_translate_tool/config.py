@@ -30,6 +30,9 @@ class AppConfig:
     timeout_seconds: int = 60
     opencode_path: str = "opencode"
     opencode_args: str = ""
+    opencode_attach_url: str = "http://127.0.0.1:31319"
+    opencode_model: str = ""
+    opencode_models: list[str] = field(default_factory=list)
     autosave_every: int = 5
     max_workers: int = 3
     rate_limit_seconds: float = 1.0

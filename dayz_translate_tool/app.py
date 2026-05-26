@@ -8,7 +8,7 @@ from tkinter import filedialog, messagebox
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import BOTH, DISABLED, END, LEFT, NORMAL, RIGHT, X, Y
 
-from .ai import GoogleTranslateTranslator, OpenAICompatibleTranslator, OpencodeCliTranslator
+from .ai import GoogleTranslateTranslator, OpenAICompatibleTranslator, OpencodeCliTranslator, list_opencode_models
 from .config import DEFAULT_LANGUAGE_COLUMNS, AppConfig, load_config, save_config
 from .scanner import scan_translation_keys
 from .stringtable import StringTable
@@ -90,6 +90,8 @@ class DayZTranslateApp(ttk.Window):
         self.model_var = tk.StringVar(value=self.config_data.model)
         self.opencode_path_var = tk.StringVar(value=self.config_data.opencode_path)
         self.opencode_args_var = tk.StringVar(value=self.config_data.opencode_args)
+        self.opencode_attach_url_var = tk.StringVar(value=self.config_data.opencode_attach_url)
+        self.opencode_model_var = tk.StringVar(value=self.config_data.opencode_model)
         self.autosave_var = tk.IntVar(value=self.config_data.autosave_every)
         self.max_workers_var = tk.IntVar(value=self.config_data.max_workers)
         self.rate_limit_var = tk.DoubleVar(value=self.config_data.rate_limit_seconds)
@@ -118,8 +120,14 @@ class DayZTranslateApp(ttk.Window):
         ttk.Label(opencode, text="程序").grid(row=0, column=0, sticky="w")
         ttk.Entry(opencode, textvariable=self.opencode_path_var).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(opencode, text="选择程序", command=self.choose_opencode_program, bootstyle="secondary").grid(row=0, column=2, padx=4)
-        ttk.Label(opencode, text="Run 参数").grid(row=0, column=3, sticky="w")
-        ttk.Entry(opencode, textvariable=self.opencode_args_var).grid(row=0, column=4, sticky="ew", padx=6)
+        ttk.Label(opencode, text="服务 URL").grid(row=0, column=3, sticky="w")
+        ttk.Entry(opencode, textvariable=self.opencode_attach_url_var).grid(row=0, column=4, sticky="ew", padx=6)
+        ttk.Label(opencode, text="模型").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.opencode_model_combo = ttk.Combobox(opencode, textvariable=self.opencode_model_var, values=self.config_data.opencode_models, state="normal")
+        self.opencode_model_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
+        ttk.Button(opencode, text="刷新模型", command=self.refresh_opencode_models, bootstyle="secondary").grid(row=1, column=2, padx=4, pady=(8, 0))
+        ttk.Label(opencode, text="Run 参数").grid(row=1, column=3, sticky="w", pady=(8, 0))
+        ttk.Entry(opencode, textvariable=self.opencode_args_var).grid(row=1, column=4, sticky="ew", padx=6, pady=(8, 0))
         opencode.columnconfigure(1, weight=1)
         opencode.columnconfigure(4, weight=1)
 
@@ -190,6 +198,33 @@ class DayZTranslateApp(ttk.Window):
         path = filedialog.askopenfilename(title="选择 Opencode 程序", filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
         if path:
             self.opencode_path_var.set(path)
+
+    def refresh_opencode_models(self) -> None:
+        self._save_config_from_ui()
+        self._set_status("正在获取 Opencode 模型列表")
+        thread = threading.Thread(target=self._refresh_opencode_models_worker, daemon=True)
+        thread.start()
+
+    def _refresh_opencode_models_worker(self) -> None:
+        try:
+            models = list_opencode_models(
+                self.opencode_path_var.get(),
+                refresh=True,
+                timeout_seconds=int(self.config_data.timeout_seconds),
+            )
+        except Exception as exc:
+            self.after(0, lambda: messagebox.showerror("获取模型失败", str(exc)))
+            self.after(0, lambda: self._set_status("获取 Opencode 模型失败"))
+            return
+        self.after(0, lambda: self._apply_opencode_models(models))
+
+    def _apply_opencode_models(self, models: list[str]) -> None:
+        self.config_data.opencode_models = models
+        if self.opencode_model_var.get() not in models:
+            self.opencode_model_var.set(models[0] if models else "")
+        self.opencode_model_combo.configure(values=models)
+        self._save_config_from_ui()
+        self._set_status(f"已获取 {len(models)} 个 Opencode 模型")
 
     def add_glossary_entry(self) -> None:
         term = self.glossary_term_var.get().strip()
@@ -410,6 +445,8 @@ class DayZTranslateApp(ttk.Window):
                 executable_path=self.opencode_path_var.get(),
                 extra_args=self.opencode_args_var.get(),
                 timeout_seconds=int(self.config_data.timeout_seconds),
+                attach_url=self.opencode_attach_url_var.get(),
+                model=self.opencode_model_var.get(),
             )
         return OpenAICompatibleTranslator(
             base_url=self.base_url_var.get(),
@@ -511,6 +548,8 @@ class DayZTranslateApp(ttk.Window):
         self.config_data.model = self.model_var.get()
         self.config_data.opencode_path = self.opencode_path_var.get()
         self.config_data.opencode_args = self.opencode_args_var.get()
+        self.config_data.opencode_attach_url = self.opencode_attach_url_var.get()
+        self.config_data.opencode_model = self.opencode_model_var.get()
         self.config_data.autosave_every = max(1, int(self.autosave_var.get()))
         self.config_data.max_workers = max(1, int(self.max_workers_var.get()))
         self.config_data.rate_limit_seconds = max(0.0, float(self.rate_limit_var.get()))

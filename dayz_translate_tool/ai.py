@@ -126,6 +126,43 @@ def hidden_subprocess_kwargs() -> dict:
     return options
 
 
+def parse_opencode_models_output(output: str) -> list[str]:
+    models = set()
+    pattern = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+")
+    for token in output.split():
+        candidate = token.strip("`'\" ,;()[]{}")
+        if candidate.startswith(("http://", "https://")):
+            continue
+        if pattern.fullmatch(candidate):
+            models.add(candidate)
+    return sorted(models)
+
+
+def list_opencode_models(executable_path: str, refresh: bool = False, timeout_seconds: int = 60) -> list[str]:
+    executable = executable_path.strip()
+    if not executable:
+        raise ValueError("缺少 Opencode 可执行文件路径")
+    command = [executable, "models"]
+    if refresh:
+        command.append("--refresh")
+    completed = subprocess.run(
+        command,
+        input="",
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds,
+        check=False,
+        **hidden_subprocess_kwargs(),
+    )
+    if completed.returncode != 0:
+        stderr = clean_process_error(completed.stderr)
+        raise RuntimeError(f"获取 Opencode 模型失败: {stderr}")
+    models = parse_opencode_models_output(completed.stdout)
+    if not models:
+        raise RuntimeError("没有从 Opencode 输出中识别到模型")
+    return models
+
+
 class OpenAICompatibleTranslator(AITranslator):
     def __init__(self, base_url: str, api_key: str, model: str, timeout_seconds: int = 60):
         self.base_url = base_url.strip()
@@ -177,15 +214,21 @@ class OpenAICompatibleTranslator(AITranslator):
 
 
 class OpencodeCliTranslator(AITranslator):
-    def __init__(self, executable_path: str, extra_args: str = "", timeout_seconds: int = 120):
+    def __init__(self, executable_path: str, extra_args: str = "", timeout_seconds: int = 120, attach_url: str = "", model: str = ""):
         self.executable_path = executable_path.strip()
         self.extra_args = extra_args.strip()
         self.timeout_seconds = timeout_seconds
+        self.attach_url = attach_url.strip()
+        self.model = model.strip()
 
     def translate(self, request: TranslationRequest) -> str:
         if not self.executable_path:
             raise ValueError("缺少 Opencode 可执行文件路径")
         command = [self.executable_path, "run"]
+        if self.attach_url:
+            command.extend(["--attach", self.attach_url])
+        if self.model:
+            command.extend(["--model", self.model])
         if self.extra_args:
             command.extend(shlex.split(self.extra_args, posix=False))
         prompt = build_translation_prompt(request)

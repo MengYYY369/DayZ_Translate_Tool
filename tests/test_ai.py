@@ -10,6 +10,8 @@ from dayz_translate_tool.ai import (
     RateLimiter,
     TranslationRequest,
     build_translation_prompt,
+    list_opencode_models,
+    parse_opencode_models_output,
 )
 from dayz_translate_tool.stringtable import StringTable
 
@@ -131,6 +133,29 @@ class AITests(unittest.TestCase):
         self.assertIn("源文本: Hello", command[-1])
         self.assertEqual("", run.call_args.kwargs["input"])
 
+    def test_opencode_translator_attaches_to_running_server_and_uses_selected_model(self):
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="译文\n", stderr="")
+        request = TranslationRequest(
+            key="STR_A",
+            source_language="english",
+            source_text="Hello",
+            target_language="chinesesimp",
+        )
+
+        with patch("dayz_translate_tool.ai.subprocess.run", return_value=completed) as run:
+            OpencodeCliTranslator(
+                "opencode",
+                attach_url="http://127.0.0.1:31319",
+                model="opencode-go/deepseek-v4-flash",
+            ).translate(request)
+
+        command = run.call_args.args[0]
+        self.assertEqual("run", command[1])
+        self.assertIn("--attach", command)
+        self.assertIn("http://127.0.0.1:31319", command)
+        self.assertIn("--model", command)
+        self.assertIn("opencode-go/deepseek-v4-flash", command)
+
     def test_opencode_translator_hides_console_window_when_supported(self):
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="译文\n", stderr="")
         request = TranslationRequest(
@@ -164,6 +189,26 @@ class AITests(unittest.TestCase):
         self.assertIn("Model not found: gpt-5.5", message)
         self.assertIn("Run 参数", message)
         self.assertNotIn("\x1b", message)
+
+    def test_parse_opencode_models_output_extracts_provider_model_names(self):
+        output = """
+        opencode-go/deepseek-v4-flash  DeepSeek V4 Flash
+        anthropic/claude-sonnet-4.5
+        https://example.test/not-a-model
+        """
+
+        models = parse_opencode_models_output(output)
+
+        self.assertEqual(["anthropic/claude-sonnet-4.5", "opencode-go/deepseek-v4-flash"], models)
+
+    def test_list_opencode_models_runs_cli_models_command(self):
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="opencode-go/deepseek-v4-flash\n", stderr="")
+
+        with patch("dayz_translate_tool.ai.subprocess.run", return_value=completed) as run:
+            models = list_opencode_models("opencode", refresh=True)
+
+        self.assertEqual(["opencode-go/deepseek-v4-flash"], models)
+        self.assertEqual(["opencode", "models", "--refresh"], run.call_args.args[0])
 
 
 if __name__ == "__main__":
