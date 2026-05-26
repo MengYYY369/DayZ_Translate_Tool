@@ -1,5 +1,5 @@
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -16,6 +16,7 @@ class AppConfig:
     max_workers: int = 3
     rate_limit_seconds: float = 1.0
     target_columns: list[str] | None = None
+    glossary_entries: list[dict[str, str]] = field(default_factory=list)
     last_csv_path: str = ""
 
 

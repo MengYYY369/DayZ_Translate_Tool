@@ -18,8 +18,8 @@ class DayZTranslateApp(ttk.Window):
     def __init__(self):
         super().__init__(themename="cosmo")
         self.title("DayZ Translate Tool")
-        self.geometry("1280x760")
-        self.minsize(1060, 620)
+        self.geometry("1500x900")
+        self.minsize(1240, 720)
         self.config_data = load_config()
         self.table: StringTable | None = None
         self.current_path: Path | None = None
@@ -49,42 +49,36 @@ class DayZTranslateApp(ttk.Window):
         )
 
     def _build_ui(self) -> None:
+        self.path_var = tk.StringVar()
         self._build_header()
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=BOTH, expand=True, padx=6, pady=(0, 4))
         self.workbench_tab = ttk.Frame(self.notebook, padding=6)
         self.settings_tab = ttk.Frame(self.notebook, padding=8)
+        self.glossary_tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(self.workbench_tab, text="翻译工作台")
         self.notebook.add(self.settings_tab, text="翻译设置")
+        self.notebook.add(self.glossary_tab, text="自定义词表")
         self._build_workbench_tab()
         self._build_settings_tab()
+        self._build_glossary_tab()
         self.status_var = tk.StringVar(value="准备就绪")
         ttk.Label(self, textvariable=self.status_var, anchor="w", bootstyle="secondary").pack(fill=X, padx=8, pady=(0, 4))
 
     def _build_header(self) -> None:
-        frame = ttk.Frame(self, padding=(8, 6, 8, 4))
+        frame = ttk.Frame(self, padding=(8, 4, 8, 4))
         frame.pack(fill=X)
-        title = ttk.Frame(frame)
-        title.pack(side=LEFT)
-        ttk.Label(title, text="DayZ Translate Tool", font=("Segoe UI", 13, "bold")).pack(anchor="w")
         actions = ttk.Frame(frame)
         actions.pack(side=RIGHT)
         ttk.Button(actions, text="打开", command=self.open_csv, bootstyle="secondary").pack(side=LEFT, padx=3)
         ttk.Button(actions, text="保存", command=self.save_csv, bootstyle="success").pack(side=LEFT, padx=3)
         ttk.Button(actions, text="另存为", command=self.save_csv_as, bootstyle="secondary").pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="扫描文件", command=self.scan_file, bootstyle="secondary").pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="扫描文件夹", command=self.scan_folder, bootstyle="secondary").pack(side=LEFT, padx=3)
 
     def _build_workbench_tab(self) -> None:
-        self._build_file_bar(self.workbench_tab)
         self._build_actions(self.workbench_tab)
         self._build_table(self.workbench_tab)
-
-    def _build_file_bar(self, parent) -> None:
-        frame = ttk.Labelframe(parent, text="当前翻译表", padding=6)
-        frame.pack(fill=X, pady=(0, 4))
-        self.path_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.path_var).pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
-        ttk.Button(frame, text="扫描文件", command=self.scan_file, bootstyle="secondary").pack(side=LEFT, padx=2)
-        ttk.Button(frame, text="扫描文件夹", command=self.scan_folder, bootstyle="secondary").pack(side=LEFT, padx=2)
 
     def _build_settings_tab(self) -> None:
         frame = ttk.Labelframe(self.settings_tab, text="翻译引擎", padding=12)
@@ -127,6 +121,40 @@ class DayZTranslateApp(ttk.Window):
         opencode.columnconfigure(1, weight=1)
         opencode.columnconfigure(3, weight=1)
 
+    def _build_glossary_tab(self) -> None:
+        editor = ttk.Labelframe(self.glossary_tab, text="词条", padding=8)
+        editor.pack(fill=X, pady=(0, 8))
+        self.glossary_source_var = tk.StringVar()
+        self.glossary_target_var = tk.StringVar()
+        self.glossary_note_var = tk.StringVar()
+        ttk.Label(editor, text="原文").grid(row=0, column=0, sticky="w")
+        ttk.Entry(editor, textvariable=self.glossary_source_var).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Label(editor, text="译文").grid(row=0, column=2, sticky="w")
+        ttk.Entry(editor, textvariable=self.glossary_target_var).grid(row=0, column=3, sticky="ew", padx=5)
+        ttk.Label(editor, text="备注").grid(row=0, column=4, sticky="w")
+        ttk.Entry(editor, textvariable=self.glossary_note_var).grid(row=0, column=5, sticky="ew", padx=5)
+        ttk.Button(editor, text="添加/更新", command=self.add_glossary_entry, bootstyle="primary").grid(row=0, column=6, padx=4)
+        ttk.Button(editor, text="删除选中", command=self.delete_glossary_entries, bootstyle="secondary").grid(row=0, column=7, padx=4)
+        for column in [1, 3, 5]:
+            editor.columnconfigure(column, weight=1)
+
+        frame = ttk.Frame(self.glossary_tab, borderwidth=1, relief="solid")
+        frame.pack(fill=BOTH, expand=True)
+        self.glossary_tree = ttk.Treeview(frame, columns=["source", "target", "note"], show="headings", selectmode="extended", style="Grid.Treeview")
+        self.glossary_tree.heading("source", text="原文")
+        self.glossary_tree.heading("target", text="译文")
+        self.glossary_tree.heading("note", text="备注")
+        self.glossary_tree.column("source", width=260, minwidth=120, stretch=True)
+        self.glossary_tree.column("target", width=260, minwidth=120, stretch=True)
+        self.glossary_tree.column("note", width=360, minwidth=120, stretch=True)
+        self.glossary_tree.tag_configure("odd", background="#f7f9fc")
+        self.glossary_tree.tag_configure("even", background="#ffffff")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.glossary_tree.yview)
+        self.glossary_tree.configure(yscrollcommand=yscroll.set)
+        self.glossary_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        yscroll.pack(side=RIGHT, fill=Y)
+        self._reload_glossary_tree()
+
     def _build_actions(self, parent) -> None:
         frame = ttk.Labelframe(parent, text="翻译任务", padding=6)
         frame.pack(fill=X, pady=(0, 4))
@@ -144,6 +172,39 @@ class DayZTranslateApp(ttk.Window):
         self.translate_selected_button.pack(side=LEFT, padx=4)
         self.translate_all_button = ttk.Button(frame, text="翻译全部可翻译行", command=self.translate_all_rows, bootstyle="primary")
         self.translate_all_button.pack(side=LEFT, padx=4)
+
+    def add_glossary_entry(self) -> None:
+        source = self.glossary_source_var.get().strip()
+        target = self.glossary_target_var.get().strip()
+        note = self.glossary_note_var.get().strip()
+        if not source or not target:
+            messagebox.showwarning("词条不完整", "请填写原文和译文")
+            return
+        entries = [entry for entry in self.config_data.glossary_entries if entry.get("source") != source]
+        entries.append({"source": source, "target": target, "note": note})
+        self.config_data.glossary_entries = entries
+        save_config(self.config_data)
+        self.glossary_source_var.set("")
+        self.glossary_target_var.set("")
+        self.glossary_note_var.set("")
+        self._reload_glossary_tree()
+        self._set_status("已保存自定义词条")
+
+    def delete_glossary_entries(self) -> None:
+        selected_sources = {self.glossary_tree.item(iid, "values")[0] for iid in self.glossary_tree.selection()}
+        if not selected_sources:
+            return
+        self.config_data.glossary_entries = [entry for entry in self.config_data.glossary_entries if entry.get("source") not in selected_sources]
+        save_config(self.config_data)
+        self._reload_glossary_tree()
+        self._set_status("已删除选中词条")
+
+    def _reload_glossary_tree(self) -> None:
+        for item in self.glossary_tree.get_children():
+            self.glossary_tree.delete(item)
+        for index, entry in enumerate(self.config_data.glossary_entries):
+            tag = "odd" if index % 2 else "even"
+            self.glossary_tree.insert("", END, values=[entry.get("source", ""), entry.get("target", ""), entry.get("note", "")], tags=(tag,))
 
     def _build_table(self, parent) -> None:
         frame = ttk.Frame(parent, borderwidth=1, relief="solid")
