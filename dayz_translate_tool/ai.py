@@ -1,7 +1,10 @@
 import json
 import shlex
 import subprocess
+import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
@@ -25,6 +28,44 @@ class BatchTranslationResult:
 class AITranslator:
     def translate(self, request: TranslationRequest) -> str:
         raise NotImplementedError
+
+
+LANGUAGE_CODES = {
+    "original": "auto",
+    "english": "en",
+    "czech": "cs",
+    "german": "de",
+    "russian": "ru",
+    "polish": "pl",
+    "hungarian": "hu",
+    "italian": "it",
+    "spanish": "es",
+    "french": "fr",
+    "chinese": "zh-CN",
+    "chinesesimp": "zh-CN",
+    "japanese": "ja",
+    "portuguese": "pt",
+}
+
+
+class RateLimiter:
+    def __init__(self, interval_seconds: float = 0.0, monotonic=time.monotonic, sleep=time.sleep):
+        self.interval_seconds = max(0.0, float(interval_seconds))
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self._lock = threading.Lock()
+        self._next_at: float | None = None
+
+    def wait(self) -> None:
+        if self.interval_seconds <= 0:
+            return
+        with self._lock:
+            now = self.monotonic()
+            if self._next_at is not None and now < self._next_at:
+                delay = self._next_at - now
+                self.sleep(delay)
+                now = self._next_at
+            self._next_at = now + self.interval_seconds
 
 
 def build_translation_prompt(request: TranslationRequest) -> str:
@@ -131,3 +172,36 @@ class OpencodeCliTranslator(AITranslator):
         if not output:
             raise RuntimeError("Opencode 返回了空翻译")
         return output
+
+
+class GoogleTranslateTranslator(AITranslator):
+    def __init__(self, timeout_seconds: int = 30):
+        self.timeout_seconds = timeout_seconds
+
+    def translate(self, request: TranslationRequest) -> str:
+        source_code = LANGUAGE_CODES.get(request.source_language, "auto")
+        target_code = LANGUAGE_CODES.get(request.target_language, request.target_language)
+        query = urllib.parse.urlencode(
+            {
+                "client": "gtx",
+                "sl": source_code,
+                "tl": target_code,
+                "dt": "t",
+                "q": request.source_text,
+            }
+        )
+        url = f"https://translate.googleapis.com/translate_a/single?{query}"
+        http_request = urllib.request.Request(url, headers={"User-Agent": "DayZTranslateTool/0.1"})
+        try:
+            with urllib.request.urlopen(http_request, timeout=self.timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Google 翻译请求失败: HTTP {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Google 翻译请求失败: {exc}") from exc
+        try:
+            pieces = [part[0] for part in payload[0] if part and part[0]]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"Google 翻译返回格式无法识别: {payload}") from exc
+        return clean_ai_text("".join(pieces))

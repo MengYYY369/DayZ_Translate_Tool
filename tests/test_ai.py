@@ -1,8 +1,11 @@
 import unittest
+from unittest.mock import MagicMock, patch
 
 from dayz_translate_tool.ai import (
     AITranslator,
     BatchTranslationResult,
+    GoogleTranslateTranslator,
+    RateLimiter,
     TranslationRequest,
     build_translation_prompt,
 )
@@ -61,6 +64,52 @@ class AITests(unittest.TestCase):
         self.assertEqual("chinesesimp:Charlie", table.get_cell(2, "chinesesimp"))
         self.assertEqual("chinesesimp:Delta", table.get_cell(3, "chinesesimp"))
         self.assertEqual(2, len(saves))
+
+    def test_multi_target_translation_updates_each_target_column(self):
+        table = StringTable(
+            ["Language", "english", "german", "chinesesimp", ""],
+            [
+                ["STR_A", "Alpha", "", "", ""],
+                ["STR_B", "", "", "", ""],
+            ],
+        )
+
+        result = table.translate_rows_multi(
+            row_indices=[0, 1],
+            source_column="english",
+            target_columns=["german", "chinesesimp"],
+            translator=FakeTranslator(),
+            autosave_every=10,
+            max_workers=2,
+        )
+
+        self.assertEqual(BatchTranslationResult(translated=2, skipped=2, failed=[]), result)
+        self.assertEqual("german:Alpha", table.get_cell(0, "german"))
+        self.assertEqual("chinesesimp:Alpha", table.get_cell(0, "chinesesimp"))
+
+    def test_rate_limiter_waits_between_translation_starts(self):
+        sleeper = MagicMock()
+        limiter = RateLimiter(interval_seconds=0.5, monotonic=lambda: 10.0, sleep=sleeper)
+
+        limiter.wait()
+        limiter.wait()
+
+        sleeper.assert_called_once_with(0.5)
+
+    def test_google_translator_parses_response(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'[[["Hallo","Hello",null,null,1]],null,"en"]'
+        request = TranslationRequest(
+            key="STR_A",
+            source_language="english",
+            source_text="Hello",
+            target_language="german",
+        )
+
+        with patch("dayz_translate_tool.ai.urllib.request.urlopen", return_value=response):
+            result = GoogleTranslateTranslator(timeout_seconds=10).translate(request)
+
+        self.assertEqual("Hallo", result)
 
 
 if __name__ == "__main__":

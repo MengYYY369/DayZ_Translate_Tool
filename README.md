@@ -6,11 +6,13 @@ DayZ `stringtable.csv` 翻译编辑工具，使用 `ttkbootstrap` 构建桌面�
 
 - 打开、编辑、保存固定格式的 DayZ `stringtable.csv`。
 - 选择主语言/源列和目标语言列。
+- 目标语言支持多选，一次可翻译到多个语言列。
 - 双击表格单元格手动修改。
 - 双击每行最后的“翻译”操作列翻译单行。
 - 支持翻译选中行、翻译全部可翻译行。
 - 从文件或文件夹扫描 `$STR_xxx` / `#STR_xxx` 引用，自动加入缺失的 `Language` 键。
-- 支持 OpenAI 兼容 API 和 Opencode CLI 两种 AI 后端。
+- 支持 Google 免费翻译源、OpenAI 兼容 API 和 Opencode CLI 三种后端。
+- 支持设置请求间隔和并发线程数，减少免费翻译源或 API 限速风险。
 - 批量翻译时默认每 5 行自动保存一次。
 
 ## 开发运行

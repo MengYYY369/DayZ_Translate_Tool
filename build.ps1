@@ -26,6 +26,7 @@ $PyInstallerArgs = @(
     "--distpath", $ReleaseDir,
     "--workpath", $BuildDir,
     "--specpath", $Root,
+    "--collect-all", "ttkbootstrap",
     "--add-data", "stringtable.csv;.",
     "main.py"
 )

@@ -8,7 +8,7 @@ from tkinter import filedialog, messagebox
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import BOTH, DISABLED, END, LEFT, NORMAL, RIGHT, X, Y
 
-from .ai import OpenAICompatibleTranslator, OpencodeCliTranslator
+from .ai import GoogleTranslateTranslator, OpenAICompatibleTranslator, OpencodeCliTranslator
 from .config import AppConfig, load_config, save_config
 from .scanner import scan_translation_keys
 from .stringtable import StringTable
@@ -16,10 +16,10 @@ from .stringtable import StringTable
 
 class DayZTranslateApp(ttk.Window):
     def __init__(self):
-        super().__init__(themename="flatly")
+        super().__init__(themename="cosmo")
         self.title("DayZ Translate Tool")
-        self.geometry("1280x760")
-        self.minsize(1024, 620)
+        self.geometry("1360x820")
+        self.minsize(1120, 680)
         self.config_data = load_config()
         self.table: StringTable | None = None
         self.current_path: Path | None = None
@@ -30,26 +30,47 @@ class DayZTranslateApp(ttk.Window):
         self._load_default_csv()
 
     def _build_ui(self) -> None:
-        self._build_file_bar()
-        self._build_ai_bar()
-        self._build_actions()
-        self._build_table()
+        self._build_header()
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=BOTH, expand=True, padx=10, pady=(0, 8))
+        self.workbench_tab = ttk.Frame(self.notebook, padding=10)
+        self.settings_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.workbench_tab, text="翻译工作台")
+        self.notebook.add(self.settings_tab, text="翻译设置")
+        self._build_workbench_tab()
+        self._build_settings_tab()
         self.status_var = tk.StringVar(value="准备就绪")
-        ttk.Label(self, textvariable=self.status_var, anchor="w").pack(fill=X, padx=8, pady=(0, 6))
+        ttk.Label(self, textvariable=self.status_var, anchor="w", bootstyle="secondary").pack(fill=X, padx=10, pady=(0, 8))
 
-    def _build_file_bar(self) -> None:
-        frame = ttk.Frame(self, padding=8)
+    def _build_header(self) -> None:
+        frame = ttk.Frame(self, padding=(10, 10, 10, 8))
         frame.pack(fill=X)
-        ttk.Label(frame, text="CSV").pack(side=LEFT)
-        self.path_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.path_var).pack(side=LEFT, fill=X, expand=True, padx=6)
-        ttk.Button(frame, text="打开", command=self.open_csv, bootstyle="secondary").pack(side=LEFT, padx=2)
-        ttk.Button(frame, text="保存", command=self.save_csv, bootstyle="success").pack(side=LEFT, padx=2)
-        ttk.Button(frame, text="另存为", command=self.save_csv_as, bootstyle="secondary").pack(side=LEFT, padx=2)
+        title = ttk.Frame(frame)
+        title.pack(side=LEFT)
+        ttk.Label(title, text="DayZ Translate Tool", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(title, text="stringtable.csv 编辑、扫描和批量翻译", bootstyle="secondary").pack(anchor="w")
+        actions = ttk.Frame(frame)
+        actions.pack(side=RIGHT)
+        ttk.Button(actions, text="打开", command=self.open_csv, bootstyle="secondary").pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="保存", command=self.save_csv, bootstyle="success").pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="另存为", command=self.save_csv_as, bootstyle="secondary").pack(side=LEFT, padx=3)
 
-    def _build_ai_bar(self) -> None:
-        frame = ttk.Labelframe(self, text="AI 设置", padding=8)
-        frame.pack(fill=X, padx=8, pady=(0, 6))
+    def _build_workbench_tab(self) -> None:
+        self._build_file_bar(self.workbench_tab)
+        self._build_actions(self.workbench_tab)
+        self._build_table(self.workbench_tab)
+
+    def _build_file_bar(self, parent) -> None:
+        frame = ttk.Labelframe(parent, text="当前翻译表", padding=10)
+        frame.pack(fill=X, pady=(0, 8))
+        self.path_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.path_var).pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+        ttk.Button(frame, text="扫描文件", command=self.scan_file, bootstyle="secondary").pack(side=LEFT, padx=2)
+        ttk.Button(frame, text="扫描文件夹", command=self.scan_folder, bootstyle="secondary").pack(side=LEFT, padx=2)
+
+    def _build_settings_tab(self) -> None:
+        frame = ttk.Labelframe(self.settings_tab, text="翻译引擎", padding=12)
+        frame.pack(fill=X, pady=(0, 10))
         self.backend_var = tk.StringVar(value=self.config_data.ai_backend)
         self.base_url_var = tk.StringVar(value=self.config_data.base_url)
         self.api_key_var = tk.StringVar(value=self.config_data.api_key)
@@ -57,44 +78,56 @@ class DayZTranslateApp(ttk.Window):
         self.opencode_path_var = tk.StringVar(value=self.config_data.opencode_path)
         self.opencode_args_var = tk.StringVar(value=self.config_data.opencode_args)
         self.autosave_var = tk.IntVar(value=self.config_data.autosave_every)
+        self.max_workers_var = tk.IntVar(value=self.config_data.max_workers)
+        self.rate_limit_var = tk.DoubleVar(value=self.config_data.rate_limit_seconds)
         ttk.Label(frame, text="后端").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(frame, textvariable=self.backend_var, values=["api", "opencode"], width=12, state="readonly").grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Label(frame, text="base_url").grid(row=0, column=2, sticky="w")
-        ttk.Entry(frame, textvariable=self.base_url_var).grid(row=0, column=3, sticky="ew", padx=4)
-        ttk.Label(frame, text="api_key").grid(row=0, column=4, sticky="w")
-        ttk.Entry(frame, textvariable=self.api_key_var, show="*").grid(row=0, column=5, sticky="ew", padx=4)
-        ttk.Label(frame, text="model").grid(row=0, column=6, sticky="w")
-        ttk.Entry(frame, textvariable=self.model_var, width=20).grid(row=0, column=7, sticky="ew", padx=4)
-        ttk.Label(frame, text="Opencode").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(frame, textvariable=self.opencode_path_var).grid(row=1, column=1, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
-        ttk.Label(frame, text="参数").grid(row=1, column=3, sticky="w", pady=(6, 0))
-        ttk.Entry(frame, textvariable=self.opencode_args_var).grid(row=1, column=4, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
-        ttk.Label(frame, text="自动保存行数").grid(row=1, column=6, sticky="w", pady=(6, 0))
-        ttk.Spinbox(frame, from_=1, to=100, textvariable=self.autosave_var, width=8).grid(row=1, column=7, sticky="w", padx=4, pady=(6, 0))
-        for column in range(8):
-            frame.columnconfigure(column, weight=1 if column in {3, 5, 7} else 0)
+        ttk.Combobox(frame, textvariable=self.backend_var, values=["google", "api", "opencode"], width=14, state="readonly").grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(frame, text="并发线程").grid(row=0, column=2, sticky="w")
+        ttk.Spinbox(frame, from_=1, to=16, textvariable=self.max_workers_var, width=8).grid(row=0, column=3, sticky="w", padx=6)
+        ttk.Label(frame, text="请求间隔(秒)").grid(row=0, column=4, sticky="w")
+        ttk.Spinbox(frame, from_=0, to=60, increment=0.25, textvariable=self.rate_limit_var, width=8).grid(row=0, column=5, sticky="w", padx=6)
+        ttk.Label(frame, text="自动保存行数").grid(row=0, column=6, sticky="w")
+        ttk.Spinbox(frame, from_=1, to=100, textvariable=self.autosave_var, width=8).grid(row=0, column=7, sticky="w", padx=6)
 
-    def _build_actions(self) -> None:
-        frame = ttk.Frame(self, padding=(8, 0, 8, 6))
-        frame.pack(fill=X)
+        api = ttk.Labelframe(self.settings_tab, text="OpenAI 兼容 API", padding=12)
+        api.pack(fill=X, pady=(0, 10))
+        ttk.Label(api, text="base_url").grid(row=0, column=0, sticky="w")
+        ttk.Entry(api, textvariable=self.base_url_var).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(api, text="api_key").grid(row=0, column=2, sticky="w")
+        ttk.Entry(api, textvariable=self.api_key_var, show="*").grid(row=0, column=3, sticky="ew", padx=6)
+        ttk.Label(api, text="model").grid(row=0, column=4, sticky="w")
+        ttk.Entry(api, textvariable=self.model_var, width=24).grid(row=0, column=5, sticky="ew", padx=6)
+        for column in [1, 3, 5]:
+            api.columnconfigure(column, weight=1)
+
+        opencode = ttk.Labelframe(self.settings_tab, text="Opencode CLI", padding=12)
+        opencode.pack(fill=X)
+        ttk.Label(opencode, text="可执行文件").grid(row=0, column=0, sticky="w")
+        ttk.Entry(opencode, textvariable=self.opencode_path_var).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(opencode, text="参数").grid(row=0, column=2, sticky="w")
+        ttk.Entry(opencode, textvariable=self.opencode_args_var).grid(row=0, column=3, sticky="ew", padx=6)
+        opencode.columnconfigure(1, weight=1)
+        opencode.columnconfigure(3, weight=1)
+
+    def _build_actions(self, parent) -> None:
+        frame = ttk.Labelframe(parent, text="翻译任务", padding=10)
+        frame.pack(fill=X, pady=(0, 8))
         self.source_var = tk.StringVar()
-        self.target_var = tk.StringVar()
         ttk.Label(frame, text="主语言/源列").pack(side=LEFT)
         self.source_combo = ttk.Combobox(frame, textvariable=self.source_var, width=18, state="readonly")
         self.source_combo.pack(side=LEFT, padx=4)
-        ttk.Label(frame, text="目标列").pack(side=LEFT, padx=(10, 0))
-        self.target_combo = ttk.Combobox(frame, textvariable=self.target_var, width=18, state="readonly")
-        self.target_combo.pack(side=LEFT, padx=4)
+        ttk.Label(frame, text="目标语言可多选").pack(side=LEFT, padx=(10, 0))
+        self.target_listbox = tk.Listbox(frame, selectmode=tk.MULTIPLE, height=4, exportselection=False, width=42)
+        self.target_listbox.pack(side=LEFT, padx=4)
+        ttk.Button(frame, text="全选目标", command=self.select_all_targets, bootstyle="secondary").pack(side=LEFT, padx=4)
         self.translate_selected_button = ttk.Button(frame, text="翻译选中行", command=self.translate_selected_rows, bootstyle="primary")
         self.translate_selected_button.pack(side=LEFT, padx=4)
         self.translate_all_button = ttk.Button(frame, text="翻译全部可翻译行", command=self.translate_all_rows, bootstyle="primary")
         self.translate_all_button.pack(side=LEFT, padx=4)
-        ttk.Button(frame, text="扫描文件", command=self.scan_file, bootstyle="secondary").pack(side=RIGHT, padx=2)
-        ttk.Button(frame, text="扫描文件夹", command=self.scan_folder, bootstyle="secondary").pack(side=RIGHT, padx=2)
 
-    def _build_table(self) -> None:
-        frame = ttk.Frame(self)
-        frame.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
+    def _build_table(self, parent) -> None:
+        frame = ttk.Frame(parent)
+        frame.pack(fill=BOTH, expand=True)
         self.tree = ttk.Treeview(frame, show="headings", selectmode="extended")
         yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         xscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
@@ -188,6 +221,12 @@ class DayZTranslateApp(ttk.Window):
     def translate_single_row(self, row_index: int) -> None:
         self._start_translation([row_index])
 
+    def select_all_targets(self) -> None:
+        self.target_listbox.select_set(0, END)
+
+    def _selected_target_columns(self) -> list[str]:
+        return [self.target_listbox.get(index) for index in self.target_listbox.curselection()]
+
     def _start_translation(self, indices) -> None:
         if not self.table:
             return
@@ -196,12 +235,12 @@ class DayZTranslateApp(ttk.Window):
             messagebox.showinfo("没有选中行", "请先选中要翻译的行")
             return
         source_column = self.source_var.get()
-        target_column = self.target_var.get()
-        if not source_column or not target_column:
-            messagebox.showwarning("缺少语言列", "请选择主语言/源列和目标列")
+        target_columns = self._selected_target_columns()
+        if not source_column or not target_columns:
+            messagebox.showwarning("缺少语言列", "请选择主语言/源列和至少一个目标列")
             return
-        if source_column == target_column:
-            messagebox.showwarning("语言列重复", "源列和目标列不能相同")
+        if source_column in target_columns:
+            messagebox.showwarning("语言列重复", "目标列不能包含源列")
             return
         try:
             translator = self._create_translator()
@@ -209,13 +248,19 @@ class DayZTranslateApp(ttk.Window):
             messagebox.showerror("AI 设置错误", str(exc))
             return
         autosave_every = max(1, int(self.autosave_var.get()))
+        max_workers = max(1, int(self.max_workers_var.get()))
+        rate_limit_seconds = max(0.0, float(self.rate_limit_var.get()))
         self._save_config_from_ui()
         self._set_translation_buttons(DISABLED)
-        self._set_status(f"开始翻译 {len(row_indices)} 行")
-        thread = threading.Thread(target=self._translation_worker, args=(row_indices, source_column, target_column, translator, autosave_every), daemon=True)
+        self._set_status(f"开始翻译 {len(row_indices)} 行 x {len(target_columns)} 个目标")
+        thread = threading.Thread(
+            target=self._translation_worker,
+            args=(row_indices, source_column, target_columns, translator, autosave_every, max_workers, rate_limit_seconds),
+            daemon=True,
+        )
         thread.start()
 
-    def _translation_worker(self, row_indices, source_column: str, target_column: str, translator, autosave_every: int) -> None:
+    def _translation_worker(self, row_indices, source_column: str, target_columns: list[str], translator, autosave_every: int, max_workers: int, rate_limit_seconds: float) -> None:
         def autosave(table: StringTable) -> None:
             if self.current_path:
                 table.save(self.current_path)
@@ -223,14 +268,16 @@ class DayZTranslateApp(ttk.Window):
         def progress(done: int, total: int) -> None:
             self.after(0, lambda: self._set_status(f"AI 翻译进度 {done}/{total}"))
 
-        result = self.table.translate_rows(
+        result = self.table.translate_rows_multi(
             row_indices=row_indices,
             source_column=source_column,
-            target_column=target_column,
+            target_columns=target_columns,
             translator=translator,
             autosave_every=autosave_every,
             save_callback=autosave,
             progress_callback=progress,
+            max_workers=max_workers,
+            rate_limit_seconds=rate_limit_seconds,
         )
         self.after(0, lambda: self._finish_translation(result))
 
@@ -245,7 +292,10 @@ class DayZTranslateApp(ttk.Window):
             messagebox.showwarning("部分翻译失败", detail)
 
     def _create_translator(self):
-        if self.backend_var.get() == "opencode":
+        backend = self.backend_var.get()
+        if backend == "google":
+            return GoogleTranslateTranslator(timeout_seconds=int(self.config_data.timeout_seconds))
+        if backend == "opencode":
             return OpencodeCliTranslator(
                 executable_path=self.opencode_path_var.get(),
                 extra_args=self.opencode_args_var.get(),
@@ -277,11 +327,15 @@ class DayZTranslateApp(ttk.Window):
             self.tree.insert("", END, iid=str(row_index), values=row + ["翻译"])
         columns = self.table.language_columns()
         self.source_combo.configure(values=columns)
-        self.target_combo.configure(values=columns)
+        self.target_listbox.delete(0, END)
+        for column in columns:
+            self.target_listbox.insert(END, column)
         if not self.source_var.get() and "english" in columns:
             self.source_var.set("english")
-        if not self.target_var.get() and "chinesesimp" in columns:
-            self.target_var.set("chinesesimp")
+        configured_targets = self.config_data.target_columns or ["chinesesimp"]
+        for index, column in enumerate(columns):
+            if column in configured_targets:
+                self.target_listbox.select_set(index)
 
     def _on_table_double_click(self, event) -> None:
         if not self.table:
@@ -339,6 +393,9 @@ class DayZTranslateApp(ttk.Window):
         self.config_data.opencode_path = self.opencode_path_var.get()
         self.config_data.opencode_args = self.opencode_args_var.get()
         self.config_data.autosave_every = max(1, int(self.autosave_var.get()))
+        self.config_data.max_workers = max(1, int(self.max_workers_var.get()))
+        self.config_data.rate_limit_seconds = max(0.0, float(self.rate_limit_var.get()))
+        self.config_data.target_columns = self._selected_target_columns()
         if self.current_path:
             self.config_data.last_csv_path = str(self.current_path)
         save_config(self.config_data)

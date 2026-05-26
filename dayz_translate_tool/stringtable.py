@@ -1,8 +1,9 @@
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from .ai import BatchTranslationResult, TranslationRequest
+from .ai import BatchTranslationResult, RateLimiter, TranslationRequest
 
 
 class StringTable:
@@ -82,18 +83,41 @@ class StringTable:
         save_callback: Optional[Callable[["StringTable"], None]] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> BatchTranslationResult:
+        return self.translate_rows_multi(
+            row_indices=row_indices,
+            source_column=source_column,
+            target_columns=[target_column],
+            translator=translator,
+            autosave_every=autosave_every,
+            save_callback=save_callback,
+            progress_callback=progress_callback,
+            max_workers=1,
+        )
+
+    def translate_rows_multi(
+        self,
+        row_indices: Iterable[int],
+        source_column: str,
+        target_columns: Iterable[str],
+        translator,
+        autosave_every: int = 5,
+        save_callback: Optional[Callable[["StringTable"], None]] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        max_workers: int = 1,
+        rate_limit_seconds: float = 0.0,
+    ) -> BatchTranslationResult:
         translated = 0
         skipped = 0
         failed: list[tuple[int, str]] = []
         indices = list(row_indices)
-        for position, row_index in enumerate(indices, start=1):
+        targets = [column for column in target_columns if column and column != source_column]
+        jobs: list[tuple[int, str, TranslationRequest]] = []
+        for row_index in indices:
             source_text = self.get_cell(row_index, source_column).strip()
             if not source_text:
-                skipped += 1
-                if progress_callback:
-                    progress_callback(position, len(indices))
+                skipped += len(targets)
                 continue
-            try:
+            for target_column in targets:
                 request = TranslationRequest(
                     key=self.rows[row_index][0],
                     source_language=source_column,
@@ -101,17 +125,35 @@ class StringTable:
                     target_language=target_column,
                     current_target_text=self.get_cell(row_index, target_column).strip(),
                 )
-                result = translator.translate(request).strip()
-                if not result:
-                    raise RuntimeError("AI 返回了空翻译")
-                self.set_cell(row_index, target_column, result)
-                translated += 1
-                if save_callback and autosave_every > 0 and translated % autosave_every == 0:
-                    save_callback(self)
-            except Exception as exc:
-                failed.append((row_index, str(exc)))
-            if progress_callback:
-                progress_callback(position, len(indices))
+                jobs.append((row_index, target_column, request))
+        completed = 0
+        total = len(jobs)
+        limiter = RateLimiter(rate_limit_seconds)
+
+        def run_job(job: tuple[int, str, TranslationRequest]) -> tuple[int, str, str]:
+            row_index, target_column, request = job
+            limiter.wait()
+            return row_index, target_column, translator.translate(request).strip()
+
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
+            futures = {executor.submit(run_job, job): job for job in jobs}
+            for future in as_completed(futures):
+                row_index, target_column, _request = futures[future]
+                try:
+                    _row_index, _target_column, result = future.result()
+                    if not result:
+                        raise RuntimeError("AI 返回了空翻译")
+                    self.set_cell(row_index, target_column, result)
+                    translated += 1
+                    if save_callback and autosave_every > 0 and translated % autosave_every == 0:
+                        save_callback(self)
+                except Exception as exc:
+                    failed.append((row_index, str(exc)))
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, total)
+        if not jobs and progress_callback:
+            progress_callback(0, 0)
         if save_callback and translated > 0:
             save_callback(self)
         return BatchTranslationResult(translated=translated, skipped=skipped, failed=failed)

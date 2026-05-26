@@ -5,7 +5,7 @@ from pathlib import Path
 
 @dataclass
 class AppConfig:
-    ai_backend: str = "api"
+    ai_backend: str = "google"
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = ""
@@ -13,6 +13,9 @@ class AppConfig:
     opencode_path: str = "opencode"
     opencode_args: str = ""
     autosave_every: int = 5
+    max_workers: int = 3
+    rate_limit_seconds: float = 1.0
+    target_columns: list[str] | None = None
     last_csv_path: str = ""
 
 
