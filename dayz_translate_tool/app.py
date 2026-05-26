@@ -18,8 +18,8 @@ class DayZTranslateApp(ttk.Window):
     def __init__(self):
         super().__init__(themename="cosmo")
         self.title("DayZ Translate Tool")
-        self.geometry("1360x820")
-        self.minsize(1120, 680)
+        self.geometry("1280x760")
+        self.minsize(1060, 620)
         self.config_data = load_config()
         self.table: StringTable | None = None
         self.current_path: Path | None = None
@@ -34,7 +34,7 @@ class DayZTranslateApp(ttk.Window):
     def _configure_styles(self) -> None:
         self.style.configure(
             "Grid.Treeview",
-            rowheight=30,
+            rowheight=24,
             borderwidth=1,
             relief="solid",
             fieldbackground="#ffffff",
@@ -44,30 +44,29 @@ class DayZTranslateApp(ttk.Window):
             "Grid.Treeview.Heading",
             borderwidth=1,
             relief="solid",
-            padding=(8, 7),
-            font=("Segoe UI", 9, "bold"),
+            padding=(5, 4),
+            font=("Segoe UI", 8, "bold"),
         )
 
     def _build_ui(self) -> None:
         self._build_header()
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=BOTH, expand=True, padx=10, pady=(0, 8))
-        self.workbench_tab = ttk.Frame(self.notebook, padding=10)
-        self.settings_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.pack(fill=BOTH, expand=True, padx=6, pady=(0, 4))
+        self.workbench_tab = ttk.Frame(self.notebook, padding=6)
+        self.settings_tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(self.workbench_tab, text="翻译工作台")
         self.notebook.add(self.settings_tab, text="翻译设置")
         self._build_workbench_tab()
         self._build_settings_tab()
         self.status_var = tk.StringVar(value="准备就绪")
-        ttk.Label(self, textvariable=self.status_var, anchor="w", bootstyle="secondary").pack(fill=X, padx=10, pady=(0, 8))
+        ttk.Label(self, textvariable=self.status_var, anchor="w", bootstyle="secondary").pack(fill=X, padx=8, pady=(0, 4))
 
     def _build_header(self) -> None:
-        frame = ttk.Frame(self, padding=(10, 10, 10, 8))
+        frame = ttk.Frame(self, padding=(8, 6, 8, 4))
         frame.pack(fill=X)
         title = ttk.Frame(frame)
         title.pack(side=LEFT)
-        ttk.Label(title, text="DayZ Translate Tool", font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(title, text="stringtable.csv 编辑、扫描和批量翻译", bootstyle="secondary").pack(anchor="w")
+        ttk.Label(title, text="DayZ Translate Tool", font=("Segoe UI", 13, "bold")).pack(anchor="w")
         actions = ttk.Frame(frame)
         actions.pack(side=RIGHT)
         ttk.Button(actions, text="打开", command=self.open_csv, bootstyle="secondary").pack(side=LEFT, padx=3)
@@ -80,8 +79,8 @@ class DayZTranslateApp(ttk.Window):
         self._build_table(self.workbench_tab)
 
     def _build_file_bar(self, parent) -> None:
-        frame = ttk.Labelframe(parent, text="当前翻译表", padding=10)
-        frame.pack(fill=X, pady=(0, 8))
+        frame = ttk.Labelframe(parent, text="当前翻译表", padding=6)
+        frame.pack(fill=X, pady=(0, 4))
         self.path_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.path_var).pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
         ttk.Button(frame, text="扫描文件", command=self.scan_file, bootstyle="secondary").pack(side=LEFT, padx=2)
@@ -129,15 +128,15 @@ class DayZTranslateApp(ttk.Window):
         opencode.columnconfigure(3, weight=1)
 
     def _build_actions(self, parent) -> None:
-        frame = ttk.Labelframe(parent, text="翻译任务", padding=10)
-        frame.pack(fill=X, pady=(0, 8))
+        frame = ttk.Labelframe(parent, text="翻译任务", padding=6)
+        frame.pack(fill=X, pady=(0, 4))
         self.source_var = tk.StringVar()
         ttk.Label(frame, text="主语言/源列").pack(side=LEFT)
         self.source_combo = ttk.Combobox(frame, textvariable=self.source_var, width=18, state="readonly")
         self.source_combo.pack(side=LEFT, padx=4)
-        ttk.Label(frame, text="目标语言可多选").pack(side=LEFT, padx=(10, 0))
-        target_panel = ttk.Frame(frame, padding=(8, 4), borderwidth=1, relief="solid")
-        target_panel.pack(side=LEFT, fill=X, expand=True, padx=6)
+        ttk.Label(frame, text="目标语言").pack(side=LEFT, padx=(8, 0))
+        target_panel = ttk.Frame(frame, padding=(4, 2), borderwidth=1, relief="solid")
+        target_panel.pack(side=LEFT, fill=X, expand=True, padx=4)
         self.target_checks_frame = ttk.Frame(target_panel)
         self.target_checks_frame.pack(fill=X)
         ttk.Button(frame, text="全选目标", command=self.select_all_targets, bootstyle="secondary").pack(side=LEFT, padx=4)
@@ -342,11 +341,11 @@ class DayZTranslateApp(ttk.Window):
         for index, column_id in enumerate(self.column_ids):
             if column_id == "action":
                 self.tree.heading(column_id, text="操作")
-                self.tree.column(column_id, width=80, minwidth=70, stretch=False, anchor="center")
+                self.tree.column(column_id, width=62, minwidth=58, stretch=False, anchor="center")
             else:
                 heading = self.table.header[index] or "(空列)"
                 self.tree.heading(column_id, text=heading)
-                self.tree.column(column_id, width=150 if index else 190, minwidth=80, stretch=True)
+                self.tree.column(column_id, width=115 if index else 155, minwidth=64, stretch=True)
         for row_index, row in enumerate(self.table.rows):
             tag = "odd" if row_index % 2 else "even"
             self.tree.insert("", END, iid=str(row_index), values=row + ["翻译"], tags=(tag,))
@@ -367,7 +366,7 @@ class DayZTranslateApp(ttk.Window):
             variable = tk.BooleanVar(value=column in selected)
             self.target_vars[column] = variable
             check = ttk.Checkbutton(self.target_checks_frame, text=column or "(空列)", variable=variable, bootstyle="primary")
-            check.grid(row=index // 6, column=index % 6, sticky="w", padx=5, pady=3)
+            check.grid(row=index // 8, column=index % 8, sticky="w", padx=3, pady=1)
 
     def _on_table_double_click(self, event) -> None:
         if not self.table:

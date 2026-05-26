@@ -50,7 +50,7 @@ class StringTable:
             raise KeyError(f"找不到列: {column}") from exc
 
     def language_columns(self) -> list[str]:
-        return [column for column in self.header if column]
+        return [column for column in self.header[1:] if column]
 
     def keys(self) -> set[str]:
         if not self.header:

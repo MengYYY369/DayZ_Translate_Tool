@@ -40,6 +40,11 @@ class StringTableTests(unittest.TestCase):
         self.assertEqual(1, len(table.rows))
         self.assertEqual(["STR_Test_A", "", "", ""], table.rows[0])
 
+    def test_language_columns_excludes_key_and_empty_tail_columns(self):
+        table = StringTable(["Language", "original", "english", "chinesesimp", ""], [])
+
+        self.assertEqual(["original", "english", "chinesesimp"], table.language_columns())
+
 
 if __name__ == "__main__":
     unittest.main()
