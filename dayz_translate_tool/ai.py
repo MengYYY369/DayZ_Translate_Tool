@@ -1,4 +1,5 @@
 import json
+import re
 import shlex
 import subprocess
 import threading
@@ -94,6 +95,37 @@ def clean_ai_text(text: str) -> str:
     return result
 
 
+def clean_process_error(text: str) -> str:
+    result = re.sub(r"\x1b\[[0-9;]*m", "", text).strip()
+    start = result.find("{")
+    end = result.rfind("}")
+    if start != -1 and end > start:
+        try:
+            payload = json.loads(result[start : end + 1])
+            message = payload.get("data", {}).get("message") or payload.get("message")
+            if message:
+                result = str(message)
+        except json.JSONDecodeError:
+            pass
+    if "model not found" in result.lower():
+        result = f"{result}。请检查 Opencode 的 Run 参数或本机配置，改成当前账号可用的模型。"
+    return result
+
+
+def hidden_subprocess_kwargs() -> dict:
+    options = {}
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        options["creationflags"] = subprocess.CREATE_NO_WINDOW
+    if hasattr(subprocess, "STARTUPINFO"):
+        startupinfo = subprocess.STARTUPINFO()
+        if hasattr(subprocess, "STARTF_USESHOWWINDOW"):
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        if hasattr(subprocess, "SW_HIDE"):
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+        options["startupinfo"] = startupinfo
+    return options
+
+
 class OpenAICompatibleTranslator(AITranslator):
     def __init__(self, base_url: str, api_key: str, model: str, timeout_seconds: int = 60):
         self.base_url = base_url.strip()
@@ -165,9 +197,10 @@ class OpencodeCliTranslator(AITranslator):
             capture_output=True,
             timeout=self.timeout_seconds,
             check=False,
+            **hidden_subprocess_kwargs(),
         )
         if completed.returncode != 0:
-            stderr = completed.stderr.strip()
+            stderr = clean_process_error(completed.stderr)
             raise RuntimeError(f"Opencode 退出码 {completed.returncode}: {stderr}")
         output = clean_ai_text(completed.stdout)
         if not output:

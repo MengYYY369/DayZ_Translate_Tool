@@ -131,6 +131,40 @@ class AITests(unittest.TestCase):
         self.assertIn("源文本: Hello", command[-1])
         self.assertEqual("", run.call_args.kwargs["input"])
 
+    def test_opencode_translator_hides_console_window_when_supported(self):
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="译文\n", stderr="")
+        request = TranslationRequest(
+            key="STR_A",
+            source_language="english",
+            source_text="Hello",
+            target_language="chinesesimp",
+        )
+
+        with patch("dayz_translate_tool.ai.subprocess.run", return_value=completed) as run:
+            OpencodeCliTranslator("opencode").translate(request)
+
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            self.assertEqual(subprocess.CREATE_NO_WINDOW, run.call_args.kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW)
+
+    def test_opencode_translator_reports_model_not_found_cleanly(self):
+        stderr = '\x1b[91mError:\x1b[0m{"name":"UnknownError","data":{"message":"Model not found: gpt-5.5"}}'
+        completed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=stderr)
+        request = TranslationRequest(
+            key="STR_A",
+            source_language="english",
+            source_text="Hello",
+            target_language="chinesesimp",
+        )
+
+        with patch("dayz_translate_tool.ai.subprocess.run", return_value=completed):
+            with self.assertRaises(RuntimeError) as context:
+                OpencodeCliTranslator("opencode").translate(request)
+
+        message = str(context.exception)
+        self.assertIn("Model not found: gpt-5.5", message)
+        self.assertIn("Run 参数", message)
+        self.assertNotIn("\x1b", message)
+
 
 if __name__ == "__main__":
     unittest.main()
