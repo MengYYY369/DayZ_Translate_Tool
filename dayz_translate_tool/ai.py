@@ -153,13 +153,14 @@ class OpencodeCliTranslator(AITranslator):
     def translate(self, request: TranslationRequest) -> str:
         if not self.executable_path:
             raise ValueError("缺少 Opencode 可执行文件路径")
-        command = [self.executable_path]
+        command = [self.executable_path, "run"]
         if self.extra_args:
             command.extend(shlex.split(self.extra_args, posix=False))
         prompt = build_translation_prompt(request)
+        command.append(prompt)
         completed = subprocess.run(
             command,
-            input=prompt,
+            input="",
             text=True,
             capture_output=True,
             timeout=self.timeout_seconds,

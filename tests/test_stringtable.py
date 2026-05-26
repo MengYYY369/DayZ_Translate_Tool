@@ -32,6 +32,18 @@ class StringTableTests(unittest.TestCase):
                 header = next(csv.reader(handle))
             self.assertEqual(table.header, header)
 
+    def test_save_quotes_every_cell_for_dayz_stringtable_format(self):
+        table = StringTable(["Language", "english", ""], [["STR_Test", "Hello", ""]])
+
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "stringtable.csv"
+            table.save(output)
+
+            text = output.read_text(encoding="utf-8")
+
+        self.assertIn('"Language","english",""', text)
+        self.assertIn('"STR_Test","Hello",""', text)
+
     def test_add_key_skips_existing_and_fills_all_columns(self):
         table = StringTable(["Language", "original", "chinesesimp", ""], [])
 

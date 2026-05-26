@@ -32,7 +32,7 @@ class StringTable:
             raise ValueError("没有可保存的文件路径")
         encoding = "utf-8-sig" if self.has_bom else "utf-8"
         with target.open("w", encoding=encoding, newline="") as handle:
-            writer = csv.writer(handle, lineterminator="\r\n")
+            writer = csv.writer(handle, lineterminator="\r\n", quoting=csv.QUOTE_ALL)
             writer.writerow(self.header)
             writer.writerows(self.rows)
         self.path = target

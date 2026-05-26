@@ -25,6 +25,7 @@ class DayZTranslateApp(ttk.Window):
         self.current_path: Path | None = None
         self.dirty = False
         self.column_ids: list[str] = []
+        self.visible_column_indices: list[int] = []
         self.target_vars: dict[str, tk.BooleanVar] = {}
         self.edit_entry: tk.Entry | None = None
         self._configure_styles()
@@ -69,7 +70,12 @@ class DayZTranslateApp(ttk.Window):
         self._build_settings_tab()
         self._build_glossary_tab()
         self.status_var = tk.StringVar(value="准备就绪")
-        ttk.Label(self, textvariable=self.status_var, anchor="w", bootstyle="secondary").pack(fill=X, padx=8, pady=(0, 4))
+        self.progress_var = tk.DoubleVar(value=0)
+        status_frame = ttk.Frame(self, padding=(8, 0, 8, 4))
+        status_frame.pack(fill=X)
+        self.progress = ttk.Progressbar(status_frame, variable=self.progress_var, maximum=1, mode="determinate")
+        self.progress.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+        ttk.Label(status_frame, textvariable=self.status_var, anchor="w", bootstyle="secondary", width=48).pack(side=LEFT)
 
     def _build_workbench_tab(self) -> None:
         self._build_actions(self.workbench_tab)
@@ -112,7 +118,7 @@ class DayZTranslateApp(ttk.Window):
         ttk.Label(opencode, text="程序").grid(row=0, column=0, sticky="w")
         ttk.Entry(opencode, textvariable=self.opencode_path_var).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(opencode, text="选择程序", command=self.choose_opencode_program, bootstyle="secondary").grid(row=0, column=2, padx=4)
-        ttk.Label(opencode, text="附加参数").grid(row=0, column=3, sticky="w")
+        ttk.Label(opencode, text="Run 参数").grid(row=0, column=3, sticky="w")
         ttk.Entry(opencode, textvariable=self.opencode_args_var).grid(row=0, column=4, sticky="ew", padx=6)
         opencode.columnconfigure(1, weight=1)
         opencode.columnconfigure(4, weight=1)
@@ -353,6 +359,7 @@ class DayZTranslateApp(ttk.Window):
         rate_limit_seconds = max(0.0, float(self.rate_limit_var.get()))
         self._save_config_from_ui()
         self._set_translation_buttons(DISABLED)
+        self._set_progress(0, len(row_indices) * len(target_columns))
         self._set_status(f"开始翻译 {len(row_indices)} 行 x {len(target_columns)} 个目标")
         thread = threading.Thread(
             target=self._translation_worker,
@@ -367,6 +374,7 @@ class DayZTranslateApp(ttk.Window):
                 table.save(self.current_path)
 
         def progress(done: int, total: int) -> None:
+            self.after(0, lambda: self._set_progress(done, total))
             self.after(0, lambda: self._set_status(f"AI 翻译进度 {done}/{total}"))
 
         result = self.table.translate_rows_multi(
@@ -386,6 +394,7 @@ class DayZTranslateApp(ttk.Window):
         self.dirty = self.current_path is None and result.translated > 0
         self._reload_tree()
         self._set_translation_buttons(NORMAL)
+        self._set_progress(1, 1)
         failed = f"，失败 {len(result.failed)} 行" if result.failed else ""
         self._set_status(f"翻译完成：成功 {result.translated} 行，跳过 {result.skipped} 行{failed}")
         if result.failed:
@@ -414,25 +423,26 @@ class DayZTranslateApp(ttk.Window):
             self.tree.delete(item)
         if not self.table:
             return
-        self.column_ids = [f"c{index}" for index in range(len(self.table.header))] + ["action"]
+        self.visible_column_indices = [index for index, column in enumerate(self.table.header) if column]
+        self.column_ids = [f"c{index}" for index in self.visible_column_indices]
         self.tree.configure(columns=self.column_ids)
-        for index, column_id in enumerate(self.column_ids):
-            if column_id == "action":
-                self.tree.heading(column_id, text="操作")
-                self.tree.column(column_id, width=62, minwidth=58, stretch=False, anchor="center")
-            else:
-                heading = self.table.header[index] or "(空列)"
-                self.tree.heading(column_id, text=heading)
-                self.tree.column(column_id, width=115 if index else 155, minwidth=64, stretch=True)
+        for column_pos, column_id in enumerate(self.column_ids):
+            header_index = self.visible_column_indices[column_pos]
+            heading = self.table.header[header_index]
+            self.tree.heading(column_id, text=heading)
+            self.tree.column(column_id, width=112 if header_index else 155, minwidth=62, stretch=True)
         for row_index, row in enumerate(self.table.rows):
             tag = "odd" if row_index % 2 else "even"
-            self.tree.insert("", END, iid=str(row_index), values=row + ["翻译"], tags=(tag,))
+            self.tree.insert("", END, iid=str(row_index), values=self._visible_row_values(row), tags=(tag,))
         columns = self.table.language_columns()
         self.source_combo.configure(values=columns)
         self.glossary_language_combo.configure(values=columns or DEFAULT_LANGUAGE_COLUMNS)
         if not self.source_var.get() and "english" in columns:
             self.source_var.set("english")
         self._reload_target_checks(columns)
+
+    def _visible_row_values(self, row: list[str]) -> list[str]:
+        return [row[index] for index in self.visible_column_indices]
 
     def _reload_target_checks(self, columns: list[str]) -> None:
         previous_selection = set(self._selected_target_columns())
@@ -455,10 +465,7 @@ class DayZTranslateApp(ttk.Window):
         if not iid or not column:
             return
         column_pos = int(column.replace("#", "")) - 1
-        if column_pos == len(self.table.header):
-            self.translate_single_row(int(iid))
-            return
-        if column_pos < 0 or column_pos >= len(self.table.header):
+        if column_pos < 0 or column_pos >= len(self.visible_column_indices):
             return
         self._edit_cell(iid, column_pos)
 
@@ -470,7 +477,8 @@ class DayZTranslateApp(ttk.Window):
         if not bbox:
             return
         x, y, width, height = bbox
-        value = self.table.rows[int(iid)][column_pos]
+        header_index = self.visible_column_indices[column_pos]
+        value = self.table.rows[int(iid)][header_index]
         self.edit_entry = tk.Entry(self.tree)
         self.edit_entry.insert(0, value)
         self.edit_entry.select_range(0, END)
@@ -483,8 +491,9 @@ class DayZTranslateApp(ttk.Window):
     def _commit_edit(self, iid: str, column_pos: int) -> None:
         if not self.edit_entry or not self.table:
             return
-        self.table.rows[int(iid)][column_pos] = self.edit_entry.get()
-        self.tree.item(iid, values=self.table.rows[int(iid)] + ["翻译"])
+        header_index = self.visible_column_indices[column_pos]
+        self.table.rows[int(iid)][header_index] = self.edit_entry.get()
+        self.tree.item(iid, values=self._visible_row_values(self.table.rows[int(iid)]))
         self.edit_entry.destroy()
         self.edit_entry = None
         self.dirty = True
@@ -513,6 +522,12 @@ class DayZTranslateApp(ttk.Window):
     def _set_translation_buttons(self, state: str) -> None:
         self.translate_selected_button.configure(state=state)
         self.translate_all_button.configure(state=state)
+
+    def _set_progress(self, done: int, total: int) -> None:
+        maximum = max(1, int(total))
+        value = max(0, min(int(done), maximum))
+        self.progress.configure(maximum=maximum)
+        self.progress_var.set(value)
 
     def _set_status(self, message: str) -> None:
         marker = " *" if self.dirty else ""

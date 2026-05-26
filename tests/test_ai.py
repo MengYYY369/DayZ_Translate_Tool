@@ -1,3 +1,4 @@
+import subprocess
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -5,6 +6,7 @@ from dayz_translate_tool.ai import (
     AITranslator,
     BatchTranslationResult,
     GoogleTranslateTranslator,
+    OpencodeCliTranslator,
     RateLimiter,
     TranslationRequest,
     build_translation_prompt,
@@ -110,6 +112,24 @@ class AITests(unittest.TestCase):
             result = GoogleTranslateTranslator(timeout_seconds=10).translate(request)
 
         self.assertEqual("Hallo", result)
+
+    def test_opencode_translator_uses_run_command_with_prompt_argument(self):
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="译文\n", stderr="")
+        request = TranslationRequest(
+            key="STR_A",
+            source_language="english",
+            source_text="Hello",
+            target_language="chinesesimp",
+        )
+
+        with patch("dayz_translate_tool.ai.subprocess.run", return_value=completed) as run:
+            result = OpencodeCliTranslator("opencode", "--model test/model").translate(request)
+
+        command = run.call_args.args[0]
+        self.assertEqual("译文", result)
+        self.assertEqual(["opencode", "run", "--model", "test/model"], command[:4])
+        self.assertIn("源文本: Hello", command[-1])
+        self.assertEqual("", run.call_args.kwargs["input"])
 
 
 if __name__ == "__main__":
