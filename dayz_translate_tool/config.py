@@ -3,6 +3,24 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
+DEFAULT_LANGUAGE_COLUMNS = [
+    "original",
+    "english",
+    "czech",
+    "german",
+    "russian",
+    "polish",
+    "hungarian",
+    "italian",
+    "spanish",
+    "french",
+    "chinese",
+    "japanese",
+    "portuguese",
+    "chinesesimp",
+]
+
+
 @dataclass
 class AppConfig:
     ai_backend: str = "google"
