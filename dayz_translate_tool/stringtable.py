@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from .ai import BatchTranslationResult, RateLimiter, TranslationRequest
+from .ai import BatchTranslationResult, MultiTranslationRequest, RateLimiter, TranslationRequest
 
 
 class StringTable:
@@ -105,48 +105,70 @@ class StringTable:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         max_workers: int = 1,
         rate_limit_seconds: float = 0.0,
+        cancel_callback: Optional[Callable[[], bool]] = None,
     ) -> BatchTranslationResult:
         translated = 0
         skipped = 0
+        canceled = False
         failed: list[tuple[int, str]] = []
         indices = list(row_indices)
         targets = [column for column in target_columns if column and column != source_column]
-        jobs: list[tuple[int, str, TranslationRequest]] = []
+        jobs: list[tuple[int, MultiTranslationRequest]] = []
         for row_index in indices:
+            if cancel_callback and cancel_callback():
+                canceled = True
+                break
             source_text = self.get_cell(row_index, source_column).strip()
             if not source_text:
                 skipped += len(targets)
                 continue
+            requests = []
             for target_column in targets:
-                request = TranslationRequest(
-                    key=self.rows[row_index][0],
-                    source_language=source_column,
-                    source_text=source_text,
-                    target_language=target_column,
-                    current_target_text=self.get_cell(row_index, target_column).strip(),
+                requests.append(
+                    TranslationRequest(
+                        key=self.rows[row_index][0],
+                        source_language=source_column,
+                        source_text=source_text,
+                        target_language=target_column,
+                        current_target_text=self.get_cell(row_index, target_column).strip(),
+                    )
                 )
-                jobs.append((row_index, target_column, request))
+            jobs.append((row_index, MultiTranslationRequest(self.rows[row_index][0], source_column, source_text, requests)))
         completed = 0
         total = len(jobs)
         limiter = RateLimiter(rate_limit_seconds)
 
-        def run_job(job: tuple[int, str, TranslationRequest]) -> tuple[int, str, str]:
-            row_index, target_column, request = job
+        def run_job(job: tuple[int, MultiTranslationRequest]) -> tuple[int, dict[str, str]]:
+            row_index, request = job
+            if cancel_callback and cancel_callback():
+                return row_index, {}
             limiter.wait()
-            return row_index, target_column, translator.translate(request).strip()
+            if cancel_callback and cancel_callback():
+                return row_index, {}
+            return row_index, translator.translate_many(request)
 
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
             futures = {executor.submit(run_job, job): job for job in jobs}
             for future in as_completed(futures):
-                row_index, target_column, _request = futures[future]
+                if cancel_callback and cancel_callback():
+                    canceled = True
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                row_index, request = futures[future]
                 try:
-                    _row_index, _target_column, result = future.result()
-                    if not result:
-                        raise RuntimeError("AI 返回了空翻译")
-                    self.set_cell(row_index, target_column, result)
-                    translated += 1
-                    if save_callback and autosave_every > 0 and translated % autosave_every == 0:
-                        save_callback(self)
+                    _row_index, results = future.result()
+                    if cancel_callback and cancel_callback():
+                        canceled = True
+                        break
+                    for target in request.targets:
+                        result = results.get(target.target_language, "").strip()
+                        if not result:
+                            raise RuntimeError(f"AI 没有返回 {target.target_language} 翻译")
+                        self.set_cell(row_index, target.target_language, result)
+                        translated += 1
+                        if save_callback and autosave_every > 0 and translated % autosave_every == 0:
+                            save_callback(self)
                 except Exception as exc:
                     failed.append((row_index, str(exc)))
                 completed += 1
@@ -156,7 +178,7 @@ class StringTable:
             progress_callback(0, 0)
         if save_callback and translated > 0:
             save_callback(self)
-        return BatchTranslationResult(translated=translated, skipped=skipped, failed=failed)
+        return BatchTranslationResult(translated=translated, skipped=skipped, failed=failed, canceled=canceled)
 
     def _normalize_row(self, row: list[str]) -> list[str]:
         normalized = list(row[: len(self.header)])

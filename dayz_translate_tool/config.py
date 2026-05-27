@@ -27,7 +27,10 @@ class AppConfig:
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = ""
-    timeout_seconds: int = 60
+    timeout_seconds: int = 240
+    azure_key: str = ""
+    azure_endpoint: str = "https://api.cognitive.microsofttranslator.com"
+    azure_region: str = ""
     opencode_path: str = "opencode"
     opencode_args: str = ""
     opencode_port: int = 31319
@@ -37,6 +40,7 @@ class AppConfig:
     max_workers: int = 3
     rate_limit_seconds: float = 1.0
     target_columns: list[str] | None = None
+    scan_key_prefixes: str = ""
     glossary_entries: list[dict[str, str]] = field(default_factory=list)
     last_csv_path: str = ""
 
