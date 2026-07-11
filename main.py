@@ -25,7 +25,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from config_cpp import collect_config_cpp_files, extract_keys_from_paths, merge_language_keys
 from dayz_csv import (
+    DAYZ_HEADERS,
     build_column_translation_jobs,
     build_row_translation_jobs,
     language_code_for_header,
@@ -117,6 +119,16 @@ UI_TEXT = {
         "cancelling_translation": "Cancelling translation...",
         "unsaved_changes": "Unsaved changes",
         "save_changes_before_close": "Save changes to {path} before closing?",
+        "import_config_cpp": "Import from config.cpp...",
+        "import_config_cpp_folder": "Import config.cpp from Folder...",
+        "import_config_cpp_title": "Select config.cpp files",
+        "import_config_folder_title": "Select folder containing config.cpp",
+        "config_cpp_files": "config.cpp (config.cpp);;C++ files (*.cpp);;All files (*.*)",
+        "import_requires_csv": "Open a DayZ stringtable.csv before importing config.cpp keys.",
+        "import_no_files": "No config.cpp files were selected.",
+        "import_no_new_keys": "No new keys to import. Skipped duplicates: {skipped}. Files: {files}.",
+        "import_result": "Imported {added} keys, skipped {skipped} duplicates, files: {files}.",
+        "import_failed": "Import failed",
     },
     "zh": {
         "file": "文件",
@@ -179,6 +191,16 @@ UI_TEXT = {
         "cancelling_translation": "正在取消翻译...",
         "unsaved_changes": "未保存的更改",
         "save_changes_before_close": "关闭前要保存 {path} 的更改吗？",
+        "import_config_cpp": "从 config.cpp 导入...",
+        "import_config_cpp_folder": "从文件夹批量导入 config.cpp...",
+        "import_config_cpp_title": "选择 config.cpp 文件",
+        "import_config_folder_title": "选择包含 config.cpp 的文件夹",
+        "config_cpp_files": "config.cpp (config.cpp);;C++ 文件 (*.cpp);;所有文件 (*.*)",
+        "import_requires_csv": "请先打开 DayZ stringtable.csv，再导入 config.cpp 键。",
+        "import_no_files": "没有选择 config.cpp 文件。",
+        "import_no_new_keys": "没有可导入的新键。跳过重复 {skipped}，文件数 {files}。",
+        "import_result": "新增 {added} 个键，跳过重复 {skipped}，文件数 {files}。",
+        "import_failed": "导入失败",
     },
 }
 PROVIDER_FIELD_KEYS = {
@@ -727,6 +749,14 @@ class DayzTranslateTool(QMainWindow):
         self.action_save_as.triggered.connect(self.save_file_as)
         self.menu_file.addAction(self.action_save_as)
 
+        self.menu_file.addSeparator()
+        self.action_import_config_cpp = QAction("Import from config.cpp...", self)
+        self.action_import_config_cpp.triggered.connect(self.import_from_config_cpp_files)
+        self.menu_file.addAction(self.action_import_config_cpp)
+        self.action_import_config_folder = QAction("Import config.cpp from Folder...", self)
+        self.action_import_config_folder.triggered.connect(self.import_config_cpp_from_folder)
+        self.menu_file.addAction(self.action_import_config_folder)
+
         self.menu_search = self.menuBar().addMenu("Search")
         self.search_action = QAction("Search", self)
         self.search_action.setShortcut(QKeySequence.Find)
@@ -755,6 +785,8 @@ class DayzTranslateTool(QMainWindow):
         self.action_open.setText(texts["open"])
         self.action_save.setText(texts["save"])
         self.action_save_as.setText(texts["save_as"])
+        self.action_import_config_cpp.setText(texts["import_config_cpp"])
+        self.action_import_config_folder.setText(texts["import_config_cpp_folder"])
         self.menu_search.setTitle(texts["search"])
         self.search_action.setText(texts["search"])
         self.menu_settings.setTitle(texts["settings"])
@@ -804,6 +836,13 @@ class DayzTranslateTool(QMainWindow):
 
         self.headers = headers
         self.current_path = Path(path)
+        self.apply_table_rows(rows, dirty=False)
+        message = self.tr("loaded", path=self.current_path)
+        if warnings:
+            message = f"{message} | " + "; ".join(warnings)
+        self.statusBar().showMessage(message, 8000)
+
+    def apply_table_rows(self, rows, dirty=True):
         self.loading = True
         self.table.blockSignals(True)
         self.table.clear()
@@ -820,11 +859,60 @@ class DayzTranslateTool(QMainWindow):
         self.table.blockSignals(False)
         self.loading = False
         self.apply_column_widths()
-        self.set_dirty(False)
-        message = self.tr("loaded", path=self.current_path)
-        if warnings:
-            message = f"{message} | " + "; ".join(warnings)
-        self.statusBar().showMessage(message, 8000)
+        self.set_dirty(bool(dirty))
+
+    def import_from_config_cpp_files(self):
+        if not self.headers:
+            QMessageBox.warning(self, self.tr("import_failed"), self.tr("import_requires_csv"))
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            self.tr("import_config_cpp_title"),
+            "",
+            self.tr("config_cpp_files"),
+        )
+        if not paths:
+            return
+        self._import_config_cpp_paths(paths)
+
+    def import_config_cpp_from_folder(self):
+        if not self.headers:
+            QMessageBox.warning(self, self.tr("import_failed"), self.tr("import_requires_csv"))
+            return
+        folder = QFileDialog.getExistingDirectory(self, self.tr("import_config_folder_title"), "")
+        if not folder:
+            return
+        paths = collect_config_cpp_files(folder)
+        if not paths:
+            QMessageBox.information(self, self.tr("import_failed"), self.tr("import_no_files"))
+            return
+        self._import_config_cpp_paths(paths)
+
+    def _import_config_cpp_paths(self, paths):
+        if not self.headers:
+            QMessageBox.warning(self, self.tr("import_failed"), self.tr("import_requires_csv"))
+            return
+        try:
+            keys, file_warnings = extract_keys_from_paths(paths)
+            existing = self.table_rows()
+            merged, added, skipped = merge_language_keys(existing, keys)
+        except Exception as exc:
+            QMessageBox.critical(self, self.tr("import_failed"), str(exc))
+            return
+
+        files_count = len(list(paths))
+        if added == 0:
+            msg = self.tr("import_no_new_keys", skipped=skipped, files=files_count)
+            if file_warnings:
+                msg = msg + "\n" + "\n".join(file_warnings)
+            QMessageBox.information(self, self.tr("import_config_cpp"), msg)
+            return
+
+        self.apply_table_rows(merged, dirty=True)
+        msg = self.tr("import_result", added=added, skipped=skipped, files=files_count)
+        if file_warnings:
+            msg = f"{msg} | " + "; ".join(file_warnings)
+        self.statusBar().showMessage(msg, 8000)
 
     def apply_column_widths(self):
         for column_index in range(self.table.columnCount()):
