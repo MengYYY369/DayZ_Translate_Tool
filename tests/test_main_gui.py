@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidgetSelectionRange, QTableWidgetItem
 
 from dayz_csv import DAYZ_HEADERS
 from main import DayzTranslateTool, LanguageSettingsDialog, SearchDialog, TranslationSettingsDialog, WordbookWindow
@@ -22,6 +22,7 @@ class MainGuiTests(unittest.TestCase):
     def setUp(self):
         self.settings = QSettings("DayZTranslateToolTests", "DayZTranslateToolTests")
         self.settings.clear()
+        self.settings.sync()
         self.window = DayzTranslateTool(settings=self.settings)
         self._ensure_dayz_table()
 
@@ -190,6 +191,40 @@ class MainGuiTests(unittest.TestCase):
         self.window.translate_selected_cells()
 
         self.assertEqual(captured_jobs, [(0, 14, "Knife", "zh-CN")])
+
+    def test_right_click_context_menu_selects_target_cell(self):
+        self.window.table.clearSelection()
+        self.window.set_cell_text(0, 4, "")
+        center = self.window.table.visualItemRect(self.window.table.item(0, 4)).center()
+
+        with patch.object(self.window, "show_context_menu") as show_menu:
+            self.window.open_context_menu(center)
+            show_menu.assert_called_once()
+            self.assertEqual(show_menu.call_args.args[:3], ("cell", 0, 4))
+
+        selected = [(item.row(), item.column()) for item in self.window.table.selectedItems()]
+        self.assertEqual(selected, [(0, 4)])
+        self.assertEqual(self.window.table.currentRow(), 0)
+        self.assertEqual(self.window.table.currentColumn(), 4)
+
+    def test_translate_selected_cells_falls_back_to_current_cell(self):
+        captured_jobs = []
+        self.window.source_header = "english"
+        self.window.set_cell_text(0, 2, "Knife")
+        self.window.table.clearSelection()
+        self.window.table.setCurrentCell(0, 4)
+        self.window.run_translation_jobs = lambda jobs: captured_jobs.extend(jobs)
+
+        self.window.translate_selected_cells()
+
+        self.assertEqual(captured_jobs, [(0, 4, "Knife", "de")])
+
+    def test_finish_translation_shows_errors_when_all_jobs_fail(self):
+        results = TranslationResults(translated=0, failed=2, errors=["network down", "timeout"])
+        with patch.object(QMessageBox, "warning") as warning:
+            self.window.finish_translation(results)
+            warning.assert_called()
+            self.assertIn("network down", warning.call_args.args[2])
 
     def test_translation_settings_dialog_saves_provider_and_parallel_batches(self):
         dialog = TranslationSettingsDialog(self.window)
@@ -507,6 +542,177 @@ class MainGuiTests(unittest.TestCase):
         self.window.delete_translation_preset("DeleteMe")
 
         self.assertNotIn("DeleteMe", self.window.translation_preset_names())
+
+    def test_preset_combo_switch_auto_loads_values(self):
+        self.window.translation_provider = "openai"
+        self.window.translation_api_key = "key-a"
+        self.window.translation_model = "model-a"
+        self.window.translation_base_url = "https://a.test/v1"
+        self.window.save_translation_preset("PresetA")
+
+        self.window.translation_api_key = "key-b"
+        self.window.translation_model = "model-b"
+        self.window.translation_base_url = "https://b.test/v1"
+        self.window.save_translation_preset("PresetB")
+
+        dialog = TranslationSettingsDialog(self.window)
+        dialog.provider_combo.setCurrentText("OpenAI")
+
+        dialog.preset_combo.setCurrentText("PresetA")
+        dialog.auto_load_preset("PresetA")
+        self.assertEqual(dialog.api_key_input.text(), "key-a")
+        self.assertEqual(dialog.model_input.text(), "model-a")
+        self.assertEqual(dialog.base_url_input.text(), "https://a.test/v1")
+
+        dialog.preset_combo.setCurrentText("PresetB")
+        dialog.auto_load_preset("PresetB")
+        self.assertEqual(dialog.api_key_input.text(), "key-b")
+        self.assertEqual(dialog.model_input.text(), "model-b")
+        self.assertEqual(dialog.base_url_input.text(), "https://b.test/v1")
+
+    def test_preset_combo_shows_star_when_field_value_changes(self):
+        self.window.translation_provider = "openai"
+        self.window.translation_api_key = "original-key"
+        self.window.translation_model = "original-model"
+        self.window.translation_base_url = "https://original.test/v1"
+        self.window.save_translation_preset("StarPreset")
+
+        dialog = TranslationSettingsDialog(self.window)
+        dialog.provider_combo.setCurrentText("OpenAI")
+        dialog.preset_combo.setCurrentText("StarPreset")
+        dialog.auto_load_preset("StarPreset")
+
+        self.assertEqual(dialog.dirty_indicator_label.text(), "")
+
+        dialog.api_key_input.setText("changed-key")
+
+        self.assertTrue(dialog.is_preset_dirty())
+        self.assertEqual(dialog.dirty_indicator_label.text(), "*")
+
+    def test_preset_combo_clears_star_after_saving_preset(self):
+        self.window.translation_provider = "openai"
+        self.window.translation_api_key = "save-key"
+        self.window.translation_model = "save-model"
+        self.window.translation_base_url = "https://save.test/v1"
+        self.window.save_translation_preset("SavePreset")
+
+        dialog = TranslationSettingsDialog(self.window)
+        dialog.provider_combo.setCurrentText("OpenAI")
+        dialog.preset_combo.setCurrentText("SavePreset")
+        dialog.auto_load_preset("SavePreset")
+
+        dialog.api_key_input.setText("changed-key")
+        self.assertTrue(dialog.is_preset_dirty())
+        self.assertEqual(dialog.dirty_indicator_label.text(), "*")
+
+        dialog.preset_name_input.setText("SavePreset")
+        dialog.save_preset()
+
+        self.assertEqual(dialog.dirty_indicator_label.text(), "")
+
+    def test_preset_load_button_is_removed(self):
+        dialog = TranslationSettingsDialog(self.window)
+        self.assertFalse(hasattr(dialog, "load_preset_button"))
+
+    def test_open_csv_remember_last_directory(self):
+        import csv
+        import tempfile
+        import os
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = os.path.join(tmpdir, "subfolder", "test.csv")
+            os.makedirs(os.path.dirname(csv_path))
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["key", "original", "english"])
+                writer.writerow(["STR_TEST", "Hello", "Hello"])
+
+            self.window.open_csv_from_path(csv_path)
+            self.assertEqual(self.window.last_file_directory, os.path.join(tmpdir, "subfolder"))
+
+    def test_save_csv_remember_last_directory(self):
+        import tempfile
+        import os
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = os.path.join(tmpdir, "savefolder", "output.csv")
+            os.makedirs(os.path.dirname(save_path))
+            self.window.save_csv_to_path(save_path)
+            self.assertEqual(self.window.last_file_directory, os.path.join(tmpdir, "savefolder"))
+
+    def test_last_file_directory_defaults_to_empty(self):
+        self.assertEqual(self.window.last_file_directory, "")
+
+    def test_right_click_preserves_multi_selection(self):
+        table = self.window.table
+        table.setRangeSelected(QTableWidgetSelectionRange(0, 0, 1, table.columnCount() - 1), True)
+
+        center = table.visualItemRect(table.item(0, 0)).center()
+        with patch.object(self.window, "show_context_menu"):
+            self.window.open_context_menu(center)
+
+        selected_ranges = table.selectedRanges()
+        self.assertGreater(len(selected_ranges), 0)
+        total_selected_rows = sum(r.bottomRow() - r.topRow() + 1 for r in selected_ranges)
+        self.assertGreater(total_selected_rows, 1)
+
+    def test_right_click_on_unselected_cell_clears_selection(self):
+        table = self.window.table
+        table.setRangeSelected(QTableWidgetSelectionRange(0, 0, 0, table.columnCount() - 1), True)
+
+        self.window.set_cell_text(1, 0, "Unselected")
+        center = table.visualItemRect(table.item(1, 0)).center()
+        with patch.object(self.window, "show_context_menu"):
+            self.window.open_context_menu(center)
+
+        selected_range = table.selectedRanges()[0]
+        self.assertEqual(selected_range.topRow(), 1)
+        self.assertEqual(selected_range.bottomRow(), 1)
+
+    def test_right_click_preserves_selection_on_empty_cell(self):
+        table = self.window.table
+        self.window.set_cell_text(0, 4, "")
+        self.window.set_cell_text(1, 4, "")
+        table.setRangeSelected(QTableWidgetSelectionRange(0, 0, 1, table.columnCount() - 1), True)
+
+        center = table.visualItemRect(table.item(0, 0)).center()
+        with patch.object(self.window, "show_context_menu"):
+            self.window.open_context_menu(center)
+
+        selected_ranges = table.selectedRanges()
+        self.assertGreater(len(selected_ranges), 0)
+        total_selected_rows = sum(r.bottomRow() - r.topRow() + 1 for r in selected_ranges)
+        self.assertGreater(total_selected_rows, 1)
+
+    def test_translate_all_cells_creates_jobs_for_all_translatable_cells(self):
+        captured_jobs = []
+        self.window.source_header = "english"
+        self.window.set_cell_text(0, 2, "Knife")
+        self.window.set_cell_text(1, 2, "Rifle")
+        self.window.run_translation_jobs = lambda jobs: captured_jobs.extend(jobs)
+
+        self.window.translate_all_cells()
+
+        self.assertGreater(len(captured_jobs), 0)
+        job_positions = [(j[0], j[1]) for j in captured_jobs]
+        self.assertIn((0, 3), job_positions)
+        self.assertIn((1, 3), job_positions)
+
+    def test_translate_empty_cells_only_translates_blank_targets(self):
+        captured_jobs = []
+        self.window.source_header = "english"
+        self.window.set_cell_text(0, 2, "Knife")
+        self.window.set_cell_text(1, 2, "Rifle")
+        self.window.set_cell_text(0, 3, "Messer")
+        self.window.run_translation_jobs = lambda jobs: captured_jobs.extend(jobs)
+
+        self.window.translate_empty_cells()
+
+        job_positions = [(j[0], j[1]) for j in captured_jobs]
+        self.assertNotIn((0, 3), job_positions)
+        self.assertIn((1, 3), job_positions)
+
+    def test_translate_all_cells_menu_action_exists(self):
+        self.assertTrue(hasattr(self.window, "action_translate_all"))
+        self.assertTrue(hasattr(self.window, "action_translate_empty"))
 
 
 if __name__ == "__main__":

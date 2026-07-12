@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QThread, Qt
+from PySide6.QtCore import QSettings, QThread, Qt, QItemSelectionModel
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -121,6 +121,8 @@ UI_TEXT = {
         "save_changes_before_close": "Save changes to {path} before closing?",
         "import_config_cpp": "Import from config.cpp...",
         "import_config_cpp_folder": "Import config.cpp from Folder...",
+        "translate_all_cells": "Translate All Cells",
+        "translate_empty_cells": "Translate Empty Cells",
         "import_config_cpp_title": "Select config.cpp files",
         "import_config_folder_title": "Select folder containing config.cpp",
         "config_cpp_files": "config.cpp (config.cpp);;C++ files (*.cpp);;All files (*.*)",
@@ -193,6 +195,8 @@ UI_TEXT = {
         "save_changes_before_close": "关闭前要保存 {path} 的更改吗？",
         "import_config_cpp": "从 config.cpp 导入...",
         "import_config_cpp_folder": "从文件夹批量导入 config.cpp...",
+        "translate_all_cells": "翻译全表",
+        "translate_empty_cells": "翻译空白单元格",
         "import_config_cpp_title": "选择 config.cpp 文件",
         "import_config_folder_title": "选择包含 config.cpp 的文件夹",
         "config_cpp_files": "config.cpp (config.cpp);;C++ 文件 (*.cpp);;所有文件 (*.*)",
@@ -309,6 +313,7 @@ class TranslationSettingsDialog(QDialog):
         super().__init__(window)
         self.window = window
         self.form_rows = {}
+        self._loading_preset = False
         self.setWindowTitle(window.tr("translation_settings").rstrip("."))
 
         self.provider_combo = QComboBox(self)
@@ -318,10 +323,10 @@ class TranslationSettingsDialog(QDialog):
         self.preset_combo = QComboBox(self)
         self.refresh_presets()
         self.preset_name_input = QLineEdit(self)
+        self.dirty_indicator_label = QLabel("", self)
+        self.dirty_indicator_label.setFixedWidth(16)
         self.save_preset_button = QPushButton(window.tr("save"), self)
         self.save_preset_button.clicked.connect(self.save_preset)
-        self.load_preset_button = QPushButton(window.tr("open"), self)
-        self.load_preset_button.clicked.connect(self.load_preset)
         self.delete_preset_button = QPushButton("Delete", self)
         self.delete_preset_button.clicked.connect(self.delete_preset)
 
@@ -351,7 +356,7 @@ class TranslationSettingsDialog(QDialog):
         form = QFormLayout()
         preset_layout = QHBoxLayout()
         preset_layout.addWidget(self.preset_combo)
-        preset_layout.addWidget(self.load_preset_button)
+        preset_layout.addWidget(self.dirty_indicator_label)
         preset_layout.addWidget(self.preset_name_input)
         preset_layout.addWidget(self.save_preset_button)
         preset_layout.addWidget(self.delete_preset_button)
@@ -369,6 +374,7 @@ class TranslationSettingsDialog(QDialog):
         self.provider_combo.currentTextChanged.connect(self.update_visible_fields)
         self.connect_auto_save_signals()
         self.update_visible_fields()
+        self.preset_combo.currentTextChanged.connect(self.auto_load_preset)
 
         save_button = QPushButton(window.tr("save"), self)
         save_button.clicked.connect(self.apply_settings)
@@ -419,14 +425,20 @@ class TranslationSettingsDialog(QDialog):
         return not label.isHidden() and not widget.isHidden()
 
     def connect_auto_save_signals(self):
-        self.provider_combo.currentTextChanged.connect(lambda value: self.apply_settings(close_dialog=False))
-        self.batch_size_input.valueChanged.connect(lambda value: self.apply_settings(close_dialog=False))
-        self.parallel_batches_input.valueChanged.connect(lambda value: self.apply_settings(close_dialog=False))
-        self.api_key_input.textChanged.connect(lambda value: self.apply_settings(close_dialog=False))
-        self.region_input.textChanged.connect(lambda value: self.apply_settings(close_dialog=False))
-        self.model_input.textChanged.connect(lambda value: self.apply_settings(close_dialog=False))
-        self.base_url_input.textChanged.connect(lambda value: self.apply_settings(close_dialog=False))
-        self.email_input.textChanged.connect(lambda value: self.apply_settings(close_dialog=False))
+        self.provider_combo.currentTextChanged.connect(self._on_field_changed)
+        self.batch_size_input.valueChanged.connect(self._on_field_changed)
+        self.parallel_batches_input.valueChanged.connect(self._on_field_changed)
+        self.api_key_input.textChanged.connect(self._on_field_changed)
+        self.region_input.textChanged.connect(self._on_field_changed)
+        self.model_input.textChanged.connect(self._on_field_changed)
+        self.base_url_input.textChanged.connect(self._on_field_changed)
+        self.email_input.textChanged.connect(self._on_field_changed)
+
+    def _on_field_changed(self, value=None):
+        if self._loading_preset:
+            return
+        self.apply_settings(close_dialog=False)
+        self.refresh_preset_dirty_indicator()
 
     def apply_settings(self, close_dialog=True):
         provider_label = self.provider_combo.currentText()
@@ -444,20 +456,29 @@ class TranslationSettingsDialog(QDialog):
             self.accept()
 
     def refresh_presets(self):
+        self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
         self.preset_combo.addItems(self.window.translation_preset_names())
+        self.preset_combo.blockSignals(False)
 
     def save_preset(self):
         self.apply_settings(close_dialog=False)
         self.window.save_translation_preset(self.preset_name_input.text())
         self.refresh_presets()
+        self._loaded_preset_values = self.current_field_values()
+        self.refresh_preset_dirty_indicator()
 
     def delete_preset(self):
-        self.window.delete_translation_preset(self.preset_combo.currentText())
+        name = (self.preset_combo.currentText() or "").rstrip("*").strip()
+        self.window.delete_translation_preset(name)
         self.refresh_presets()
+        self.refresh_preset_dirty_indicator()
 
-    def load_preset(self):
-        name = self.preset_combo.currentText()
+    def auto_load_preset(self, name):
+        name = (name or "").rstrip("*").strip()
+        if not name:
+            return
+        self._loading_preset = True
         self.window.load_translation_preset(name)
         self.provider_combo.setCurrentText(PROVIDER_LABELS.get(self.window.translation_provider, "Google"))
         self.batch_size_input.setValue(self.window.translation_batch_size)
@@ -467,6 +488,45 @@ class TranslationSettingsDialog(QDialog):
         self.model_input.setText(self.window.translation_model)
         self.base_url_input.setText(self.window.translation_base_url)
         self.email_input.setText(self.window.translation_email)
+        self._loading_preset = False
+        self.update_visible_fields()
+        self._loaded_preset_values = self.current_field_values()
+        self.refresh_preset_dirty_indicator()
+
+    def current_field_values(self):
+        return {
+            "provider": self.window.translation_provider,
+            "batch_size": self.batch_size_input.value(),
+            "parallel_batches": self.parallel_batches_input.value(),
+            "api_key": self.api_key_input.text().strip(),
+            "region": self.region_input.text().strip(),
+            "model": self.model_input.text().strip(),
+            "base_url": self.base_url_input.text().strip(),
+            "email": self.email_input.text().strip(),
+        }
+
+    def preset_saved_values(self):
+        return getattr(self, '_loaded_preset_values', None)
+
+    def is_preset_dirty(self):
+        saved = self.preset_saved_values()
+        if saved is None:
+            return False
+        current = self.current_field_values()
+        for key, value in current.items():
+            saved_value = saved.get(key, "")
+            if str(value) != str(saved_value):
+                return True
+        return False
+
+    def refresh_preset_dirty_indicator(self):
+        if self.preset_saved_values() is None:
+            self.dirty_indicator_label.setText("")
+            return
+        if self.is_preset_dirty():
+            self.dirty_indicator_label.setText("*")
+        else:
+            self.dirty_indicator_label.setText("")
 
 
 class LanguageSettingsDialog(QDialog):
@@ -691,6 +751,7 @@ class DayzTranslateTool(QMainWindow):
         self.loading = False
         self.is_dirty = False
         self.settings = settings if settings is not None else QSettings("DayZTranslateTool", "DayZTranslateTool")
+        self.last_file_directory = self.settings.value("last_file_directory", "")
         self.source_header = self.settings.value("source_header", "english")
         self.translation_provider = normalize_provider(self.settings.value("translation_provider", "google"))
         self.translation_batch_size = int(self.settings.value("translation_batch_size", 30))
@@ -757,6 +818,14 @@ class DayzTranslateTool(QMainWindow):
         self.action_import_config_folder.triggered.connect(self.import_config_cpp_from_folder)
         self.menu_file.addAction(self.action_import_config_folder)
 
+        self.menu_file.addSeparator()
+        self.action_translate_all = QAction("Translate All Cells", self)
+        self.action_translate_all.triggered.connect(self.translate_all_cells)
+        self.menu_file.addAction(self.action_translate_all)
+        self.action_translate_empty = QAction("Translate Empty Cells", self)
+        self.action_translate_empty.triggered.connect(self.translate_empty_cells)
+        self.menu_file.addAction(self.action_translate_empty)
+
         self.menu_search = self.menuBar().addMenu("Search")
         self.search_action = QAction("Search", self)
         self.search_action.setShortcut(QKeySequence.Find)
@@ -787,6 +856,8 @@ class DayzTranslateTool(QMainWindow):
         self.action_save_as.setText(texts["save_as"])
         self.action_import_config_cpp.setText(texts["import_config_cpp"])
         self.action_import_config_folder.setText(texts["import_config_cpp_folder"])
+        self.action_translate_all.setText(texts["translate_all_cells"])
+        self.action_translate_empty.setText(texts["translate_empty_cells"])
         self.menu_search.setTitle(texts["search"])
         self.search_action.setText(texts["search"])
         self.menu_settings.setTitle(texts["settings"])
@@ -823,9 +894,15 @@ class DayzTranslateTool(QMainWindow):
         self.translation_cancel_button.show()
 
     def open_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, self.tr("open_dayz_csv"), str(DEFAULT_CSV_PATH), self.tr("csv_files"))
+        start_dir = self.last_file_directory or str(DEFAULT_CSV_PATH)
+        path, _ = QFileDialog.getOpenFileName(self, self.tr("open_dayz_csv"), start_dir, self.tr("csv_files"))
         if path:
-            self.load_file(Path(path))
+            self.open_csv_from_path(path)
+
+    def open_csv_from_path(self, path):
+        self.load_file(Path(path))
+        self.last_file_directory = str(Path(path).parent)
+        self.settings.setValue("last_file_directory", self.last_file_directory)
 
     def load_file(self, path):
         try:
@@ -930,10 +1007,18 @@ class DayzTranslateTool(QMainWindow):
         return self.write_current_file(self.current_path)
 
     def save_file_as(self):
-        path, _ = QFileDialog.getSaveFileName(self, self.tr("save_dayz_csv"), str(self.current_path or DEFAULT_CSV_PATH), self.tr("csv_files"))
+        start_dir = self.last_file_directory or str(self.current_path or DEFAULT_CSV_PATH)
+        path, _ = QFileDialog.getSaveFileName(self, self.tr("save_dayz_csv"), start_dir, self.tr("csv_files"))
         if path:
-            return self.write_current_file(Path(path))
+            return self.save_csv_to_path(path)
         return False
+
+    def save_csv_to_path(self, path):
+        result = self.write_current_file(Path(path))
+        if result:
+            self.last_file_directory = str(Path(path).parent)
+            self.settings.setValue("last_file_directory", self.last_file_directory)
+        return result
 
     def write_current_file(self, path):
         if not self.headers:
@@ -1042,10 +1127,10 @@ class DayzTranslateTool(QMainWindow):
         self.save_translation_settings()
 
     def translation_preset_names(self):
-        self.settings.beginGroup("translation_presets")
-        names = self.settings.childGroups()
-        self.settings.endGroup()
-        return names
+        names = self.settings.value("translation_preset_names_list", [])
+        if isinstance(names, str):
+            names = [names]
+        return sorted(names)
 
     def save_translation_preset(self, name):
         name = (name or "").strip()
@@ -1055,13 +1140,18 @@ class DayzTranslateTool(QMainWindow):
         for key, value in self.current_translation_settings_dict().items():
             self.settings.setValue(key, value)
         self.settings.endGroup()
+        names = self.translation_preset_names()
+        if name not in names:
+            names.append(name)
+        self.settings.setValue("translation_preset_names_list", names)
 
     def load_translation_preset(self, name):
         name = (name or "").strip()
         if not name:
             return
+        preset_keys = ["provider", "batch_size", "parallel_batches", "api_key", "region", "model", "base_url", "email"]
         self.settings.beginGroup(f"translation_presets/{name}")
-        values = {key: self.settings.value(key) for key in self.settings.childKeys()}
+        values = {key: self.settings.value(key) for key in preset_keys}
         self.settings.endGroup()
         self.apply_translation_settings_dict(values)
 
@@ -1070,13 +1160,33 @@ class DayzTranslateTool(QMainWindow):
         if not name:
             return
         self.settings.remove(f"translation_presets/{name}")
+        names = self.translation_preset_names()
+        if name in names:
+            names.remove(name)
+        self.settings.setValue("translation_preset_names_list", names)
 
     def save_ui_language(self):
         self.settings.setValue("ui_language", self.ui_language)
 
+    def is_cell_in_selection(self, row, column):
+        for selected_range in self.table.selectedRanges():
+            if selected_range.topRow() <= row <= selected_range.bottomRow() and \
+               selected_range.leftColumn() <= column <= selected_range.rightColumn():
+                return True
+        return False
+
     def open_context_menu(self, position):
         row = self.table.rowAt(position.y())
         column = self.table.columnAt(position.x())
+        if row >= 0 and column >= 0:
+            item = self.table.item(row, column)
+            if item is None:
+                item = QTableWidgetItem("")
+                self.table.setItem(row, column, item)
+            if not self.is_cell_in_selection(row, column):
+                self.table.clearSelection()
+                item.setSelected(True)
+            self.table.setCurrentCell(row, column, QItemSelectionModel.NoUpdate)
         self.show_context_menu("cell", row, column, self.table.viewport().mapToGlobal(position))
 
     def open_row_header_context_menu(self, position):
@@ -1237,7 +1347,7 @@ class DayzTranslateTool(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, self.tr("translate_cells"), self.tr("source_column_missing", header=self.source_header))
             return
-        for item in self.table.selectedItems():
+        for item in self.selected_cell_items():
             if not self.is_translatable_column(item.column()):
                 continue
             target_code = language_code_for_header(self.headers[item.column()])
@@ -1245,6 +1355,20 @@ class DayzTranslateTool(QMainWindow):
             if source_text and target_code:
                 jobs.append((item.row(), item.column(), source_text, target_code))
         self.run_translation_jobs(jobs)
+
+    def selected_cell_items(self):
+        items = list(self.table.selectedItems())
+        if items:
+            return items
+        row = self.table.currentRow()
+        column = self.table.currentColumn()
+        if row < 0 or column < 0:
+            return []
+        item = self.table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem("")
+            self.table.setItem(row, column, item)
+        return [item]
 
     def translate_selected_rows(self):
         rows, columns = self.selected_rows_and_columns()
@@ -1268,6 +1392,49 @@ class DayzTranslateTool(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, self.tr("translate_columns"), str(exc))
             return
+        self.run_translation_jobs(jobs)
+
+    def translate_all_cells(self):
+        try:
+            source_column = self.headers.index(self.source_header)
+        except ValueError:
+            QMessageBox.warning(self, self.tr("translate_cells"), self.tr("source_column_missing", header=self.source_header))
+            return
+        rows = self.table_rows()
+        jobs = []
+        for row_index, row in enumerate(rows):
+            source_text = row[source_column].strip() if source_column < len(row) else ""
+            if not source_text:
+                continue
+            for col_index in range(len(self.headers)):
+                if col_index == source_column or not self.is_translatable_column(col_index):
+                    continue
+                target_code = language_code_for_header(self.headers[col_index])
+                if target_code:
+                    jobs.append((row_index, col_index, source_text, target_code))
+        self.run_translation_jobs(jobs)
+
+    def translate_empty_cells(self):
+        try:
+            source_column = self.headers.index(self.source_header)
+        except ValueError:
+            QMessageBox.warning(self, self.tr("translate_cells"), self.tr("source_column_missing", header=self.source_header))
+            return
+        rows = self.table_rows()
+        jobs = []
+        for row_index, row in enumerate(rows):
+            source_text = row[source_column].strip() if source_column < len(row) else ""
+            if not source_text:
+                continue
+            for col_index in range(len(self.headers)):
+                if col_index == source_column or not self.is_translatable_column(col_index):
+                    continue
+                target_code = language_code_for_header(self.headers[col_index])
+                if not target_code:
+                    continue
+                target_text = row[col_index].strip() if col_index < len(row) else ""
+                if not target_text:
+                    jobs.append((row_index, col_index, source_text, target_code))
         self.run_translation_jobs(jobs)
 
     def selected_rows_and_columns(self):
@@ -1374,6 +1541,8 @@ class DayzTranslateTool(QMainWindow):
             5000,
         )
         self.hide_translation_progress()
+        if results.failed and results.errors and results.translated == 0:
+            QMessageBox.warning(self, self.tr("translate_failed"), "\n".join(results.errors[:3]))
 
     def fail_translation(self, message):
         self.hide_translation_progress()
