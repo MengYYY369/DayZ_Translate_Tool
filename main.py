@@ -208,7 +208,7 @@ UI_TEXT = {
     },
 }
 PROVIDER_FIELD_KEYS = {
-    "google": set(),
+    "google": {"base_url"},
     "mymemory": {"email"},
     "deepl": {"api_key"},
     "microsoft": {"api_key", "region"},
@@ -1116,14 +1116,14 @@ class DayzTranslateTool(QMainWindow):
         }
 
     def apply_translation_settings_dict(self, values):
-        self.translation_provider = normalize_provider(values.get("provider", self.translation_provider))
-        self.translation_batch_size = int(values.get("batch_size", self.translation_batch_size))
-        self.translation_parallel_batches = int(values.get("parallel_batches", self.translation_parallel_batches))
-        self.translation_api_key = values.get("api_key", self.translation_api_key)
-        self.translation_region = values.get("region", self.translation_region)
-        self.translation_model = values.get("model", self.translation_model)
-        self.translation_base_url = values.get("base_url", self.translation_base_url)
-        self.translation_email = values.get("email", self.translation_email)
+        self.translation_provider = normalize_provider(values.get("provider") or self.translation_provider)
+        self.translation_batch_size = int(values.get("batch_size") or self.translation_batch_size)
+        self.translation_parallel_batches = int(values.get("parallel_batches") or self.translation_parallel_batches)
+        self.translation_api_key = values.get("api_key") or self.translation_api_key
+        self.translation_region = values.get("region") or self.translation_region
+        self.translation_model = values.get("model") or self.translation_model
+        self.translation_base_url = values.get("base_url") or self.translation_base_url
+        self.translation_email = values.get("email") or self.translation_email
         self.save_translation_settings()
 
     def translation_preset_names(self):
@@ -1144,6 +1144,7 @@ class DayzTranslateTool(QMainWindow):
         if name not in names:
             names.append(name)
         self.settings.setValue("translation_preset_names_list", names)
+        self.settings.sync()
 
     def load_translation_preset(self, name):
         name = (name or "").strip()

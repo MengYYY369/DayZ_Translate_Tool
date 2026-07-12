@@ -263,7 +263,7 @@ class MainGuiTests(unittest.TestCase):
         self.assertFalse(dialog.is_field_visible("region"))
         self.assertFalse(dialog.is_field_visible("model"))
         self.assertFalse(dialog.is_field_visible("email"))
-        self.assertFalse(dialog.is_field_visible("base_url"))
+        self.assertTrue(dialog.is_field_visible("base_url"))
 
         dialog.provider_combo.setCurrentText("Microsoft")
         self.assertTrue(dialog.is_field_visible("api_key"))

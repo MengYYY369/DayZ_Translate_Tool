@@ -1,5 +1,6 @@
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +25,7 @@ class TranslatorConfig:
     model: str = ""
     email: str = ""
     base_url: str = ""
+    timeout: float = 15.0
     glossary: list = field(default_factory=list)
 
 
@@ -43,13 +45,17 @@ class TranslationService:
         self.batch_size = batch_size
         self.cache = {}
         self.openai_translator_class = OpenAICompatibleTranslator
+        self.google_translator_class = GoogleTranslateTranslator
 
     def create_provider(self, source, target, config):
         provider = normalize_provider(config.provider)
         if provider == "google":
-            from deep_translator import GoogleTranslator
-
-            return GoogleTranslator(source=source, target=target)
+            return self.google_translator_class(
+                source=source,
+                target=target,
+                base_url=config.base_url,
+                timeout=config.timeout,
+            )
         if provider == "mymemory":
             from deep_translator import MyMemoryTranslator
 
@@ -393,3 +399,83 @@ class OpenAICompatibleTranslator:
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
         return "\n".join(lines).strip()
+
+
+class GoogleTranslateTranslator:
+    """Google Translate via the googleapis.com JSON endpoint.
+
+    Uses ``translate.googleapis.com/translate_a/single`` instead of the
+    HTML-scraping ``translate.google.com/m`` endpoint used by
+    ``deep_translator.GoogleTranslator``.  The JSON endpoint is more
+    reliable and supports a configurable timeout so the UI does not hang
+    indefinitely when the network is unreachable.
+    """
+
+    DEFAULT_BASE_URL = "https://translate.googleapis.com/translate_a/single"
+    DEFAULT_TIMEOUT = 15.0
+
+    def __init__(self, source="auto", target="en", base_url="", timeout=None,
+                 request_func=None):
+        self.source = source
+        self.target = target
+        self.base_url = self._normalize_base_url(base_url or self.DEFAULT_BASE_URL)
+        self.timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
+        self.request_func = request_func or self._default_request
+
+    @staticmethod
+    def _normalize_base_url(url):
+        url = url.strip().rstrip("/")
+        if not url.endswith("/translate_a/single"):
+            url = f"{url}/translate_a/single"
+        return url
+
+    def translate(self, text):
+        return self.translate_batch([text])[0]
+
+    def translate_batch(self, texts):
+        if not texts:
+            return []
+        params = [("client", "gtx"), ("sl", self.source),
+                  ("tl", self.target), ("dt", "t")]
+        params.extend(("q", text) for text in texts)
+        query_string = urllib.parse.urlencode(params)
+        url = f"{self.base_url}?{query_string}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+        data = self.request_func(url, headers)
+        translated = self._extract_translations(data)
+        if len(translated) != len(texts):
+            raise RuntimeError(
+                f"Google returned {len(translated)} translations "
+                f"for {len(texts)} texts."
+            )
+        return translated
+
+    @staticmethod
+    def _extract_translations(data):
+        if not isinstance(data, list) or not data or not isinstance(data[0], list):
+            raise RuntimeError(f"Unexpected Google Translate response: {data}")
+        translations = []
+        for item in data[0]:
+            if isinstance(item, list) and item:
+                translations.append(item[0])
+            else:
+                raise RuntimeError(f"Unexpected Google Translate response item: {item}")
+        return translations
+
+    def _default_request(self, url, headers):
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Google Translate HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Google Translate request failed: {exc.reason}") from exc
+        return json.loads(body)
