@@ -86,6 +86,54 @@ class MainGuiTests(unittest.TestCase):
         self.assertEqual(self.window.translation_provider, "google")
         self.assertEqual(self.window.translation_parallel_batches, 1)
 
+    def test_provider_settings_are_isolated_between_providers(self):
+        self.window.translation_provider = "deepl"
+        self.window.translation_api_key = "deepl-key"
+        self.window.save_translation_settings()
+
+        self.window.translation_provider = "microsoft"
+        self.window.translation_api_key = "ms-key"
+        self.window.translation_region = "eastus"
+        self.window.save_translation_settings()
+
+        self.window.translation_provider = "deepl"
+        self.assertEqual(self.window.translation_api_key, "deepl-key")
+
+        self.window.translation_provider = "microsoft"
+        self.assertEqual(self.window.translation_api_key, "ms-key")
+        self.assertEqual(self.window.translation_region, "eastus")
+
+    def test_dialog_switching_provider_loads_correct_per_provider_settings(self):
+        self.window.translation_provider = "deepl"
+        self.window.translation_api_key = "deepl-key"
+        self.window.save_translation_settings()
+
+        self.window.translation_provider = "microsoft"
+        self.window.translation_api_key = "ms-key"
+        self.window.save_translation_settings()
+
+        dialog = TranslationSettingsDialog(self.window)
+        dialog.provider_combo.setCurrentText("DeepL")
+        self.assertEqual(dialog.api_key_input.text(), "deepl-key")
+
+        dialog.provider_combo.setCurrentText("Microsoft")
+        self.assertEqual(dialog.api_key_input.text(), "ms-key")
+
+    def test_dialog_switching_provider_saves_old_provider_fields(self):
+        self.window.translation_provider = "deepl"
+        self.window.translation_api_key = "original-deepl"
+        self.window.save_translation_settings()
+
+        dialog = TranslationSettingsDialog(self.window)
+        dialog.provider_combo.setCurrentText("DeepL")
+        dialog.api_key_input.setText("changed-deepl")
+
+        dialog.provider_combo.setCurrentText("Microsoft")
+        dialog.api_key_input.setText("ms-key")
+
+        self.assertEqual(self.window.get_provider_setting("deepl", "api_key"), "changed-deepl")
+        self.assertEqual(self.window.get_provider_setting("microsoft", "api_key"), "ms-key")
+
     def test_body_context_menu_hides_translation_for_language_column_only(self):
         actions = self.window.context_action_labels(context="cell", row=0, column=0)
 
@@ -232,7 +280,6 @@ class MainGuiTests(unittest.TestCase):
         dialog.parallel_batches_input.setValue(3)
         dialog.batch_size_input.setValue(40)
         dialog.api_key_input.setText("secret")
-        dialog.base_url_input.setText("https://example.test/v1")
 
         dialog.apply_settings()
 
@@ -240,7 +287,6 @@ class MainGuiTests(unittest.TestCase):
         self.assertEqual(self.window.translation_parallel_batches, 3)
         self.assertEqual(self.window.translation_batch_size, 40)
         self.assertEqual(self.window.translation_api_key, "secret")
-        self.assertEqual(self.window.translation_base_url, "https://example.test/v1")
         self.assertFalse(hasattr(dialog, "language_combo"))
         self.assertGreaterEqual(dialog.width(), 620)
 
@@ -251,9 +297,9 @@ class MainGuiTests(unittest.TestCase):
         dialog.model_input.setText("gpt-test")
         dialog.base_url_input.setText("https://example.test/v1")
 
-        self.assertEqual(self.settings.value("translation_provider"), "openai")
-        self.assertEqual(self.settings.value("translation_model"), "gpt-test")
-        self.assertEqual(self.settings.value("translation_base_url"), "https://example.test/v1")
+        self.assertEqual(self.window.translation_provider, "openai")
+        self.assertEqual(self.window.translation_model, "gpt-test")
+        self.assertEqual(self.window.translation_base_url, "https://example.test/v1")
 
     def test_translation_settings_dialog_shows_fields_for_selected_provider(self):
         dialog = TranslationSettingsDialog(self.window)
@@ -263,7 +309,7 @@ class MainGuiTests(unittest.TestCase):
         self.assertFalse(dialog.is_field_visible("region"))
         self.assertFalse(dialog.is_field_visible("model"))
         self.assertFalse(dialog.is_field_visible("email"))
-        self.assertTrue(dialog.is_field_visible("base_url"))
+        self.assertFalse(dialog.is_field_visible("base_url"))
 
         dialog.provider_combo.setCurrentText("Microsoft")
         self.assertTrue(dialog.is_field_visible("api_key"))
@@ -336,6 +382,68 @@ class MainGuiTests(unittest.TestCase):
 
         self.assertEqual(self.window.table.item(0, 2).text(), "")
         self.assertTrue(self.window.is_dirty)
+
+    def test_context_menu_includes_delete_selected_cells_when_multi_selected(self):
+        table = self.window.table
+        table.setRangeSelected(QTableWidgetSelectionRange(0, 2, 1, 4), True)
+
+        actions = self.window.context_action_names(context="cell", row=0, column=2)
+
+        self.assertIn("delete_cell", actions)
+        self.assertIn("delete_selected_cells", actions)
+
+    def test_context_menu_omits_delete_selected_cells_for_single_cell(self):
+        table = self.window.table
+        table.clearSelection()
+        table.setCurrentCell(0, 2)
+        item = table.item(0, 2)
+        if item is not None:
+            item.setSelected(True)
+
+        actions = self.window.context_action_names(context="cell", row=0, column=2)
+
+        self.assertIn("delete_cell", actions)
+        self.assertNotIn("delete_selected_cells", actions)
+
+    def test_delete_selected_cells_clears_all_selected_cells(self):
+        table = self.window.table
+        self.window.set_cell_text(0, 2, "A")
+        self.window.set_cell_text(0, 3, "B")
+        self.window.set_cell_text(1, 2, "C")
+        self.window.set_cell_text(1, 3, "D")
+        self.window.set_cell_text(0, 5, "Keep")
+        table.setRangeSelected(QTableWidgetSelectionRange(0, 2, 1, 3), True)
+        self.window.set_dirty(False)
+
+        self.window.delete_selected_cells()
+
+        self.assertEqual(table.item(0, 2).text(), "")
+        self.assertEqual(table.item(0, 3).text(), "")
+        self.assertEqual(table.item(1, 2).text(), "")
+        self.assertEqual(table.item(1, 3).text(), "")
+        self.assertEqual(table.item(0, 5).text(), "Keep")
+        self.assertTrue(self.window.is_dirty)
+
+    def test_delete_selected_cells_clears_empty_items_in_range(self):
+        table = self.window.table
+        self.window.set_cell_text(0, 2, "A")
+        table.setRangeSelected(QTableWidgetSelectionRange(0, 2, 1, 2), True)
+        self.window.set_dirty(False)
+
+        self.window.delete_selected_cells()
+
+        self.assertEqual(self.window.table.item(0, 2).text(), "")
+        self.assertEqual(self.window.table.item(1, 2).text(), "")
+        self.assertTrue(self.window.is_dirty)
+
+    def test_delete_selected_cells_chinese_label(self):
+        self.window.ui_language = "zh"
+        self.window.apply_ui_language()
+        self.window.table.setRangeSelected(QTableWidgetSelectionRange(0, 2, 1, 3), True)
+
+        labels = self.window.context_action_labels(context="cell", row=0, column=2)
+
+        self.assertIn("删除选中单元格", labels)
 
     def test_delete_row_removes_current_row_without_leaving_empty_row(self):
         self.window.table.setRowCount(2)

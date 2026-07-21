@@ -87,6 +87,7 @@ UI_TEXT = {
         "paste": "Paste",
         "cut": "Cut",
         "delete_cell": "Delete Cell",
+        "delete_selected_cells": "Delete Selected Cells",
         "delete_row": "Delete Row",
         "delete_column": "Delete Column",
         "translate_selected_cells": "Translate Selected Cells",
@@ -161,6 +162,7 @@ UI_TEXT = {
         "paste": "粘贴",
         "cut": "剪切",
         "delete_cell": "删除单元格",
+        "delete_selected_cells": "删除选中单元格",
         "delete_row": "删除行",
         "delete_column": "删除列",
         "translate_selected_cells": "翻译选中单元格",
@@ -208,11 +210,18 @@ UI_TEXT = {
     },
 }
 PROVIDER_FIELD_KEYS = {
-    "google": {"base_url"},
+    "google": set(),
     "mymemory": {"email"},
     "deepl": {"api_key"},
     "microsoft": {"api_key", "region"},
     "openai": {"api_key", "model", "base_url"},
+}
+PROVIDER_DEFAULTS = {
+    "google": {},
+    "mymemory": {"email": ""},
+    "deepl": {"api_key": ""},
+    "microsoft": {"api_key": "", "region": ""},
+    "openai": {"api_key": "", "model": "gpt-3.5-turbo", "base_url": ""},
 }
 
 
@@ -319,6 +328,7 @@ class TranslationSettingsDialog(QDialog):
         self.provider_combo = QComboBox(self)
         self.provider_combo.addItems(PROVIDER_LABELS.values())
         self.provider_combo.setCurrentText(PROVIDER_LABELS.get(window.translation_provider, "Google"))
+        self._current_dialog_provider = window.translation_provider
 
         self.preset_combo = QComboBox(self)
         self.refresh_presets()
@@ -371,7 +381,7 @@ class TranslationSettingsDialog(QDialog):
         self.add_form_row(form, "model", window.tr("model"), self.model_input)
         self.add_form_row(form, "base_url", window.tr("base_url"), self.base_url_input)
         self.add_form_row(form, "email", window.tr("email"), self.email_input)
-        self.provider_combo.currentTextChanged.connect(self.update_visible_fields)
+        self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
         self.connect_auto_save_signals()
         self.update_visible_fields()
         self.preset_combo.currentTextChanged.connect(self.auto_load_preset)
@@ -425,7 +435,6 @@ class TranslationSettingsDialog(QDialog):
         return not label.isHidden() and not widget.isHidden()
 
     def connect_auto_save_signals(self):
-        self.provider_combo.currentTextChanged.connect(self._on_field_changed)
         self.batch_size_input.valueChanged.connect(self._on_field_changed)
         self.parallel_batches_input.valueChanged.connect(self._on_field_changed)
         self.api_key_input.textChanged.connect(self._on_field_changed)
@@ -433,6 +442,58 @@ class TranslationSettingsDialog(QDialog):
         self.model_input.textChanged.connect(self._on_field_changed)
         self.base_url_input.textChanged.connect(self._on_field_changed)
         self.email_input.textChanged.connect(self._on_field_changed)
+
+    def _on_provider_changed(self, label):
+        if self._loading_preset:
+            return
+        old_provider = self._current_dialog_provider
+        self._save_dialog_fields_for_provider(old_provider)
+        new_provider = next(key for key, lbl in PROVIDER_LABELS.items() if lbl == label)
+        self._block_field_signals(True)
+        for key in PROVIDER_FIELD_KEYS.get(new_provider, set()):
+            value = self.window.get_provider_setting(new_provider, key, "")
+            self._set_field_value(key, value)
+        self._block_field_signals(False)
+        self._current_dialog_provider = new_provider
+        self.update_visible_fields()
+        self.apply_settings(close_dialog=False)
+        self.refresh_preset_dirty_indicator()
+
+    def _save_dialog_fields_for_provider(self, provider):
+        for key in PROVIDER_FIELD_KEYS.get(provider, set()):
+            self.window.set_provider_setting(provider, key, self._get_field_value(key))
+
+    def _get_field_value(self, key):
+        field_map = {
+            "api_key": self.api_key_input,
+            "region": self.region_input,
+            "model": self.model_input,
+            "base_url": self.base_url_input,
+            "email": self.email_input,
+        }
+        widget = field_map.get(key)
+        if widget is not None:
+            return widget.text().strip()
+        return ""
+
+    def _set_field_value(self, key, value):
+        field_map = {
+            "api_key": self.api_key_input,
+            "region": self.region_input,
+            "model": self.model_input,
+            "base_url": self.base_url_input,
+            "email": self.email_input,
+        }
+        widget = field_map.get(key)
+        if widget is not None:
+            widget.setText(value or "")
+
+    def _block_field_signals(self, block):
+        self.api_key_input.blockSignals(block)
+        self.region_input.blockSignals(block)
+        self.model_input.blockSignals(block)
+        self.base_url_input.blockSignals(block)
+        self.email_input.blockSignals(block)
 
     def _on_field_changed(self, value=None):
         if self._loading_preset:
@@ -446,11 +507,8 @@ class TranslationSettingsDialog(QDialog):
         self.window.translation_provider = provider
         self.window.translation_batch_size = self.batch_size_input.value()
         self.window.translation_parallel_batches = self.parallel_batches_input.value()
-        self.window.translation_api_key = self.api_key_input.text().strip()
-        self.window.translation_region = self.region_input.text().strip()
-        self.window.translation_model = self.model_input.text().strip()
-        self.window.translation_base_url = self.base_url_input.text().strip()
-        self.window.translation_email = self.email_input.text().strip()
+        for key in PROVIDER_FIELD_KEYS.get(provider, set()):
+            self.window.set_provider_setting(provider, key, self._get_field_value(key))
         self.window.save_translation_settings()
         if close_dialog:
             self.accept()
@@ -489,6 +547,7 @@ class TranslationSettingsDialog(QDialog):
         self.base_url_input.setText(self.window.translation_base_url)
         self.email_input.setText(self.window.translation_email)
         self._loading_preset = False
+        self._current_dialog_provider = self.window.translation_provider
         self.update_visible_fields()
         self._loaded_preset_values = self.current_field_values()
         self.refresh_preset_dirty_indicator()
@@ -756,11 +815,7 @@ class DayzTranslateTool(QMainWindow):
         self.translation_provider = normalize_provider(self.settings.value("translation_provider", "google"))
         self.translation_batch_size = int(self.settings.value("translation_batch_size", 30))
         self.translation_parallel_batches = int(self.settings.value("translation_parallel_batches", 1))
-        self.translation_api_key = self.settings.value("translation_api_key", "")
-        self.translation_region = self.settings.value("translation_region", "")
-        self.translation_model = self.settings.value("translation_model", "gpt-3.5-turbo")
-        self.translation_base_url = self.settings.value("translation_base_url", "")
-        self.translation_email = self.settings.value("translation_email", "")
+        self.provider_settings = self._load_provider_settings()
         self.ui_language = self.settings.value("ui_language", "en")
         self.table = QTableWidget(self)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1089,15 +1144,79 @@ class DayzTranslateTool(QMainWindow):
         self.wordbook_window.raise_()
         self.wordbook_window.activateWindow()
 
+    def _load_provider_settings(self):
+        result = {}
+        for provider, defaults in PROVIDER_DEFAULTS.items():
+            self.settings.beginGroup(f"provider_settings/{provider}")
+            values = {}
+            for key, default_value in defaults.items():
+                stored = self.settings.value(key, None)
+                values[key] = stored if stored is not None else default_value
+            self.settings.endGroup()
+            result[provider] = values
+        return result
+
+    def _save_provider_settings(self):
+        for provider, values in self.provider_settings.items():
+            self.settings.beginGroup(f"provider_settings/{provider}")
+            for key, value in values.items():
+                self.settings.setValue(key, value)
+            self.settings.endGroup()
+        self.settings.sync()
+
+    def get_provider_setting(self, provider, key, default=""):
+        return self.provider_settings.get(provider, {}).get(key, default)
+
+    def set_provider_setting(self, provider, key, value):
+        if provider not in self.provider_settings:
+            self.provider_settings[provider] = {}
+        self.provider_settings[provider][key] = value
+
+    @property
+    def translation_api_key(self):
+        return self.get_provider_setting(self.translation_provider, "api_key", "")
+
+    @translation_api_key.setter
+    def translation_api_key(self, value):
+        self.set_provider_setting(self.translation_provider, "api_key", value)
+
+    @property
+    def translation_region(self):
+        return self.get_provider_setting(self.translation_provider, "region", "")
+
+    @translation_region.setter
+    def translation_region(self, value):
+        self.set_provider_setting(self.translation_provider, "region", value)
+
+    @property
+    def translation_model(self):
+        return self.get_provider_setting(self.translation_provider, "model", "gpt-3.5-turbo")
+
+    @translation_model.setter
+    def translation_model(self, value):
+        self.set_provider_setting(self.translation_provider, "model", value)
+
+    @property
+    def translation_base_url(self):
+        return self.get_provider_setting(self.translation_provider, "base_url", "")
+
+    @translation_base_url.setter
+    def translation_base_url(self, value):
+        self.set_provider_setting(self.translation_provider, "base_url", value)
+
+    @property
+    def translation_email(self):
+        return self.get_provider_setting(self.translation_provider, "email", "")
+
+    @translation_email.setter
+    def translation_email(self, value):
+        self.set_provider_setting(self.translation_provider, "email", value)
+
     def save_translation_settings(self):
         self.settings.setValue("translation_provider", self.translation_provider)
         self.settings.setValue("translation_batch_size", self.translation_batch_size)
         self.settings.setValue("translation_parallel_batches", self.translation_parallel_batches)
-        self.settings.setValue("translation_api_key", self.translation_api_key)
-        self.settings.setValue("translation_region", self.translation_region)
-        self.settings.setValue("translation_model", self.translation_model)
-        self.settings.setValue("translation_base_url", self.translation_base_url)
-        self.settings.setValue("translation_email", self.translation_email)
+        self._save_provider_settings()
         self.statusBar().showMessage(
             self.tr("translation_engine_status", engine=PROVIDER_LABELS.get(self.translation_provider, self.translation_provider)),
             5000,
@@ -1176,6 +1295,17 @@ class DayzTranslateTool(QMainWindow):
                 return True
         return False
 
+    def has_multi_cell_selection(self):
+        ranges = self.table.selectedRanges()
+        if len(ranges) > 1:
+            return True
+        for selected_range in ranges:
+            rows = selected_range.bottomRow() - selected_range.topRow() + 1
+            columns = selected_range.rightColumn() - selected_range.leftColumn() + 1
+            if rows * columns > 1:
+                return True
+        return False
+
     def open_context_menu(self, position):
         row = self.table.rowAt(position.y())
         column = self.table.columnAt(position.x())
@@ -1209,6 +1339,7 @@ class DayzTranslateTool(QMainWindow):
             "paste": self.paste_selection,
             "cut": self.cut_selection,
             "delete_cell": self.delete_cell_text,
+            "delete_selected_cells": self.delete_selected_cells,
             "delete_row": self.delete_rows,
             "delete_column": self.delete_column_cells,
             "translate_selected_cells": self.translate_selected_cells,
@@ -1233,6 +1364,8 @@ class DayzTranslateTool(QMainWindow):
             actions.append("delete_column")
         elif context == "cell" and row >= 0 and column >= 0:
             actions.append("delete_cell")
+            if self.has_multi_cell_selection():
+                actions.append("delete_selected_cells")
         translate_actions = []
         if context == "row_header" and row >= 0:
             translate_actions = ["translate_selected_rows"]
@@ -1278,6 +1411,15 @@ class DayzTranslateTool(QMainWindow):
         if row < 0 or column < 0:
             return
         self.set_cell_text(row, column, "")
+
+    def delete_selected_cells(self):
+        ranges = self.table.selectedRanges()
+        if not ranges:
+            return
+        for selected_range in ranges:
+            for row_index in range(selected_range.topRow(), selected_range.bottomRow() + 1):
+                for column_index in range(selected_range.leftColumn(), selected_range.rightColumn() + 1):
+                    self.set_cell_text(row_index, column_index, "")
 
     def delete_rows(self):
         rows, columns = self.selected_rows_and_columns()
