@@ -663,20 +663,45 @@ class MainGuiTests(unittest.TestCase):
         self.window.translation_base_url = "https://b.test/v1"
         self.window.save_translation_preset("PresetB")
 
+        # Loading an older preset must overwrite the live provider fields.
+        self.window.load_translation_preset("PresetA")
+        self.assertEqual(self.window.translation_api_key, "key-a")
+        self.assertEqual(self.window.translation_model, "model-a")
+        self.assertEqual(self.window.translation_base_url, "https://a.test/v1")
+
         dialog = TranslationSettingsDialog(self.window)
         dialog.provider_combo.setCurrentText("OpenAI")
 
-        dialog.preset_combo.setCurrentText("PresetA")
         dialog.auto_load_preset("PresetA")
         self.assertEqual(dialog.api_key_input.text(), "key-a")
         self.assertEqual(dialog.model_input.text(), "model-a")
         self.assertEqual(dialog.base_url_input.text(), "https://a.test/v1")
 
-        dialog.preset_combo.setCurrentText("PresetB")
         dialog.auto_load_preset("PresetB")
         self.assertEqual(dialog.api_key_input.text(), "key-b")
         self.assertEqual(dialog.model_input.text(), "model-b")
         self.assertEqual(dialog.base_url_input.text(), "https://b.test/v1")
+
+    def test_load_translation_preset_overwrites_with_empty_fields(self):
+        self.window.translation_provider = "openai"
+        self.window.translation_api_key = "keep-me"
+        self.window.translation_model = "model-keep"
+        self.window.translation_base_url = "https://keep.test/v1"
+        self.window.save_translation_preset("FullPreset")
+
+        self.window.translation_api_key = ""
+        self.window.translation_model = ""
+        self.window.translation_base_url = ""
+        self.window.save_translation_preset("EmptyPreset")
+
+        self.window.translation_api_key = "stale"
+        self.window.translation_model = "stale-model"
+        self.window.translation_base_url = "https://stale.test/v1"
+        self.window.load_translation_preset("EmptyPreset")
+
+        self.assertEqual(self.window.translation_api_key, "")
+        self.assertEqual(self.window.translation_model, "")
+        self.assertEqual(self.window.translation_base_url, "")
 
     def test_preset_combo_shows_star_when_field_value_changes(self):
         self.window.translation_provider = "openai"

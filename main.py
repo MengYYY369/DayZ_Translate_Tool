@@ -1235,14 +1235,28 @@ class DayzTranslateTool(QMainWindow):
         }
 
     def apply_translation_settings_dict(self, values):
-        self.translation_provider = normalize_provider(values.get("provider") or self.translation_provider)
-        self.translation_batch_size = int(values.get("batch_size") or self.translation_batch_size)
-        self.translation_parallel_batches = int(values.get("parallel_batches") or self.translation_parallel_batches)
-        self.translation_api_key = values.get("api_key") or self.translation_api_key
-        self.translation_region = values.get("region") or self.translation_region
-        self.translation_model = values.get("model") or self.translation_model
-        self.translation_base_url = values.get("base_url") or self.translation_base_url
-        self.translation_email = values.get("email") or self.translation_email
+        # Apply explicit preset/settings values. Do not use `or` for strings:
+        # empty strings and missing-vs-stale values must not keep the previous
+        # provider field (that caused flaky preset switches).
+        provider = values.get("provider")
+        if provider:
+            self.translation_provider = normalize_provider(provider)
+        batch_size = values.get("batch_size")
+        if batch_size is not None and batch_size != "":
+            self.translation_batch_size = int(batch_size)
+        parallel_batches = values.get("parallel_batches")
+        if parallel_batches is not None and parallel_batches != "":
+            self.translation_parallel_batches = int(parallel_batches)
+        if "api_key" in values:
+            self.translation_api_key = "" if values.get("api_key") is None else str(values.get("api_key"))
+        if "region" in values:
+            self.translation_region = "" if values.get("region") is None else str(values.get("region"))
+        if "model" in values:
+            self.translation_model = "" if values.get("model") is None else str(values.get("model"))
+        if "base_url" in values:
+            self.translation_base_url = "" if values.get("base_url") is None else str(values.get("base_url"))
+        if "email" in values:
+            self.translation_email = "" if values.get("email") is None else str(values.get("email"))
         self.save_translation_settings()
 
     def translation_preset_names(self):
@@ -1271,7 +1285,8 @@ class DayzTranslateTool(QMainWindow):
             return
         preset_keys = ["provider", "batch_size", "parallel_batches", "api_key", "region", "model", "base_url", "email"]
         self.settings.beginGroup(f"translation_presets/{name}")
-        values = {key: self.settings.value(key) for key in preset_keys}
+        # Always include keys so apply overwrites previous provider fields.
+        values = {key: self.settings.value(key, "") for key in preset_keys}
         self.settings.endGroup()
         self.apply_translation_settings_dict(values)
 
