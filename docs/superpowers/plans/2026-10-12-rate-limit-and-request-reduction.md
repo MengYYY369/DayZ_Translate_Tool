@@ -76,6 +76,15 @@
 | I13 | Task 8 | 计划「既有测试的同步修改」表里同时写着 `test_translation_settings_dialog_saves_provider_and_parallel_batches` 断言 `== 40` 与 `test_translation_settings_loads_full_preset` 存 12 断言 12 | 两者不能同时成立（前者走 `QSpinBox` 会被夹到下限 200，后者直接写属性不夹）。实际：对话框测试用 `setValue(2400)` 断言 `== 2400`；主窗口测试保持存 12 断言 12。这条与 I3 同源，是计划的内部矛盾 |
 | I14 | Task 8 | Step 6「若 README 或 docs/ 里描述了旧语义就更新」 | 无需执行：仓库根目录没有 `README.md`，`docs/` 下只有 `docs/superpowers/`（计划本身）。`.trae/specs/improve-translation-cancel-timeout-batching/spec.md` 里的「按行批次」是历史 spec 快照，不回改 |
 
+### 仓库卫生：两个 commit 混入了开工前就存在的未提交改动
+
+开工时工作区已有 58 个未提交改动（`__pycache__/`、`build/`、`dist/`、`build_exe.ps1`、`dayz_csv.py`、`tests/test_main_gui.py` 的 801 行新增、`.trae/specs/`、`TODO.txt`）。Task 1 与 Task 4 的提交用了 `git add -A`，把这些 WIP 一并带进了：
+
+- `947763a`（Task 1）里 `main.py` 显示 980 行变更，而 Task 1 本身只改了 5 行（3 处 `TranslationCacheStore` 接线）
+- `4b39498`（Task 4）带进了 `tests/test_main_gui.py` 的 891 行新增
+
+**未重写历史**（WIP 没有丢失，全部 284 个测试仍绿）。但这两个 commit 的 `--stat` 不能当作本次改动的真实规模：Task 1–Task 8 自己改动的是 `translator_service.py` +800、`tests/test_translator_service.py` +881、`main.py` +206、`translation_worker.py` +2，以及新建 `translation_cache.py` 与 `tests/test_translation_cache.py`。后续提交一律用显式 `git add <文件>`。
+
 ## Global Constraints
 
 - **不新增任何第三方依赖。** `requirements.txt` 保持 `PySide6` + `deep-translator`。所有新能力用标准库实现。
