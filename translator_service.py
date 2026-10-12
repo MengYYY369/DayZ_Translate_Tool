@@ -380,6 +380,70 @@ class TranslationService:
             self.rate_limiter = None
             self.gate = None
 
+    def translate_jobs_with_fallback(self, jobs, configs, progress_callback=None,
+                                     should_cancel=None, on_fallback=None):
+        """按列表顺序主备降级。
+
+        - 先用一条试翻确认源可用；试翻结果进缓存，正式跑不会重复请求。
+        - 换源时只补还没翻好的，已翻好的保留。
+        - 全部源都不行时，failed = 剩下没翻好的条数。
+        - 降级不记住：每次都从 configs[0] 重新试。
+        """
+        configs = [config for config in (configs or [])]
+        if not configs:
+            raise ValueError("No translation source is available for this action.")
+        combined = TranslationResults()
+        remaining = list(jobs)
+        if not remaining:
+            return combined
+        for position, config in enumerate(configs):
+            if should_cancel and should_cancel():
+                combined.cancelled = True
+                return combined
+            if position and on_fallback:
+                on_fallback(configs[position - 1].label or configs[position - 1].provider,
+                            config.label or config.provider)
+            available, probe = self._probe_source(remaining, config, should_cancel)
+            if probe.cancelled:
+                combined.cancelled = True
+                return combined
+            if not available:
+                # 试翻失败：把这个源的原因记下来，换下一个源
+                combined.errors.extend(probe.errors)
+                combined.failed = len(remaining)
+                continue
+            results = self.translate_jobs(remaining, config, progress_callback, should_cancel)
+            self._merge_results(combined, results)
+            if results.cancelled:
+                combined.cancelled = True
+                return combined
+            remaining = [job for job in remaining
+                         if (job.row, job.column) not in combined.cell_results]
+            if not remaining:
+                combined.failed = 0
+                return combined
+            combined.failed = len(remaining)      # 还有剩的，交给下一个源
+        return combined
+
+    def _probe_source(self, jobs, config, should_cancel):
+        """用第一条试翻一次；返回 `(这个源可用吗, 试翻结果)`。
+
+        返回整个 probe 而不只是 bool，是因为「全部源都挂掉」时界面要显示原因
+        （`probe.errors`），而这些原因只能从这里拿到。
+        """
+        probe = self.translate_jobs(jobs[:1], config, None, should_cancel)
+        return bool(probe.cell_results), probe
+
+    def _merge_results(self, target, source):
+        # 注意：`failed` 不在这里合并 —— 它由循环末尾的
+        # `combined.failed = len(remaining)` 统一决定（「还剩几条没翻好」），
+        # 单个源的局部失败不算最终失败（后面的源会补上）。
+        target.cell_results.update(source.cell_results)
+        target.translated += source.translated
+        target.skipped += source.skipped
+        target.cache_hits += source.cache_hits
+        target.errors.extend(source.errors)
+
     def _throttle(self):
         """每次 HTTP 尝试（含重试）之前调用：全局限速（决定 12）。"""
         if self.rate_limiter is not None:
