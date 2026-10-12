@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest import mock
 
-from translator_service import DEFAULT_CHAR_BUDGET, DEFAULT_OUTPUT_CHAR_CAP, AdaptiveGate, GoogleTranslateTranslator, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, assign_batch_ids, parse_numbered_translations, parse_retry_after, retry_call, salvage_truncated_object, validate_translator_config
+from translator_service import DEFAULT_CHAR_BUDGET, DEFAULT_OUTPUT_CHAR_CAP, AdaptiveGate, GoogleTranslateTranslator, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, assign_batch_ids, matching_glossary_entries, parse_numbered_translations, parse_retry_after, retry_call, salvage_truncated_object, validate_translator_config
 
 
 class FakeBatchTranslator:
@@ -1315,6 +1315,108 @@ def _openai_translator(**kwargs):
     return OpenAICompatibleTranslator(
         source="auto", target="multi", api_key="key", model="m", **kwargs
     )
+
+
+class GlossaryFilterTests(unittest.TestCase):
+    GLOSSARY = [
+        {"english": "Knife", "german": "Messer"},
+        {"english": "Gun", "german": "Waffe"},
+        {"english": "Ammo", "german": "Munition"},
+    ]
+
+    def test_only_matching_entries_included(self):
+        matched = matching_glossary_entries(self.GLOSSARY, ["Knife"], "english")
+        self.assertEqual(matched, [{"english": "Knife", "german": "Messer"}])
+
+    def test_match_is_case_insensitive(self):
+        matched = matching_glossary_entries(self.GLOSSARY, ["KNIFE"], "english")
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["english"], "Knife")
+
+    def test_no_match_returns_empty(self):
+        self.assertEqual(matching_glossary_entries(self.GLOSSARY, ["Spoon"], "english"), [])
+
+    def test_uses_the_given_source_column(self):
+        entry = {"english": "Knife", "german": "Messer"}
+        self.assertEqual(matching_glossary_entries([entry], ["Knife"], "english"), [entry])
+        self.assertEqual(matching_glossary_entries([entry], ["Knife"], "german"), [])
+
+    def test_source_key_missing_from_entry_is_skipped(self):
+        entry = {"german": "Messer"}
+        self.assertEqual(matching_glossary_entries([entry], ["Messer"], "english"), [])
+
+    def test_empty_source_key_matches_any_column(self):
+        entry = {"english": "Knife", "german": "Messer"}
+        self.assertEqual(matching_glossary_entries([entry], ["Messer"], ""), [entry])
+
+    def test_respects_max_entries(self):
+        glossary = [{"english": f"term{i}"} for i in range(300)]
+        texts = [" ".join(f"term{i}" for i in range(300))]
+        matched = matching_glossary_entries(glossary, texts, "english", max_entries=200)
+        self.assertEqual(len(matched), 200)
+
+    def test_empty_glossary_or_texts_returns_empty(self):
+        self.assertEqual(matching_glossary_entries([], ["Knife"], "english"), [])
+        self.assertEqual(matching_glossary_entries(self.GLOSSARY, [], "english"), [])
+
+
+class GlossaryPromptIntegrationTests(unittest.TestCase):
+    def test_translator_uses_config_source_key(self):
+        config = TranslatorConfig(
+            provider="openai",
+            api_key="key",
+            model="m",
+            glossary=[{"english": "Knife", "german": "Messer"}],
+            glossary_source_key="english",
+        )
+        translator = TranslationService().create_provider("en", "de", config)
+        self.assertEqual(translator.glossary_source_key, "english")
+
+    def test_only_matching_entries_reach_the_prompt(self):
+        captured = []
+
+        def fake_post(url, headers, payload):
+            captured.append(payload)
+            return {"choices": [{"message": {"content": json.dumps({"1": {"de": "Messer"}})}}]}
+
+        translator = OpenAICompatibleTranslator(
+            source="en",
+            target="de",
+            api_key="key",
+            model="m",
+            glossary=[
+                {"english": "Knife", "german": "Messer"},
+                {"english": "Gun", "german": "Waffe"},
+            ],
+            glossary_source_key="english",
+            post_json=fake_post,
+        )
+        translator.translate_job_batch([TranslationJob(0, 1, "Knife", "en", "de")])
+
+        content = captured[0]["messages"][1]["content"]
+        self.assertIn("Messer", content)
+        self.assertNotIn("Waffe", content)
+
+    def test_no_matching_entry_omits_the_glossary_section(self):
+        captured = []
+
+        def fake_post(url, headers, payload):
+            captured.append(payload)
+            return {"choices": [{"message": {"content": json.dumps({"1": {"de": "Loeffel"}})}}]}
+
+        translator = OpenAICompatibleTranslator(
+            source="en",
+            target="de",
+            api_key="key",
+            model="m",
+            glossary=[{"english": "Knife", "german": "Messer"}],
+            glossary_source_key="english",
+            post_json=fake_post,
+        )
+        translator.translate_job_batch([TranslationJob(0, 1, "Spoon", "en", "de")])
+
+        content = captured[0]["messages"][1]["content"]
+        self.assertNotIn("Glossary", content)
 
 
 def _scripted_service(script, calls):

@@ -30,6 +30,9 @@ RETRYABLE_STATUS = frozenset({408, 409, 413, 429, 500, 502, 503, 504})
 FATAL_STATUS = frozenset({400, 401, 403, 404, 422})
 RATE_LIMIT_STATUS = frozenset({429, 503})   # 命中即让自适应闸门减半
 
+# —— 术语表（决定 7 / 21）——
+GLOSSARY_MAX_ENTRIES = 200
+
 
 class TranslationCancelled(Exception):
     """Raised when a translation run is cancelled via should_cancel."""
@@ -299,6 +302,7 @@ class TranslationService:
                 model=config.model or "gpt-3.5-turbo",
                 base_url=config.base_url,
                 glossary=config.glossary,
+                glossary_source_key=config.glossary_source_key,
                 timeout=config.timeout,
                 should_cancel=self.should_cancel,
                 retry_policy=self.retry_policy,
@@ -313,6 +317,7 @@ class TranslationService:
                 model=config.model or self.claude_translator_class.DEFAULT_MODEL,
                 base_url=config.base_url,
                 glossary=config.glossary,
+                glossary_source_key=config.glossary_source_key,
                 timeout=config.timeout,
                 should_cancel=self.should_cancel,
                 retry_policy=self.retry_policy,
@@ -327,6 +332,7 @@ class TranslationService:
                 model=config.model or self.codex_translator_class.DEFAULT_MODEL,
                 base_url=config.base_url,
                 glossary=config.glossary,
+                glossary_source_key=config.glossary_source_key,
                 timeout=config.timeout,
                 should_cancel=self.should_cancel,
                 retry_policy=self.retry_policy,
@@ -692,6 +698,40 @@ def normalize_provider(provider):
 # --- 批次编号与带编号回复解析（决定 18） -------------------------------------
 
 
+def matching_glossary_entries(glossary, texts, source_key="", max_entries=GLOSSARY_MAX_ENTRIES):
+    """只挑本批文本里真的出现了源词的术语条目（决定 7）。
+
+    每次请求都带完整单词本时，几百条术语会在每条请求里白花一遍 token。
+
+    source_key 是**当前源列名**（`main.py` 的 `self.source_header`，如 "english"），
+    与 `wordbook_csv.WORDBOOK_HEADERS` 同名，因此可以直接取源词。
+    传空则退化为「任一词条列命中即可」。
+    """
+    if not glossary or not texts:
+        return []
+    haystack = "\n".join(texts).lower()
+    key = (source_key or "").strip().lower()
+    matched = []
+    for entry in glossary:
+        if not isinstance(entry, dict):
+            continue
+        if key:
+            candidates = [entry.get(key)]
+        else:
+            candidates = list(entry.values())
+        hit = False
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if value and value.lower() in haystack:
+                hit = True
+                break
+        if hit:
+            matched.append(entry)
+            if len(matched) >= max_entries:
+                break
+    return matched
+
+
 def assign_batch_ids(jobs):
     """给一批 job 分配稳定 id：同一行的所有 job 共享一个 id。
 
@@ -825,6 +865,11 @@ class OpenAICompatibleTranslator:
         if not jobs and not assigned:
             return {}
         assigned = assigned or assign_batch_ids(jobs)
+        glossary_entries = matching_glossary_entries(
+            self.glossary,
+            [row_jobs[0].text for row_jobs in assigned.values()],
+            self.glossary_source_key,
+        )
         payload = {
             "model": self.model,
             "temperature": 0,
@@ -835,7 +880,7 @@ class OpenAICompatibleTranslator:
                 },
                 {
                     "role": "user",
-                    "content": self.build_merged_prompt(assigned, self.glossary),
+                    "content": self.build_merged_prompt(assigned, glossary_entries),
                 },
             ],
         }
@@ -1005,14 +1050,26 @@ class ClaudeMessagesTranslator:
         if not jobs and not assigned:
             return {}
         assigned = assigned or assign_batch_ids(jobs)
+        glossary_entries = matching_glossary_entries(
+            self.glossary,
+            [row_jobs[0].text for row_jobs in assigned.values()],
+            self.glossary_source_key,
+        )
         payload = {
             "model": self.model,
             "max_tokens": 8192,
-            "system": "You are a translation engine. Return only a JSON object keyed by item id.",
+            # system 用数组形状才能在稳定前缀上加 cache_control（决定 7）。
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are a translation engine. Reply with only a JSON object, no prose.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             "messages": [
                 {
                     "role": "user",
-                    "content": OpenAICompatibleTranslator.build_merged_prompt(assigned, self.glossary),
+                    "content": OpenAICompatibleTranslator.build_merged_prompt(assigned, glossary_entries),
                 }
             ],
         }
@@ -1120,10 +1177,15 @@ class CodexResponsesTranslator:
         if not jobs and not assigned:
             return {}
         assigned = assigned or assign_batch_ids(jobs)
+        glossary_entries = matching_glossary_entries(
+            self.glossary,
+            [row_jobs[0].text for row_jobs in assigned.values()],
+            self.glossary_source_key,
+        )
         payload = {
             "model": self.model,
             "instructions": "You are a translation engine. Return only a JSON object keyed by item id.",
-            "input": OpenAICompatibleTranslator.build_merged_prompt(assigned, self.glossary),
+            "input": OpenAICompatibleTranslator.build_merged_prompt(assigned, glossary_entries),
         }
         headers = {
             "Authorization": f"Bearer {self.api_key}",

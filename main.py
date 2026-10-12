@@ -2441,6 +2441,7 @@ class DayzTranslateTool(QMainWindow):
                 base_url=self.translation_base_url,
                 email=self.translation_email,
                 glossary=self.wordbook_glossary(),
+                glossary_source_key=(self.source_header or "").strip().lower(),
             ),
         )
 
