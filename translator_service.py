@@ -573,17 +573,28 @@ class TranslationService:
         self._apply_cached_results(provider, source, target, batch_jobs, results)
 
     def _translate_one_openai_batch(self, translator, batch, results, provider):
+        assigned = assign_batch_ids(batch)          # 唯一一次编号
         try:
-            translated_texts = translator.translate_job_batch(batch)
+            parsed = translator.translate_job_batch(batch, assigned=assigned)
+            missing = self._missing_assigned(assigned, parsed)
+            if missing:
+                # 只补发缺的，不拆批（决定 8 / 18）。
+                # 注意：missing 的 key 就是 assigned 的 key，绝不重新编号。
+                retry_parsed = translator.translate_job_batch(
+                    [job for jobs in missing.values() for job in jobs],
+                    assigned=missing,
+                )
+                for item_id, langs in retry_parsed.items():
+                    parsed.setdefault(item_id, {}).update(langs)
         except TranslationCancelled:
             raise
         except TranslationRequestError as exc:
             self._record_failed_jobs(batch, results, exc)
-            raise                    # 让闸门看到限速信号
+            raise                    # 保留 Task 3 的异常契约：让闸门看到限速信号
         except Exception as exc:
             self._record_failed_jobs(batch, results, exc)
             return                   # 非限速类错误：本批记失败，不打断其它批次
-        self._store_job_results(batch, translated_texts, results, provider)
+        self._store_parsed_results(assigned, parsed, results, provider)
 
     def _record_failed_batch(self, batch, group_jobs, results, exc):
         failed_texts = set(batch)
@@ -629,13 +640,31 @@ class TranslationService:
             uncached.append(job)
         return uncached
 
-    def _store_job_results(self, jobs, translated_texts, results, provider="openai"):
-        if len(translated_texts) != len(jobs):
-            raise RuntimeError(f"OpenAI returned {len(translated_texts)} translations for {len(jobs)} jobs.")
-        for job, translated_text in zip(jobs, translated_texts):
-            self.cache[self._openai_cache_key(job, provider)] = translated_text
-            results.cell_results[(job.row, job.column)] = translated_text
-            results.translated += 1
+    def _missing_assigned(self, assigned, parsed):
+        """返回 id → 该行仍缺译文的那部分 job。id 沿用 assigned，不重新编号。"""
+        missing = {}
+        for item_id, row_jobs in assigned.items():
+            got = parsed.get(item_id) or {}
+            lack = [job for job in row_jobs if job.target_code not in got]
+            if lack:
+                missing[item_id] = lack
+        return missing
+
+    def _store_parsed_results(self, assigned, parsed, results, provider):
+        for item_id in sorted(assigned):
+            row_jobs = assigned[item_id]
+            got = parsed.get(item_id) or {}
+            for job in row_jobs:
+                value = got.get(job.target_code)
+                if not isinstance(value, str) or not value:
+                    results.failed += 1
+                    results.errors.append(
+                        f"row {job.row} column {job.column}: missing {job.target_code} translation"
+                    )
+                    continue
+                results.translated += 1
+                results.cell_results[(job.row, job.column)] = value
+                self.cache[self._openai_cache_key(job, provider)] = value
 
     def _openai_cache_key(self, job, provider="openai"):
         return self._cache_key(provider, job.source_code, job.target_code, job.text)
@@ -658,6 +687,87 @@ def validate_translator_config(config):
 def normalize_provider(provider):
     provider = (provider or "google").lower()
     return "openai" if provider == "chatgpt" else provider
+
+
+# --- 批次编号与带编号回复解析（决定 18） -------------------------------------
+
+
+def assign_batch_ids(jobs):
+    """给一批 job 分配稳定 id：同一行的所有 job 共享一个 id。
+
+    **id 只在这里分配一次。** 补发时直接复用同一份映射的子集，绝不重新编号 ——
+    重新编号会让补发的第 1 行冒充原来的第 1 行，把结果写到错误的单元格并污染磁盘缓存。
+    """
+    by_row = {}
+    for job in jobs:
+        by_row.setdefault(job.row, []).append(job)
+    return {index: by_row[row] for index, row in enumerate(sorted(by_row), start=1)}
+
+
+def salvage_truncated_object(text):
+    """从被腰斩的 JSON 对象里救出最后一个完整的键值对。"""
+    text = text.strip()
+    start = text.find("{")
+    if start < 0:
+        return text
+    depth = 0
+    in_string = False
+    escaped = False
+    last_complete = -1
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 1:
+                last_complete = index
+            elif depth == 0:
+                return text[start:index + 1]
+    if last_complete < 0:
+        return text
+    return text[start:last_complete + 1] + "}"
+
+
+def parse_numbered_translations(content):
+    """解析 {"1": {"chinese": "刀"}} 形状的回复。被腰斩时尽力抢救。"""
+    content = (content or "").strip()
+    if content.startswith("```"):
+        content = OpenAICompatibleTranslator._strip_code_fence_static(content)
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        salvaged = salvage_truncated_object(content)
+        if salvaged == content:
+            raise TranslationRequestError(f"AI response was not JSON: {content}")
+        try:
+            payload = json.loads(salvaged)
+        except json.JSONDecodeError as exc:
+            raise TranslationRequestError(f"AI response was not JSON: {content}") from exc
+    if not isinstance(payload, dict):
+        raise TranslationRequestError(f"AI response must be a JSON object: {content}")
+    parsed = {}
+    for raw_id, value in payload.items():
+        try:
+            item_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        cleaned = {str(lang): text for lang, text in value.items() if isinstance(text, str)}
+        if cleaned:
+            parsed[item_id] = cleaned
+    return parsed
 
 
 class OpenAICompatibleTranslator:
@@ -706,20 +816,26 @@ class OpenAICompatibleTranslator:
             raise RuntimeError(f"OpenAI returned {len(translated)} translations for {len(texts)} source texts.")
         return translated
 
-    def translate_job_batch(self, jobs):
-        if not jobs:
-            return []
+    def translate_job_batch(self, jobs, assigned=None):
+        """返回 {id: {target_language: translation}}。
+
+        jobs 与 assigned 二选一：只给 jobs 时在这里分配 id；服务层会传入已分配的
+        assigned，以保证补发时 id 不变（决定 18）。
+        """
+        if not jobs and not assigned:
+            return {}
+        assigned = assigned or assign_batch_ids(jobs)
         payload = {
             "model": self.model,
             "temperature": 0,
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a translation engine. Return only a JSON array of translated strings.",
+                    "content": "You are a translation engine. Return only a JSON object keyed by item id.",
                 },
                 {
                     "role": "user",
-                    "content": self._build_job_batch_prompt(jobs),
+                    "content": self.build_merged_prompt(assigned, self.glossary),
                 },
             ],
         }
@@ -729,10 +845,7 @@ class OpenAICompatibleTranslator:
         }
         response = self.post_json(self._chat_completions_url(), headers, payload)
         content = self._extract_content(response)
-        translated = self._parse_translations(content)
-        if len(translated) != len(jobs):
-            raise RuntimeError(f"OpenAI returned {len(translated)} translations for {len(jobs)} jobs.")
-        return translated
+        return parse_numbered_translations(content)
 
     def translate(self, text):
         return self.translate_batch([text])[0]
@@ -745,23 +858,37 @@ class OpenAICompatibleTranslator:
             f"Source JSON array:\n{json.dumps(texts, ensure_ascii=False)}"
         )
 
-    def _build_job_batch_prompt(self, jobs):
-        items = [
-            {
-                "source_language": job.source_code,
-                "target_language": job.target_code,
-                "text": job.text,
-            }
-            for job in jobs
+    @staticmethod
+    def build_merged_prompt(assigned, glossary_entries=None):
+        """assigned: {id: [该行的 job]}（由 assign_batch_ids 产出，id 稳定）。
+
+        同一行的多个目标语言合并成一条 item：源文只出现一次，减少请求体积。
+        """
+        items = []
+        for item_id in sorted(assigned):
+            row_jobs = assigned[item_id]
+            targets = []
+            for job in row_jobs:
+                if job.target_code not in targets:
+                    targets.append(job.target_code)
+            items.append({
+                "id": item_id,
+                "source_language": row_jobs[0].source_code,
+                "targets": targets,
+                "text": row_jobs[0].text,
+            })
+        parts = [
+            "Translate each item.text from its source_language into every language in its targets.",
+            "Preserve placeholders, tags, punctuation and line breaks exactly.",
+            "Reply with only a JSON object mapping each id to an object of target_language -> translation.",
+            'Shape: {"1": {"chinese": "\\u5200", "russian": "\\u041d\\u043e\\u0436"}}',
         ]
-        return (
-            "Translate each item.text from item.source_language into item.target_language.\n"
-            "Keep the same order and preserve placeholders, tags, punctuation, and line breaks.\n"
-            "Use glossary entries when a matching source term and target language value exist.\n"
-            "Return only valid JSON in this exact shape: [\"translation 1\", \"translation 2\"].\n"
-            f"Glossary JSON object:\n{json.dumps({'glossary': self.glossary}, ensure_ascii=False)}\n"
-            f"Items JSON array:\n{json.dumps(items, ensure_ascii=False)}"
-        )
+        if glossary_entries:
+            parts.append("Glossary (use these for matching terms):")
+            parts.append(json.dumps({"glossary": glossary_entries}, ensure_ascii=False))
+        parts.append("Items:")
+        parts.append(json.dumps(items, ensure_ascii=False))
+        return "\n".join(parts)
 
     def _chat_completions_url(self):
         url = self.base_url.strip().rstrip("/")
@@ -855,7 +982,7 @@ class ClaudeMessagesTranslator:
             return []
         payload = {
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "system": "You are a translation engine. Return only a JSON array of translated strings.",
             "messages": [
                 {"role": "user", "content": self._build_batch_prompt(texts)}
@@ -873,15 +1000,20 @@ class ClaudeMessagesTranslator:
             raise RuntimeError(f"Claude returned {len(translated)} translations for {len(texts)} source texts.")
         return translated
 
-    def translate_job_batch(self, jobs):
-        if not jobs:
-            return []
+    def translate_job_batch(self, jobs, assigned=None):
+        """返回 {id: {target_language: translation}}（见 OpenAICompatibleTranslator）。"""
+        if not jobs and not assigned:
+            return {}
+        assigned = assigned or assign_batch_ids(jobs)
         payload = {
             "model": self.model,
-            "max_tokens": 4096,
-            "system": "You are a translation engine. Return only a JSON array of translated strings.",
+            "max_tokens": 8192,
+            "system": "You are a translation engine. Return only a JSON object keyed by item id.",
             "messages": [
-                {"role": "user", "content": self._build_job_batch_prompt(jobs)}
+                {
+                    "role": "user",
+                    "content": OpenAICompatibleTranslator.build_merged_prompt(assigned, self.glossary),
+                }
             ],
         }
         headers = {
@@ -891,10 +1023,7 @@ class ClaudeMessagesTranslator:
         }
         response = self.post_json(self._messages_url(), headers, payload)
         content = self._extract_content(response)
-        translated = OpenAICompatibleTranslator._parse_translations_static(content)
-        if len(translated) != len(jobs):
-            raise RuntimeError(f"Claude returned {len(translated)} translations for {len(jobs)} jobs.")
-        return translated
+        return parse_numbered_translations(content)
 
     def translate(self, text):
         return self.translate_batch([text])[0]
@@ -905,20 +1034,6 @@ class ClaudeMessagesTranslator:
             "Keep the same order and preserve placeholders, tags, punctuation, and line breaks.\n"
             "Return only valid JSON in this exact shape: [\"translation 1\", \"translation 2\"].\n"
             f"Source JSON array:\n{json.dumps(texts, ensure_ascii=False)}"
-        )
-
-    def _build_job_batch_prompt(self, jobs):
-        items = [
-            {"source_language": job.source_code, "target_language": job.target_code, "text": job.text}
-            for job in jobs
-        ]
-        return (
-            "Translate each item.text from item.source_language into item.target_language.\n"
-            "Keep the same order and preserve placeholders, tags, punctuation, and line breaks.\n"
-            "Use glossary entries when a matching source term and target language value exist.\n"
-            "Return only valid JSON in this exact shape: [\"translation 1\", \"translation 2\"].\n"
-            f"Glossary JSON object:\n{json.dumps({'glossary': self.glossary}, ensure_ascii=False)}\n"
-            f"Items JSON array:\n{json.dumps(items, ensure_ascii=False)}"
         )
 
     def _messages_url(self):
@@ -1000,13 +1115,15 @@ class CodexResponsesTranslator:
             raise RuntimeError(f"Codex returned {len(translated)} translations for {len(texts)} source texts.")
         return translated
 
-    def translate_job_batch(self, jobs):
-        if not jobs:
-            return []
+    def translate_job_batch(self, jobs, assigned=None):
+        """返回 {id: {target_language: translation}}（见 OpenAICompatibleTranslator）。"""
+        if not jobs and not assigned:
+            return {}
+        assigned = assigned or assign_batch_ids(jobs)
         payload = {
             "model": self.model,
-            "instructions": "You are a translation engine. Return only a JSON array of translated strings.",
-            "input": self._build_job_batch_prompt(jobs),
+            "instructions": "You are a translation engine. Return only a JSON object keyed by item id.",
+            "input": OpenAICompatibleTranslator.build_merged_prompt(assigned, self.glossary),
         }
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -1014,10 +1131,7 @@ class CodexResponsesTranslator:
         }
         response = self.post_json(self._responses_url(), headers, payload)
         content = self._extract_content(response)
-        translated = OpenAICompatibleTranslator._parse_translations_static(content)
-        if len(translated) != len(jobs):
-            raise RuntimeError(f"Codex returned {len(translated)} translations for {len(jobs)} jobs.")
-        return translated
+        return parse_numbered_translations(content)
 
     def translate(self, text):
         return self.translate_batch([text])[0]
@@ -1028,20 +1142,6 @@ class CodexResponsesTranslator:
             "Keep the same order and preserve placeholders, tags, punctuation, and line breaks.\n"
             "Return only valid JSON in this exact shape: [\"translation 1\", \"translation 2\"].\n"
             f"Source JSON array:\n{json.dumps(texts, ensure_ascii=False)}"
-        )
-
-    def _build_job_batch_prompt(self, jobs):
-        items = [
-            {"source_language": job.source_code, "target_language": job.target_code, "text": job.text}
-            for job in jobs
-        ]
-        return (
-            "Translate each item.text from item.source_language into item.target_language.\n"
-            "Keep the same order and preserve placeholders, tags, punctuation, and line breaks.\n"
-            "Use glossary entries when a matching source term and target language value exist.\n"
-            "Return only valid JSON in this exact shape: [\"translation 1\", \"translation 2\"].\n"
-            f"Glossary JSON object:\n{json.dumps({'glossary': self.glossary}, ensure_ascii=False)}\n"
-            f"Items JSON array:\n{json.dumps(items, ensure_ascii=False)}"
         )
 
     def _responses_url(self):

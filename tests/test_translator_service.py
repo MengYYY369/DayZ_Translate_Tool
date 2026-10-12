@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest import mock
 
-from translator_service import DEFAULT_CHAR_BUDGET, DEFAULT_OUTPUT_CHAR_CAP, AdaptiveGate, GoogleTranslateTranslator, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, parse_retry_after, retry_call, validate_translator_config
+from translator_service import DEFAULT_CHAR_BUDGET, DEFAULT_OUTPUT_CHAR_CAP, AdaptiveGate, GoogleTranslateTranslator, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, assign_batch_ids, parse_numbered_translations, parse_retry_after, retry_call, salvage_truncated_object, validate_translator_config
 
 
 class FakeBatchTranslator:
@@ -74,9 +74,12 @@ class TranslationServiceTests(unittest.TestCase):
 
                 pass
 
-            def translate_job_batch(self, jobs):
+            def translate_job_batch(self, jobs, assigned=None):
                 calls.append(list(jobs))
-                return [f"{job.target_code}:{job.text}" for job in jobs]
+                return {
+                    item_id: {job.target_code: f"{job.target_code}:{job.text}" for job in row_jobs}
+                    for item_id, row_jobs in (assigned or assign_batch_ids(jobs)).items()
+                }
 
         service = TranslationService()
         service.openai_translator_class = FakeOpenAITranslator
@@ -134,9 +137,12 @@ class TranslationServiceTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def translate_job_batch(self, jobs):
+            def translate_job_batch(self, jobs, assigned=None):
                 self.calls.append([job.text for job in jobs])
-                return [f"translated:{job.text}" for job in jobs]
+                return {
+                    item_id: {job.target_code: f"translated:{job.text}" for job in row_jobs}
+                    for item_id, row_jobs in (assigned or assign_batch_ids(jobs)).items()
+                }
 
         fake = FakeJobBatchTranslator()
         shared_cache = {}
@@ -402,7 +408,7 @@ class TranslationServiceTests(unittest.TestCase):
 
         def fake_post(url, headers, payload):
             calls.append(payload)
-            return {"choices": [{"message": {"content": json.dumps(["Messer", "Нож"])}}]}
+            return {"choices": [{"message": {"content": json.dumps({"1": {"de": "Messer", "ru": "Нож"}})}}]}
 
         translator = OpenAICompatibleTranslator(
             source="auto",
@@ -419,16 +425,15 @@ class TranslationServiceTests(unittest.TestCase):
 
         result = translator.translate_job_batch(jobs)
 
-        self.assertEqual(result, ["Messer", "Нож"])
-        self.assertIn('"target_language": "de"', calls[0]["messages"][1]["content"])
-        self.assertIn('"target_language": "ru"', calls[0]["messages"][1]["content"])
+        self.assertEqual(result, {1: {"de": "Messer", "ru": "Нож"}})
+        self.assertIn('"targets": ["de", "ru"]', calls[0]["messages"][1]["content"])
 
     def test_openai_translator_includes_glossary_in_job_batch_prompt(self):
         calls = []
 
         def fake_post(url, headers, payload):
             calls.append(payload)
-            return {"choices": [{"message": {"content": json.dumps(["Messer"])}}]}
+            return {"choices": [{"message": {"content": json.dumps({"1": {"de": "Messer"}})}}]}
 
         translator = OpenAICompatibleTranslator(
             source="auto",
@@ -457,9 +462,12 @@ class TranslationServiceTests(unittest.TestCase):
 
                 pass
 
-            def translate_job_batch(self, jobs):
+            def translate_job_batch(self, jobs, assigned=None):
                 calls.append(list(jobs))
-                return [f"{job.target_code}:{job.text}" for job in jobs]
+                return {
+                    item_id: {job.target_code: f"{job.target_code}:{job.text}" for job in row_jobs}
+                    for item_id, row_jobs in (assigned or assign_batch_ids(jobs)).items()
+                }
 
         service = TranslationService()
         service.openai_translator_class = FakeOpenAITranslator
@@ -514,7 +522,7 @@ class TranslationServiceTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 pass
 
-            def translate_job_batch(self, jobs):
+            def translate_job_batch(self, jobs, assigned=None):
                 raise TranslationCancelled()
 
         service = TranslationService()
@@ -1001,7 +1009,7 @@ class GuardedBatchTests(unittest.TestCase):
                          retry_policy=None, on_retry=None, before_attempt=None):
                 pass
 
-            def translate_job_batch(self, batch):
+            def translate_job_batch(self, batch, assigned=None):
                 raise TranslationRequestError("rate limited", status=429)
 
         service = TranslationService()
@@ -1132,6 +1140,199 @@ class RowBatchingTests(unittest.TestCase):
             [(job.row, job.column) for job in flat],
             sorted((job.row, job.column) for job in jobs),
         )
+
+
+class IdAssignmentTests(unittest.TestCase):
+    """id 只在 assign_batch_ids 分配一次：同一行共享一个 id，补发不重新编号。"""
+
+    def test_ids_follow_row_order(self):
+        jobs = [TranslationJob(row, 3, f"text{row}", "en", "de") for row in range(3)]
+
+        assigned = assign_batch_ids(jobs)
+
+        self.assertEqual(sorted(assigned), [1, 2, 3])
+        self.assertEqual([assigned[1][0].row, assigned[2][0].row, assigned[3][0].row], [0, 1, 2])
+
+    def test_same_row_shares_one_id(self):
+        jobs = [
+            TranslationJob(0, index, "Knife", "en", target)
+            for index, target in enumerate(["de", "ru", "fr", "es", "it", "pl", "cs", "hu"])
+        ]
+
+        assigned = assign_batch_ids(jobs)
+
+        self.assertEqual(sorted(assigned), [1])
+        self.assertEqual(len(assigned[1]), 8)
+
+    def test_subset_keeps_original_ids(self):
+        """补发时传入的是同一份映射的子集，id 必须还是 1 和 3（而不是被重编成 1 和 2）。"""
+        jobs = [TranslationJob(row, 3, f"text{row}", "en", "de") for row in range(3)]
+        assigned = assign_batch_ids(jobs)
+
+        subset = {key: value for key, value in assigned.items() if key in (1, 3)}
+        prompt = _openai_translator().build_merged_prompt(subset)
+
+        self.assertIn('"id": 1', prompt)
+        self.assertIn('"id": 3', prompt)
+        self.assertNotIn('"id": 2', prompt)
+
+
+class MergedPromptTests(unittest.TestCase):
+    """一行多个目标语言合并成一条 item：源文只出现一次。"""
+
+    def test_source_text_appears_once_per_row(self):
+        jobs = [
+            TranslationJob(0, index, "Knife", "en", target)
+            for index, target in enumerate(["de", "ru", "fr", "es", "it", "pl", "cs", "hu"])
+        ]
+
+        prompt = _openai_translator().build_merged_prompt(assign_batch_ids(jobs))
+
+        self.assertEqual(prompt.count('"text": "Knife"'), 1)
+
+    def test_targets_listed_per_item(self):
+        jobs = [
+            TranslationJob(0, 4, "Knife", "en", "de"),
+            TranslationJob(0, 5, "Knife", "en", "ru"),
+        ]
+
+        prompt = _openai_translator().build_merged_prompt(assign_batch_ids(jobs))
+
+        self.assertIn('"targets": ["de", "ru"]', prompt)
+        self.assertNotIn('"target_language"', prompt)
+
+    def test_only_requested_cells_included(self):
+        jobs = [
+            TranslationJob(0, 4, "Knife", "en", "de"),
+            TranslationJob(0, 5, "Knife", "en", "ru"),
+            TranslationJob(0, 6, "Knife", "en", "fr"),
+        ]
+
+        prompt = _openai_translator().build_merged_prompt(assign_batch_ids(jobs))
+
+        self.assertIn('"targets": ["de", "ru", "fr"]', prompt)
+
+    def test_prompt_is_deterministic(self):
+        """前缀缓存的前提：同一输入两次拼出的提示词必须逐字节相同。"""
+        jobs = [
+            TranslationJob(0, 4, "Knife", "en", "de"),
+            TranslationJob(0, 5, "Knife", "en", "ru"),
+            TranslationJob(1, 4, "Gun", "en", "de"),
+        ]
+        translator = _openai_translator()
+
+        self.assertEqual(
+            translator.build_merged_prompt(assign_batch_ids(jobs)),
+            translator.build_merged_prompt(assign_batch_ids(jobs)),
+        )
+
+
+class NumberedParsingTests(unittest.TestCase):
+    """解析 {"1": {"chinese": "刀"}} 形状的回复；被腰斩时尽力抢救。"""
+
+    def test_parses_clean_object(self):
+        parsed = parse_numbered_translations('{"1": {"chinese": "刀"}, "2": {"chinese": "盾"}}')
+
+        self.assertEqual(parsed, {1: {"chinese": "刀"}, 2: {"chinese": "盾"}})
+
+    def test_strips_code_fence(self):
+        content = '```json\n{"1": {"chinese": "刀"}}\n```'
+
+        self.assertEqual(parse_numbered_translations(content), {1: {"chinese": "刀"}})
+
+    def test_salvages_truncated_object(self):
+        content = '{"1": {"chinese": "刀"}, "2": {"chinese": "盾"'
+
+        parsed = parse_numbered_translations(content)
+
+        self.assertEqual(parsed, {1: {"chinese": "刀"}})
+
+    def test_rejects_non_object(self):
+        with self.assertRaises(TranslationRequestError):
+            parse_numbered_translations('["刀"]')
+
+    def test_drops_non_string_values(self):
+        self.assertEqual(parse_numbered_translations('{"1": {"chinese": 42}}'), {})
+
+    def test_salvage_returns_input_when_nothing_complete(self):
+        self.assertEqual(salvage_truncated_object('{"1": {"chinese"'), '{"1": {"chinese"')
+
+
+class MissingRecoveryTests(unittest.TestCase):
+    """某一行没返回译文时，只补发缺的那些，且 id 不重新编号。"""
+
+    def test_missing_assigned_detected(self):
+        service = TranslationService()
+        jobs = [TranslationJob(row, 3, f"text{row}", "en", "de") for row in range(3)]
+        assigned = assign_batch_ids(jobs)
+        parsed = {1: {"de": "A"}, 3: {"de": "C"}}
+
+        missing = service._missing_assigned(assigned, parsed)
+
+        self.assertEqual(sorted(missing), [2])
+        self.assertEqual(missing[2], [jobs[1]])
+
+    def test_second_request_covers_only_missing(self):
+        calls = []
+        script = [{1: {"de": "A"}, 3: {"de": "C"}}, {2: {"de": "B"}}]
+        service = _scripted_service(script, calls)
+        config = TranslatorConfig(provider="openai", api_key="k", model="m")
+        jobs = [TranslationJob(row, row, f"text{row}", "en", "de") for row in range(3)]
+
+        results = service.translate_jobs(jobs, config)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([job.row for job in calls[1]["jobs"]], [1])
+        self.assertEqual(results.failed, 0)
+        self.assertEqual(results.cell_results, {(0, 0): "A", (1, 1): "B", (2, 2): "C"})
+
+    def test_recovery_ids_are_not_renumbered(self):
+        """补发的提示词里 id 仍是 2；重编成 1 会把译文写到错误的单元格。"""
+        calls = []
+        script = [{1: {"de": "A"}, 3: {"de": "C"}}, {2: {"de": "B"}}]
+        service = _scripted_service(script, calls)
+        config = TranslatorConfig(provider="openai", api_key="k", model="m")
+        jobs = [TranslationJob(row, row, f"text{row}", "en", "de") for row in range(3)]
+
+        service.translate_jobs(jobs, config)
+
+        self.assertEqual(sorted(calls[1]["assigned"]), [2])
+
+    def test_still_missing_after_recovery_counts_failed(self):
+        calls = []
+        script = [{1: {"de": "A"}, 3: {"de": "C"}}, {}]
+        service = _scripted_service(script, calls)
+        config = TranslatorConfig(provider="openai", api_key="k", model="m")
+        jobs = [TranslationJob(row, row, f"text{row}", "en", "de") for row in range(3)]
+
+        results = service.translate_jobs(jobs, config)
+
+        self.assertEqual(results.failed, 1)
+        self.assertEqual(results.cell_results, {(0, 0): "A", (2, 2): "C"})
+
+
+def _openai_translator(**kwargs):
+    return OpenAICompatibleTranslator(
+        source="auto", target="multi", api_key="key", model="m", **kwargs
+    )
+
+
+def _scripted_service(script, calls):
+    """返回一个每次调用 translate_job_batch 就弹出 script 下一项的假 translator。"""
+
+    class ScriptedTranslator:
+        def __init__(self, source, target, api_key, model, base_url="", glossary=None,
+                     glossary_source_key="", timeout=60.0, should_cancel=None,
+                     retry_policy=None, on_retry=None, before_attempt=None):
+            pass
+
+        def translate_job_batch(self, jobs, assigned=None):
+            calls.append({"jobs": list(jobs), "assigned": dict(assigned or {})})
+            return script.pop(0)
+
+    service = TranslationService()
+    service.openai_translator_class = ScriptedTranslator
+    return service
 
 
 if __name__ == "__main__":
