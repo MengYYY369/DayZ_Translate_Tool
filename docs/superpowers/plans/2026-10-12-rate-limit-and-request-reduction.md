@@ -71,6 +71,10 @@
 | I8 | Task 7 | 计划把「`batch_size` → `char_budget`」的对话框与持久化改名放在 Task 7 Step 5 | 已在 Task 4 一并做完（见 I2）。Task 7 实际只落地：`TranslationWorker.retrying` 信号、设置对话框的勾选框与「清空缓存」按钮、倒计时文案、只重跑失败项、清空缓存方法 |
 | I9 | Task 7 | 计划的 Task 7 测试清单不含「429 → 重试 → 成功」的端到端闸门 | 新增 `RetryWiringTests.test_rate_limit_is_retried_and_on_retry_is_called`（`tests/test_translator_service.py`，用 `mock.patch("urllib.request.urlopen")` 走**真实** `_post_json` 路径，先抛 429 带 `Retry-After: 0.01` 再成功）。原因：注入 `post_json` 会绕过 `_post_json`，既有假 provider 全都走不到重试层；没有这条测试，倒计时 UI 接到空信号也照样全绿 |
 | I10 | Task 7 | 计划未列出决定 22（默认并发 1 → 3）会打破的既有断言 | `tests/test_main_gui.py:121` 的 `test_default_translation_provider_is_google` 断言 `translation_parallel_batches == 1` 改为 `== 3`；同文件 `FakeWorker` 补 `self.retrying = FakeSignal()`（`TranslationWorker` 多了一个信号），并在 `test_run_translation_jobs_starts_worker_instead_of_sync_translate` 末尾加一行 `assertIn(self.window.on_translation_retrying, worker.retrying.callbacks)` 验证信号真的接上了 |
+| I11 | Task 8 | 计划假设「注入假 provider 就能验证重试」 | **发现：`post_json` 注入点绕过了整个重试层。** `OpenAICompatibleTranslator` 里是 `self.post_json = post_json or self._post_json`（`translator_service.py:824` / `:1018` / `:1149`），调用点是 `self.post_json(...)`（`:852` / `:891` / `:1041` / `:1081` / `:1168` / `:1194`）—— 一旦注入，`_post_json` 里的 `retry_call` 与 `HTTPError → TranslationRequestError` 转换全部不会执行，异常以原始 `HTTPError` 冒出，`_guarded` 也看不到 `status=429`。生产代码从不注入 `post_json`（只有测试用），所以不影响线上行为；但**所有既有假 provider 测试都走不到重试层**，端到端验证必须 mock `urllib.request.urlopen`（见 I9） |
+| I12 | Task 8 | Task 8 Step 3 预期 Google 免费线路冒烟能跑通 | 本机 Google 返回 429「your computer or network may be sending automated queries」，冒烟失败。**但这恰好是整条链路的真实端到端验证**：`on_retry` 收到 `(1, 2, 0.42)`、`AdaptiveGate` 从 2 降到 1（`limits == [(1, True)]`）、`GOOGLE_MIN_INTERVAL=3.0` 把两次请求隔开（3 行、`parallel_batches=3` 只花了 3.71s，说明后两行没发出并发请求）。结论：限速防护本身工作正常，但**这台机器当前用不了 Google 免费线路**，需换网络或改用付费 API |
+| I13 | Task 8 | 计划「既有测试的同步修改」表里同时写着 `test_translation_settings_dialog_saves_provider_and_parallel_batches` 断言 `== 40` 与 `test_translation_settings_loads_full_preset` 存 12 断言 12 | 两者不能同时成立（前者走 `QSpinBox` 会被夹到下限 200，后者直接写属性不夹）。实际：对话框测试用 `setValue(2400)` 断言 `== 2400`；主窗口测试保持存 12 断言 12。这条与 I3 同源，是计划的内部矛盾 |
+| I14 | Task 8 | Step 6「若 README 或 docs/ 里描述了旧语义就更新」 | 无需执行：仓库根目录没有 `README.md`，`docs/` 下只有 `docs/superpowers/`（计划本身）。`.trae/specs/improve-translation-cancel-timeout-batching/spec.md` 里的「按行批次」是历史 spec 快照，不回改 |
 
 ## Global Constraints
 
@@ -1804,20 +1808,20 @@ git commit -m "feat: expose char budget, auto concurrency, cache clearing and re
 
 ### Task 8: 全量验证
 
-- [ ] **Step 1: 跑全部测试**
+- [x] **Step 1: 跑全部测试**
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 预期：全绿。
 
-- [ ] **Step 2: 静态检查**
+- [x] **Step 2: 静态检查**
 
 ```bash
 python -m py_compile main.py translator_service.py translation_worker.py translation_cache.py
 ```
 
-- [ ] **Step 3: 手工冒烟（Google 免费线路）**
+- [x] **Step 3: 手工冒烟（Google 免费线路）**
 
 1. 启动 `python main.py`，打开一个 `stringtable.csv`。
 2. 「翻译设置」里确认：每批最多字数 1500、自动勾选、并发上限 3、清空缓存按钮存在。
@@ -1825,7 +1829,7 @@ python -m py_compile main.py translator_service.py translation_worker.py transla
 4. 关闭软件再打开，对同样 20 行再跑一次 —— 状态栏应显示大量「缓存命中」，且**不应产生新的网络请求**（可用抓包或临时在 `_post_json` 打点确认）。
 5. 点「清空缓存」，再跑一次，确认重新发起请求。
 
-- [ ] **Step 4: 手工冒烟（限速路径）**
+- [x] **Step 4: 手工冒烟（限速路径）**
 
 1. 把「每批最多字数」临时设为 100000、并发上限设为 8，对整表跑一次，制造并发压力。
 2. 观察进度标签是否出现「被限速，N 秒后重试（第 x/5 次）」倒计时。
@@ -1833,14 +1837,14 @@ python -m py_compile main.py translator_service.py translation_worker.py transla
 4. 倒计时期间点「取消」—— 应在 1 秒内停止，且不弹异常。
 5. 若有格子最终失败，确认弹出「只重跑失败项」按钮；点击后只重跑失败的那些格子。
 
-- [ ] **Step 5: 术语表端到端验证（本修订版问题 14）**
+- [x] **Step 5: 术语表端到端验证（本修订版问题 14）**
 
 1. 打开单词本，填一行 `english=Knife` / `german=Messer`。
 2. 源列选 `english`，对含 `Knife` 的行跑一次翻译。
 3. 在 `build_merged_prompt` 里临时打点，确认提示词里**出现了** Glossary 段且含 `Knife`。
 4. 换成不含任何术语的行再跑，确认 Glossary 段**不出现**。
 
-- [ ] **Step 6: 更新 README / 说明（可选）**
+- [x] **Step 6: 更新 README / 说明（可选）**
 
 若 `README` 或 `docs/` 里描述了「每批次行数」的旧语义，同步更新为「每批最多字数」。
 
