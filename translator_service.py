@@ -1,13 +1,131 @@
 import json
+import random
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.utils import mktime_tz, parsedate_tz
+
+# —— 限速与重试（决定 9 / 12 / 14）——
+RETRY_MAX_ATTEMPTS = 5
+RETRY_BASE_DELAY = 2.0
+RETRY_MAX_DELAY = 60.0
+RETRYABLE_STATUS = frozenset({408, 409, 413, 429, 500, 502, 503, 504})
+FATAL_STATUS = frozenset({400, 401, 403, 404, 422})
 
 
 class TranslationCancelled(Exception):
     """Raised when a translation run is cancelled via should_cancel."""
+
+
+class TranslationRequestError(Exception):
+    """一次 HTTP 请求的失败。带状态码与 Retry-After，供重试层判定。"""
+
+    def __init__(self, message, status=None, retry_after=None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+def parse_retry_after(headers):
+    """读 Retry-After / retry-after-ms。无法解析或超出范围时返回 None。"""
+    if not headers:
+        return None
+    get = getattr(headers, "get", None)
+    if get is None:
+        return None
+    milliseconds = get("retry-after-ms")
+    if milliseconds:
+        try:
+            return max(0.0, float(milliseconds) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+    raw = get("Retry-After") or get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        pass
+    parsed = parsedate_tz(str(raw))
+    if parsed is None:
+        return None
+    try:
+        return max(0.0, float(mktime_tz(parsed) - time.time()))
+    except (OverflowError, ValueError):
+        return None
+
+
+def interruptible_sleep(seconds, should_cancel=None, slice_seconds=0.2):
+    """分片 sleep，每片查一次取消标志 —— 限速等待期间「停止」必须立刻生效（决定 9）。"""
+    remaining = float(seconds)
+    while remaining > 0:
+        if should_cancel and should_cancel():
+            raise TranslationCancelled()
+        step = min(slice_seconds, remaining)
+        time.sleep(step)
+        remaining -= step
+    if should_cancel and should_cancel():
+        raise TranslationCancelled()
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_attempts: int = RETRY_MAX_ATTEMPTS
+    base_delay: float = RETRY_BASE_DELAY
+    max_delay: float = RETRY_MAX_DELAY
+    sleep: object = interruptible_sleep
+
+    def is_retryable(self, exc):
+        if isinstance(exc, TranslationCancelled):
+            return False
+        if isinstance(exc, TranslationRequestError):
+            if exc.status is None:
+                return True  # 超时 / 连接断 / URLError
+            if exc.status in FATAL_STATUS:
+                return False
+            return exc.status in RETRYABLE_STATUS or exc.status >= 500
+        return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+
+    def delay_for(self, attempt, retry_after=None):
+        # 复刻 openai SDK 的取整与抖动：min(base·2ⁿ⁻¹, max) × (1 − 0.25·random())
+        if retry_after is not None and 0 < retry_after <= self.max_delay:
+            return float(retry_after)
+        raw = min(self.base_delay * (2 ** (attempt - 1)), self.max_delay)
+        return raw * (1 - 0.25 * random.random())
+
+
+def retry_call(func, policy=None, should_cancel=None, on_retry=None, before_attempt=None):
+    """按 policy 重试 func。
+
+    before_attempt 在**每次尝试之前**调用（含第一次与每次重试）—— 全局节流就挂在这里，
+    这样「重试」也受同一个最小间隔约束，不会出现「撞了限速反而连发」。
+    on_retry(attempt, max_attempts, wait_seconds) 在每次等待之前调用一次。
+    """
+    policy = policy or RetryPolicy()
+    last_error = None
+    for attempt in range(1, policy.max_attempts + 1):
+        if should_cancel and should_cancel():
+            raise TranslationCancelled()
+        if before_attempt is not None:
+            before_attempt()
+        try:
+            return func()
+        except TranslationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 是否重试由 policy 判定
+            if not policy.is_retryable(exc):
+                raise
+            last_error = exc
+            if attempt >= policy.max_attempts:
+                break
+            wait = policy.delay_for(attempt, getattr(exc, "retry_after", None))
+            if on_retry:
+                on_retry(attempt, policy.max_attempts, wait)
+            policy.sleep(wait, should_cancel)
+    raise last_error
 
 
 @dataclass(frozen=True)
@@ -52,6 +170,8 @@ class TranslationService:
         self.cache = cache if cache is not None else {}
         self.cache_namespace = ""
         self.should_cancel = should_cancel
+        self.retry_policy = RetryPolicy()
+        self.on_retry = None
         self.openai_translator_class = OpenAICompatibleTranslator
         self.google_translator_class = GoogleTranslateTranslator
         self.claude_translator_class = ClaudeMessagesTranslator
@@ -66,6 +186,8 @@ class TranslationService:
                 base_url=config.base_url,
                 timeout=config.timeout,
                 should_cancel=self.should_cancel,
+                retry_policy=self.retry_policy,
+                on_retry=self.on_retry,
             )
         if provider == "mymemory":
             from deep_translator import MyMemoryTranslator
@@ -92,6 +214,8 @@ class TranslationService:
                 glossary=config.glossary,
                 timeout=config.timeout,
                 should_cancel=self.should_cancel,
+                retry_policy=self.retry_policy,
+                on_retry=self.on_retry,
             )
         if provider == "claude":
             return self.claude_translator_class(
@@ -103,6 +227,8 @@ class TranslationService:
                 glossary=config.glossary,
                 timeout=config.timeout,
                 should_cancel=self.should_cancel,
+                retry_policy=self.retry_policy,
+                on_retry=self.on_retry,
             )
         if provider == "codex":
             return self.codex_translator_class(
@@ -114,6 +240,8 @@ class TranslationService:
                 glossary=config.glossary,
                 timeout=config.timeout,
                 should_cancel=self.should_cancel,
+                retry_policy=self.retry_policy,
+                on_retry=self.on_retry,
             )
         raise ValueError(f'Unsupported translation provider "{config.provider}".')
 
@@ -353,16 +481,22 @@ def normalize_provider(provider):
 
 
 class OpenAICompatibleTranslator:
-    def __init__(self, source, target, api_key, model, base_url="", glossary=None, post_json=None, timeout=60.0, should_cancel=None):
+    def __init__(self, source, target, api_key, model, base_url="", glossary=None,
+                 glossary_source_key="", post_json=None, timeout=60.0, should_cancel=None,
+                 retry_policy=None, on_retry=None, before_attempt=None):
         self.source = source
         self.target = target
         self.api_key = api_key
         self.model = model
         self.base_url = base_url or "https://api.openai.com/v1"
         self.glossary = glossary or []
+        self.glossary_source_key = glossary_source_key
         self.post_json = post_json or self._post_json
         self.timeout = timeout
         self.should_cancel = should_cancel
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.on_retry = on_retry
+        self.before_attempt = before_attempt
 
     def translate_batch(self, texts):
         if not texts:
@@ -459,16 +593,23 @@ class OpenAICompatibleTranslator:
         if self.should_cancel and self.should_cancel():
             raise TranslationCancelled()
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"OpenAI request failed: {exc.reason}") from exc
-        return json.loads(body)
+
+        def attempt():
+            request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise TranslationRequestError(
+                    f"OpenAI HTTP {exc.code}: {detail}",
+                    status=exc.code,
+                    retry_after=parse_retry_after(exc.headers),
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise TranslationRequestError(f"OpenAI request failed: {exc.reason}") from exc
+
+        return retry_call(attempt, self.retry_policy, self.should_cancel, self.on_retry, self.before_attempt)
 
     def _extract_content(self, response):
         try:
@@ -512,16 +653,22 @@ class ClaudeMessagesTranslator:
     DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
     ANTHROPIC_VERSION = "2023-06-01"
 
-    def __init__(self, source, target, api_key, model, base_url="", glossary=None, post_json=None, timeout=60.0, should_cancel=None):
+    def __init__(self, source, target, api_key, model, base_url="", glossary=None,
+                 glossary_source_key="", post_json=None, timeout=60.0, should_cancel=None,
+                 retry_policy=None, on_retry=None, before_attempt=None):
         self.source = source
         self.target = target
         self.api_key = api_key
         self.model = model or self.DEFAULT_MODEL
         self.base_url = base_url or self.DEFAULT_BASE_URL
         self.glossary = glossary or []
+        self.glossary_source_key = glossary_source_key
         self.post_json = post_json or self._post_json
         self.timeout = timeout
         self.should_cancel = should_cancel
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.on_retry = on_retry
+        self.before_attempt = before_attempt
 
     def translate_batch(self, texts):
         if not texts:
@@ -606,16 +753,23 @@ class ClaudeMessagesTranslator:
         if self.should_cancel and self.should_cancel():
             raise TranslationCancelled()
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Claude HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Claude request failed: {exc.reason}") from exc
-        return json.loads(body)
+
+        def attempt():
+            request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise TranslationRequestError(
+                    f"Claude HTTP {exc.code}: {detail}",
+                    status=exc.code,
+                    retry_after=parse_retry_after(exc.headers),
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise TranslationRequestError(f"Claude request failed: {exc.reason}") from exc
+
+        return retry_call(attempt, self.retry_policy, self.should_cancel, self.on_retry, self.before_attempt)
 
     def _extract_content(self, response):
         try:
@@ -630,16 +784,22 @@ class CodexResponsesTranslator:
     DEFAULT_BASE_URL = "https://api.openai.com/v1"
     DEFAULT_MODEL = "gpt-4o-mini"
 
-    def __init__(self, source, target, api_key, model, base_url="", glossary=None, post_json=None, timeout=60.0, should_cancel=None):
+    def __init__(self, source, target, api_key, model, base_url="", glossary=None,
+                 glossary_source_key="", post_json=None, timeout=60.0, should_cancel=None,
+                 retry_policy=None, on_retry=None, before_attempt=None):
         self.source = source
         self.target = target
         self.api_key = api_key
         self.model = model or self.DEFAULT_MODEL
         self.base_url = base_url or self.DEFAULT_BASE_URL
         self.glossary = glossary or []
+        self.glossary_source_key = glossary_source_key
         self.post_json = post_json or self._post_json
         self.timeout = timeout
         self.should_cancel = should_cancel
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.on_retry = on_retry
+        self.before_attempt = before_attempt
 
     def translate_batch(self, texts):
         if not texts:
@@ -716,16 +876,23 @@ class CodexResponsesTranslator:
         if self.should_cancel and self.should_cancel():
             raise TranslationCancelled()
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Codex HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Codex request failed: {exc.reason}") from exc
-        return json.loads(body)
+
+        def attempt():
+            request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise TranslationRequestError(
+                    f"Codex HTTP {exc.code}: {detail}",
+                    status=exc.code,
+                    retry_after=parse_retry_after(exc.headers),
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise TranslationRequestError(f"Codex request failed: {exc.reason}") from exc
+
+        return retry_call(attempt, self.retry_policy, self.should_cancel, self.on_retry, self.before_attempt)
 
     def _extract_content(self, response):
         if "output_text" in response and response["output_text"]:
@@ -755,13 +922,17 @@ class GoogleTranslateTranslator:
     DEFAULT_TIMEOUT = 15.0
 
     def __init__(self, source="auto", target="en", base_url="", timeout=None,
-                 request_func=None, should_cancel=None):
+                 request_func=None, should_cancel=None,
+                 retry_policy=None, on_retry=None, before_attempt=None):
         self.source = source
         self.target = target
         self.base_url = self._normalize_base_url(base_url or self.DEFAULT_BASE_URL)
         self.timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
         self.request_func = request_func or self._default_request
         self.should_cancel = should_cancel
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.on_retry = on_retry
+        self.before_attempt = before_attempt
 
     @staticmethod
     def _normalize_base_url(url):
@@ -788,7 +959,12 @@ class GoogleTranslateTranslator:
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         }
-        data = self.request_func(url, headers)
+        # 重试包在 request_func 外面：测试注入的假 request_func 也走同一套重试，
+        # 同时不改它「返回已解析数据」的契约。
+        data = retry_call(
+            lambda: self.request_func(url, headers),
+            self.retry_policy, self.should_cancel, self.on_retry, self.before_attempt,
+        )
         translated = self._extract_translations(data)
         if len(translated) != len(texts):
             raise RuntimeError(
@@ -818,7 +994,11 @@ class GoogleTranslateTranslator:
                 body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Google Translate HTTP {exc.code}: {detail}") from exc
+            raise TranslationRequestError(
+                f"Google Translate HTTP {exc.code}: {detail}",
+                status=exc.code,
+                retry_after=parse_retry_after(exc.headers),
+            ) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"Google Translate request failed: {exc.reason}") from exc
+            raise TranslationRequestError(f"Google Translate request failed: {exc.reason}") from exc
         return json.loads(body)

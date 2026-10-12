@@ -2,8 +2,9 @@ import json
 import threading
 import time
 import unittest
+from unittest import mock
 
-from translator_service import GoogleTranslateTranslator, OpenAICompatibleTranslator, TranslationCancelled, TranslationJob, TranslationService, TranslatorConfig, TranslationResults, validate_translator_config
+from translator_service import GoogleTranslateTranslator, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, parse_retry_after, retry_call, validate_translator_config
 
 
 class FakeBatchTranslator:
@@ -68,7 +69,10 @@ class TranslationServiceTests(unittest.TestCase):
         calls = []
 
         class FakeOpenAITranslator:
-            def __init__(self, source, target, api_key, model, base_url, glossary, timeout=60.0, should_cancel=None):
+            def __init__(self, source, target, api_key, model, base_url, glossary,
+                         glossary_source_key="", timeout=60.0, should_cancel=None,
+                         retry_policy=None, on_retry=None, before_attempt=None):
+
                 pass
 
             def translate_job_batch(self, jobs):
@@ -316,7 +320,10 @@ class TranslationServiceTests(unittest.TestCase):
         seen = {}
 
         class FakeOpenAITranslator:
-            def __init__(self, source, target, api_key, model, base_url, glossary, timeout=60.0, should_cancel=None):
+            def __init__(self, source, target, api_key, model, base_url, glossary,
+                         glossary_source_key="", timeout=60.0, should_cancel=None,
+                         retry_policy=None, on_retry=None, before_attempt=None):
+
                 seen.update(
                     {
                         "source": source,
@@ -445,7 +452,10 @@ class TranslationServiceTests(unittest.TestCase):
         calls = []
 
         class FakeOpenAITranslator:
-            def __init__(self, source, target, api_key, model, base_url, glossary, timeout=60.0, should_cancel=None):
+            def __init__(self, source, target, api_key, model, base_url, glossary,
+                         glossary_source_key="", timeout=60.0, should_cancel=None,
+                         retry_policy=None, on_retry=None, before_attempt=None):
+
                 pass
 
             def translate_job_batch(self, jobs):
@@ -690,7 +700,8 @@ class GoogleProviderIntegrationTests(unittest.TestCase):
         calls = []
 
         class FakeGoogle:
-            def __init__(self, source, target, base_url, timeout, should_cancel=None):
+            def __init__(self, source, target, base_url, timeout, should_cancel=None,
+                         retry_policy=None, on_retry=None, before_attempt=None):
                 calls.append((source, target, base_url, timeout))
 
             def translate_batch(self, texts):
@@ -706,6 +717,158 @@ class GoogleProviderIntegrationTests(unittest.TestCase):
         self.assertEqual(calls[0], ("en", "zh-CN", "https://mirror.test", 7.0))
         self.assertEqual(results.cell_results[(0, 3)], "zh:Knife")
         self.assertEqual(results.translated, 1)
+
+
+class _FakeSleeper:
+    """记录等待时长，不真的睡。"""
+
+    def __init__(self):
+        self.waits = []
+
+    def __call__(self, seconds, should_cancel=None):
+        self.waits.append(seconds)
+
+
+class RetryPolicyTests(unittest.TestCase):
+    def test_fatal_status_not_retryable(self):
+        policy = RetryPolicy()
+        for status in (400, 401, 403, 404, 422):
+            with self.subTest(status=status):
+                self.assertFalse(policy.is_retryable(TranslationRequestError("bad", status=status)))
+
+    def test_retryable_status(self):
+        policy = RetryPolicy()
+        for status in (408, 409, 413, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                self.assertTrue(policy.is_retryable(TranslationRequestError("again", status=status)))
+
+    def test_url_error_retryable(self):
+        # 没有状态码 = 超时 / 连接断 / URLError，一律可重试
+        self.assertTrue(RetryPolicy().is_retryable(TranslationRequestError("timeout")))
+
+    def test_delay_grows_and_caps(self):
+        policy = RetryPolicy(base_delay=2.0, max_delay=60.0)
+
+        self.assertGreater(policy.delay_for(1), 1.5)
+        self.assertLessEqual(policy.delay_for(1), 2.0)
+        self.assertGreater(policy.delay_for(3), 6.0)
+        self.assertLessEqual(policy.delay_for(3), 8.0)
+        self.assertLessEqual(policy.delay_for(10), 60.0)
+
+    def test_retry_after_header_wins(self):
+        policy = RetryPolicy(base_delay=2.0, max_delay=60.0)
+
+        self.assertEqual(policy.delay_for(1, retry_after=7.0), 7.0)
+        # 0 与超出上限的值都不采信，回落到指数退避
+        self.assertLessEqual(policy.delay_for(1, retry_after=0), 2.0)
+        self.assertLessEqual(policy.delay_for(1, retry_after=999), 2.0)
+
+    def test_parse_retry_after_milliseconds(self):
+        self.assertEqual(parse_retry_after({"retry-after-ms": "1500"}), 1.5)
+
+    def test_parse_retry_after_seconds(self):
+        self.assertEqual(parse_retry_after({"Retry-After": "12"}), 12.0)
+
+    def test_parse_retry_after_http_date(self):
+        target_epoch = 1792567680.0  # 2026-10-21 07:28:00 UTC
+        with mock.patch("translator_service.time.time", return_value=target_epoch - 90.0):
+            seconds = parse_retry_after({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
+
+        self.assertAlmostEqual(seconds, 90.0, places=3)
+
+    def test_parse_retry_after_handles_missing(self):
+        self.assertIsNone(parse_retry_after(None))
+        self.assertIsNone(parse_retry_after({}))
+        self.assertIsNone(parse_retry_after({"Retry-After": "not-a-date"}))
+
+
+class RetryCallTests(unittest.TestCase):
+    def test_retry_call_retries_then_succeeds(self):
+        sleeper = _FakeSleeper()
+        retries = []
+        state = {"calls": 0}
+
+        def func():
+            state["calls"] += 1
+            if state["calls"] < 3:
+                raise TranslationRequestError("rate limited", status=429)
+            return "ok"
+
+        result = retry_call(
+            func,
+            RetryPolicy(sleep=sleeper),
+            on_retry=lambda attempt, max_attempts, wait: retries.append((attempt, max_attempts, wait)),
+        )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(state["calls"], 3)
+        self.assertEqual(len(retries), 2)
+        self.assertEqual(retries[0][0], 1)
+        self.assertEqual(retries[0][1], RETRY_MAX_ATTEMPTS)
+        self.assertEqual(len(sleeper.waits), 2)
+
+    def test_retry_call_gives_up_after_max_attempts(self):
+        sleeper = _FakeSleeper()
+        state = {"calls": 0}
+
+        def func():
+            state["calls"] += 1
+            raise TranslationRequestError("rate limited", status=429)
+
+        with self.assertRaises(TranslationRequestError):
+            retry_call(func, RetryPolicy(max_attempts=5, sleep=sleeper))
+
+        self.assertEqual(state["calls"], 5)
+
+    def test_retry_call_does_not_retry_fatal(self):
+        sleeper = _FakeSleeper()
+        state = {"calls": 0}
+
+        def func():
+            state["calls"] += 1
+            raise TranslationRequestError("bad key", status=401)
+
+        with self.assertRaises(TranslationRequestError):
+            retry_call(func, RetryPolicy(sleep=sleeper))
+
+        self.assertEqual(state["calls"], 1)
+
+    def test_retry_call_cancel_interrupts_wait(self):
+        state = {"calls": 0, "cancelled": False}
+
+        def func():
+            state["calls"] += 1
+            state["cancelled"] = True
+            raise TranslationRequestError("rate limited", status=429)
+
+        # 用真实的 interruptible_sleep：base_delay=60 若真睡就会明显超过 1 秒
+        policy = RetryPolicy(base_delay=60.0, max_delay=60.0)
+        started = time.monotonic()
+        with self.assertRaises(TranslationCancelled):
+            retry_call(func, policy, should_cancel=lambda: state["cancelled"])
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(state["calls"], 1)
+
+    def test_before_attempt_runs_on_every_attempt(self):
+        """重试不能绕过节流：before_attempt 必须在每次尝试前都跑（含重试）。"""
+        sleeper = _FakeSleeper()
+        state = {"calls": 0, "before": 0}
+
+        def func():
+            state["calls"] += 1
+            if state["calls"] < 3:
+                raise TranslationRequestError("rate limited", status=429)
+            return "ok"
+
+        def before_attempt():
+            state["before"] += 1
+
+        result = retry_call(func, RetryPolicy(sleep=sleeper), before_attempt=before_attempt)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(state["before"], 3)
 
 
 if __name__ == "__main__":
