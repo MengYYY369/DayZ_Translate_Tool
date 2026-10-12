@@ -22,7 +22,6 @@ MAX_AUTO_CONCURRENCY = 8            # 自动模式上限旋钮的取值上限
 RECOVER_AFTER_SUCCESSES = 8         # 连续成功多少次后并发 +1
 
 # —— 限速与重试（决定 9 / 12 / 14）——
-GOOGLE_MIN_INTERVAL = 3.0           # 谷歌免费接口：两次请求最小间隔（约 20 请求/分钟）
 RETRY_MAX_ATTEMPTS = 5
 RETRY_BASE_DELAY = 2.0
 RETRY_MAX_DELAY = 60.0
@@ -226,8 +225,10 @@ class TranslationJob:
 @dataclass(frozen=True)
 class TranslatorConfig:
     provider: str = "google"
+    label: str = ""                 # 界面上的源名，降级提示要用
     char_budget: int = DEFAULT_CHAR_BUDGET
     parallel_batches: int = 1
+    min_interval: float = 0.0       # 全局限速：两次请求最小间隔（秒）
     api_key: str = ""
     region: str = ""
     model: str = ""
@@ -262,38 +263,32 @@ class TranslationService:
         self.rate_limiter = None
         self.gate = None
         self.openai_translator_class = OpenAICompatibleTranslator
-        self.google_translator_class = GoogleTranslateTranslator
+        self.free_translator_classes = None      # None = 用 free_translators 的注册表
         self.claude_translator_class = ClaudeMessagesTranslator
         self.codex_translator_class = CodexResponsesTranslator
 
     def create_provider(self, source, target, config):
         provider = normalize_provider(config.provider)
-        if provider == "google":
-            return self.google_translator_class(
+        free_classes = self.free_translator_classes
+        if free_classes is None:
+            from free_translators import FREE_TRANSLATOR_CLASSES
+
+            free_classes = FREE_TRANSLATOR_CLASSES
+        free_class = free_classes.get(provider)
+        if free_class is not None:
+            return free_class(
                 source=source,
                 target=target,
-                base_url=config.base_url,
                 timeout=config.timeout,
                 should_cancel=self.should_cancel,
                 retry_policy=self.retry_policy,
                 on_retry=self.on_retry,
                 before_attempt=self._throttle,
             )
-        if provider == "mymemory":
-            from deep_translator import MyMemoryTranslator
-
-            kwargs = {"source": source, "target": target}
-            if config.email:
-                kwargs["email"] = config.email
-            return MyMemoryTranslator(**kwargs)
         if provider == "deepl":
             from deep_translator import DeeplTranslator
 
             return DeeplTranslator(source=source, target=target, api_key=config.api_key)
-        if provider == "microsoft":
-            from deep_translator import MicrosoftTranslator
-
-            return MicrosoftTranslator(source=source, target=target, api_key=config.api_key, region=config.region)
         if provider == "openai":
             return self.openai_translator_class(
                 source=source,
@@ -350,8 +345,8 @@ class TranslationService:
         self.cache_namespace = self._cache_namespace(config)
         previous_cancel = self.should_cancel
         self.should_cancel = should_cancel
-        # 谷歌免费接口按 IP 限「短时间发太密」，与 AI 的 token 配额是两套规则（决定 1 / 12）
-        self.rate_limiter = RateLimiter(GOOGLE_MIN_INTERVAL if provider == "google" else 0.0)
+        # 每个源的最小请求间隔由源列表提供（免费源内置，AI 源可自定义）
+        self.rate_limiter = RateLimiter(max(0.0, float(config.min_interval or 0.0)))
         # 自动模式的并发上限 = 用户设的并发数（决定 22）。
         # 关掉自动时闸门为 None，并发完全由线程池大小决定。
         ceiling = max(MIN_AUTO_CONCURRENCY, int(config.parallel_batches or MIN_AUTO_CONCURRENCY))
@@ -680,8 +675,6 @@ def validate_translator_config(config):
     provider = normalize_provider(config.provider)
     if provider == "deepl" and not config.api_key:
         raise ValueError("DeepL requires an API key.")
-    if provider == "microsoft" and (not config.api_key or not config.region):
-        raise ValueError("Microsoft Translator requires an API key and region.")
     if provider == "openai" and not config.api_key:
         raise ValueError("OpenAI translator requires an API key.")
     if provider == "claude" and not config.api_key:
@@ -1249,98 +1242,3 @@ class CodexResponsesTranslator:
             pass
         raise RuntimeError(f"Codex response missing output_text: {response}")
 
-
-class GoogleTranslateTranslator:
-    """Google Translate via the googleapis.com JSON endpoint.
-
-    Uses ``translate.googleapis.com/translate_a/single`` instead of the
-    HTML-scraping ``translate.google.com/m`` endpoint used by
-    ``deep_translator.GoogleTranslator``.  The JSON endpoint is more
-    reliable and supports a configurable timeout so the UI does not hang
-    indefinitely when the network is unreachable.
-    """
-
-    DEFAULT_BASE_URL = "https://translate.googleapis.com/translate_a/single"
-    DEFAULT_TIMEOUT = 15.0
-
-    def __init__(self, source="auto", target="en", base_url="", timeout=None,
-                 request_func=None, should_cancel=None,
-                 retry_policy=None, on_retry=None, before_attempt=None):
-        self.source = source
-        self.target = target
-        self.base_url = self._normalize_base_url(base_url or self.DEFAULT_BASE_URL)
-        self.timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
-        self.request_func = request_func or self._default_request
-        self.should_cancel = should_cancel
-        self.retry_policy = retry_policy or RetryPolicy()
-        self.on_retry = on_retry
-        self.before_attempt = before_attempt
-
-    @staticmethod
-    def _normalize_base_url(url):
-        url = url.strip().rstrip("/")
-        if not url.endswith("/translate_a/single"):
-            url = f"{url}/translate_a/single"
-        return url
-
-    def translate(self, text):
-        return self.translate_batch([text])[0]
-
-    def translate_batch(self, texts):
-        if not texts:
-            return []
-        params = [("client", "gtx"), ("sl", self.source),
-                  ("tl", self.target), ("dt", "t")]
-        params.extend(("q", text) for text in texts)
-        query_string = urllib.parse.urlencode(params)
-        url = f"{self.base_url}?{query_string}"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        }
-        # 重试包在 request_func 外面：测试注入的假 request_func 也走同一套重试，
-        # 同时不改它「返回已解析数据」的契约。
-        data = retry_call(
-            lambda: self.request_func(url, headers),
-            self.retry_policy, self.should_cancel, self.on_retry, self.before_attempt,
-        )
-        translated = self._extract_translations(data)
-        if len(translated) != len(texts):
-            raise RuntimeError(
-                f"Google returned {len(translated)} translations "
-                f"for {len(texts)} texts."
-            )
-        return translated
-
-    @staticmethod
-    def _extract_translations(data):
-        if not isinstance(data, list) or not data or not isinstance(data[0], list):
-            raise RuntimeError(f"Unexpected Google Translate response: {data}")
-        translations = []
-        for item in data[0]:
-            if isinstance(item, list) and item:
-                translations.append(item[0])
-            else:
-                raise RuntimeError(f"Unexpected Google Translate response item: {item}")
-        return translations
-
-    def _default_request(self, url, headers):
-        if self.should_cancel and self.should_cancel():
-            raise TranslationCancelled()
-        request = urllib.request.Request(url, headers=headers, method="GET")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise TranslationRequestError(
-                f"Google Translate HTTP {exc.code}: {detail}",
-                status=exc.code,
-                retry_after=parse_retry_after(exc.headers),
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise TranslationRequestError(f"Google Translate request failed: {exc.reason}") from exc
-        return json.loads(body)

@@ -6,7 +6,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from translator_service import DEFAULT_CHAR_BUDGET, DEFAULT_OUTPUT_CHAR_CAP, AdaptiveGate, GoogleTranslateTranslator, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, assign_batch_ids, matching_glossary_entries, parse_numbered_translations, parse_retry_after, retry_call, salvage_truncated_object, validate_translator_config
+from translator_service import DEFAULT_CHAR_BUDGET, DEFAULT_OUTPUT_CHAR_CAP, AdaptiveGate, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, assign_batch_ids, matching_glossary_entries, parse_numbered_translations, parse_retry_after, retry_call, salvage_truncated_object, validate_translator_config
 
 
 class FakeBatchTranslator:
@@ -312,14 +312,11 @@ class TranslationServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_translator_config(TranslatorConfig(provider="deepl"))
         with self.assertRaises(ValueError):
-            validate_translator_config(TranslatorConfig(provider="microsoft", api_key="key"))
-        with self.assertRaises(ValueError):
             validate_translator_config(TranslatorConfig(provider="openai"))
 
         validate_translator_config(TranslatorConfig(provider="google"))
         validate_translator_config(TranslatorConfig(provider="mymemory"))
         validate_translator_config(TranslatorConfig(provider="deepl", api_key="key"))
-        validate_translator_config(TranslatorConfig(provider="microsoft", api_key="key", region="eastus"))
         validate_translator_config(TranslatorConfig(provider="openai", api_key="key"))
         validate_translator_config(TranslatorConfig(provider="chatgpt", api_key="key"))
 
@@ -537,196 +534,89 @@ class TranslationServiceTests(unittest.TestCase):
         self.assertTrue(results.cancelled)
 
 
-def _google_response(*pairs):
-    """Build a fake googleapis.com /translate_a/single response."""
-    return [[list(pair) for pair in pairs]]
+class FreeProviderTests(unittest.TestCase):
+    def test_config_carries_label_and_min_interval(self):
+        config = TranslatorConfig(provider="microsoft", label="微软翻译", min_interval=0.1)
+        self.assertEqual(config.label, "微软翻译")
+        self.assertEqual(config.min_interval, 0.1)
 
+    def test_free_providers_need_no_api_key(self):
+        for provider in ("google", "microsoft", "tencent", "volcano", "lara", "mymemory"):
+            validate_translator_config(TranslatorConfig(provider=provider))
 
-class GoogleTranslateTranslatorTests(unittest.TestCase):
-    def test_translate_single_text(self):
-        calls = []
+    def test_deepl_still_requires_api_key(self):
+        with self.assertRaises(ValueError):
+            validate_translator_config(TranslatorConfig(provider="deepl"))
 
-        def fake_request(url, headers):
-            calls.append((url, headers))
-            return _google_response(("刀", "Knife"))
+    def test_create_provider_returns_free_client_for_every_free_source(self):
+        from free_translators import FREE_TRANSLATOR_CLASSES
+        service = TranslationService()
+        for source_id, cls in FREE_TRANSLATOR_CLASSES.items():
+            provider = service.create_provider("en", "zh-CN", TranslatorConfig(provider=source_id))
+            self.assertIsInstance(provider, cls)
 
-        translator = GoogleTranslateTranslator(
-            source="en", target="zh-CN", request_func=fake_request,
+    def test_rate_limiter_is_cleared_after_a_run(self):
+        service = TranslationService(provider_factory=lambda *a, **k: FakeBatchTranslator())
+        config = TranslatorConfig(provider="volcano", min_interval=1.0, parallel_batches=1)
+        service.translate_jobs([TranslationJob(0, 1, "Knife", "en", "de")], config)
+        self.assertIsNone(service.rate_limiter)     # translate_jobs 结束后清空
+
+    def test_translate_jobs_wires_min_interval_into_rate_limiter(self):
+        seen = {}
+
+        class ProbeService(TranslationService):
+            def _translate_batches(self, *args, **kwargs):
+                seen["interval"] = self.rate_limiter.min_interval
+                return None
+
+        service = ProbeService(provider_factory=lambda *a, **k: FakeBatchTranslator())
+        service.translate_jobs(
+            [TranslationJob(0, 1, "Knife", "en", "de")],
+            TranslatorConfig(provider="volcano", min_interval=1.0),
         )
+        self.assertEqual(seen["interval"], 1.0)
 
-        result = translator.translate("Knife")
-
-        self.assertEqual(result, "刀")
-        self.assertIn("translate.googleapis.com/translate_a/single", calls[0][0])
-        self.assertIn("sl=en", calls[0][0])
-        self.assertIn("tl=zh-CN", calls[0][0])
-        self.assertIn("q=Knife", calls[0][0])
-        self.assertIn("client=gtx", calls[0][0])
-
-    def test_translate_batch_returns_translations_in_order(self):
-        def fake_request(url, headers):
-            return _google_response(("Messer", "Knife"), ("Pistole", "Gun"))
-
-        translator = GoogleTranslateTranslator(
-            source="en", target="de", request_func=fake_request,
-        )
-
-        result = translator.translate_batch(["Knife", "Gun"])
-
-        self.assertEqual(result, ["Messer", "Pistole"])
-
-    def test_translate_batch_empty_returns_empty(self):
-        translator = GoogleTranslateTranslator(
-            source="en", target="de", request_func=lambda url, headers: [],
-        )
-        self.assertEqual(translator.translate_batch([]), [])
-
-    def test_translate_batch_count_mismatch_raises(self):
-        def fake_request(url, headers):
-            return _google_response(("Messer", "Knife"))
-
-        translator = GoogleTranslateTranslator(
-            source="en", target="de", request_func=fake_request,
-        )
-
-        with self.assertRaises(RuntimeError) as ctx:
-            translator.translate_batch(["Knife", "Gun"])
-        self.assertIn("1 translations", str(ctx.exception))
-
-    def test_custom_base_url_is_used(self):
-        seen_urls = []
-
-        def fake_request(url, headers):
-            seen_urls.append(url)
-            return _google_response(("刀", "Knife"))
-
-        translator = GoogleTranslateTranslator(
-            source="en", target="zh-CN",
-            base_url="https://my-mirror.example.com",
-            request_func=fake_request,
-        )
-
-        translator.translate("Knife")
-
-        self.assertTrue(
-            seen_urls[0].startswith("https://my-mirror.example.com/translate_a/single?"),
-            f"Expected custom base URL, got {seen_urls[0]}",
-        )
-
-    def test_custom_base_url_with_full_path_is_preserved(self):
-        seen_urls = []
-
-        def fake_request(url, headers):
-            seen_urls.append(url)
-            return _google_response(("刀", "Knife"))
-
-        translator = GoogleTranslateTranslator(
-            source="en", target="zh-CN",
-            base_url="https://my-mirror.example.com/translate_a/single",
-            request_func=fake_request,
-        )
-
-        translator.translate("Knife")
-
-        self.assertTrue(
-            seen_urls[0].startswith("https://my-mirror.example.com/translate_a/single?"),
-            f"Expected full path preserved, got {seen_urls[0]}",
-        )
-
-    def test_default_timeout_is_15_seconds(self):
-        translator = GoogleTranslateTranslator(source="en", target="de")
-        self.assertEqual(translator.timeout, 15.0)
-
-    def test_custom_timeout_is_passed_to_urlopen(self):
-        captured = {}
-
-        def fake_request(url, headers):
-            captured["url"] = url
-            captured["headers"] = headers
-            return _google_response(("刀", "Knife"))
-
-        translator = GoogleTranslateTranslator(
-            source="en", target="zh-CN",
-            timeout=5.0,
-            request_func=fake_request,
-        )
-
-        translator.translate("Knife")
-        self.assertEqual(translator.timeout, 5.0)
-
-    def test_request_error_raises_runtime_error(self):
-        def fake_request(url, headers):
-            raise RuntimeError("connection timed out")
-
-        translator = GoogleTranslateTranslator(
-            source="en", target="de", request_func=fake_request,
-        )
-
-        with self.assertRaises(RuntimeError) as ctx:
-            translator.translate("Knife")
-        self.assertIn("connection timed out", str(ctx.exception))
-
-    def test_unexpected_response_raises_runtime_error(self):
-        translator = GoogleTranslateTranslator(
-            source="en", target="de",
-            request_func=lambda url, headers: {"error": "bad"},
-        )
-
-        with self.assertRaises(RuntimeError):
-            translator.translate("Knife")
-
-    def test_user_agent_header_is_set(self):
-        captured = {}
-
-        def fake_request(url, headers):
-            captured.update(headers)
-            return _google_response(("刀", "Knife"))
-
-        translator = GoogleTranslateTranslator(
-            source="en", target="zh-CN", request_func=fake_request,
-        )
-        translator.translate("Knife")
-
-        self.assertIn("User-Agent", captured)
-        self.assertIn("Mozilla", captured["User-Agent"])
+    def test_google_provider_no_longer_has_a_hardcoded_interval(self):
+        import translator_service
+        self.assertFalse(hasattr(translator_service, "GOOGLE_MIN_INTERVAL"))
 
 
 class GoogleProviderIntegrationTests(unittest.TestCase):
-    def test_create_provider_returns_google_translator(self):
+    """走真实 urllib 路径（mock.patch urlopen），验证 POST translate_a/t。"""
+
+    def test_end_to_end_translate_via_urllib(self):
+        import json as jsonlib
+        from unittest import mock
+
+        captured = {}
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = jsonlib.dumps(payload).encode("utf-8")
+
+            def read(self):
+                return self.payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["method"] = request.get_method()
+            captured["body"] = request.data
+            return FakeResponse(["刀"])
+
         service = TranslationService()
-        provider = service.create_provider("en", "zh-CN", TranslatorConfig(provider="google"))
-        self.assertIsInstance(provider, GoogleTranslateTranslator)
-
-    def test_create_provider_passes_base_url_and_timeout(self):
-        service = TranslationService()
-        config = TranslatorConfig(provider="google", base_url="https://mirror.test", timeout=8.0)
-        provider = service.create_provider("en", "zh-CN", config)
-        self.assertIsInstance(provider, GoogleTranslateTranslator)
-        self.assertIn("mirror.test", provider.base_url)
-        self.assertEqual(provider.timeout, 8.0)
-
-    def test_service_translate_jobs_uses_google_translator(self):
-        calls = []
-
-        class FakeGoogle:
-            def __init__(self, source, target, base_url, timeout, should_cancel=None,
-                         retry_policy=None, on_retry=None, before_attempt=None):
-                calls.append((source, target, base_url, timeout))
-
-            def translate_batch(self, texts):
-                return [f"zh:{text}" for text in texts]
-
-        service = TranslationService()
-        service.google_translator_class = FakeGoogle
-        config = TranslatorConfig(provider="google", base_url="https://mirror.test", timeout=7.0)
-        jobs = [TranslationJob(0, 3, "Knife", "en", "zh-CN")]
-
-        results = service.translate_jobs(jobs, config)
-
-        self.assertEqual(calls[0], ("en", "zh-CN", "https://mirror.test", 7.0))
-        self.assertEqual(results.cell_results[(0, 3)], "zh:Knife")
-        self.assertEqual(results.translated, 1)
-
+        jobs = [TranslationJob(0, 1, "Knife", "en", "zh-CN")]
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            results = service.translate_jobs(jobs, TranslatorConfig(provider="google"))
+        self.assertEqual(results.cell_results[(0, 1)], "刀")
+        self.assertEqual(captured["method"], "POST")
+        self.assertIn("translate_a/t", captured["url"])
+        self.assertIn(b"q=Knife", captured["body"])
 
 class _FakeSleeper:
     """记录等待时长，不真的睡。"""
@@ -1038,7 +928,7 @@ class GuardedBatchTests(unittest.TestCase):
                 seen.append(self)
 
         class RateLimitedGoogle:
-            def __init__(self, source, target, base_url, timeout, should_cancel=None,
+            def __init__(self, source, target, timeout=None, should_cancel=None,
                          retry_policy=None, on_retry=None, before_attempt=None):
                 pass
 
@@ -1046,7 +936,7 @@ class GuardedBatchTests(unittest.TestCase):
                 raise TranslationRequestError("rate limited", status=429)
 
         service = TranslationService()
-        service.google_translator_class = RateLimitedGoogle
+        service.free_translator_classes = {"google": RateLimitedGoogle}
         config = TranslatorConfig(provider="google", parallel_batches=4)
         jobs = [TranslationJob(0, 0, "Knife", "en", "zh-CN")]
 
