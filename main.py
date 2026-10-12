@@ -43,7 +43,7 @@ from dayz_csv import (
 )
 from translation_cache import TranslationCacheStore
 from translation_worker import TranslationWorker
-from translator_service import DEFAULT_CHAR_BUDGET, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationJob, TranslationService, TranslatorConfig, normalize_provider, validate_translator_config
+from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationJob, TranslationService, TranslatorConfig, normalize_provider, validate_translator_config
 from wordbook_csv import WORDBOOK_HEADERS, load_wordbook_csv, wordbook_rows_for_save, write_wordbook_csv
 from table_history import TableHistory, snapshot_table, restore_table
 
@@ -85,6 +85,7 @@ UI_TEXT = {
         "translation_settings": "Translation Settings...",
         "language_settings": "Interface Language...",
         "cancel": "Cancel",
+        "close": "Close",
         "ok": "OK",
         "test_translation": "Test",
         "test_translation_success": "Test succeeded. Translations:\n{result}",
@@ -96,6 +97,14 @@ UI_TEXT = {
         "parallel_batches": "Parallel Batches",
         "char_budget_tooltip": "Source characters a single request may carry. Rows are never split across requests. Larger = fewer requests but a bigger loss if one fails.",
         "parallel_batches_tooltip": "Number of batches processed concurrently. Larger = faster but may hit API rate limits.",
+        "concurrency_cap": "Concurrency cap",
+        "auto_concurrency": "Auto",
+        "concurrency_cap_tooltip": "Auto mode starts low, halves on rate limits and climbs back slowly. This is the ceiling it may climb to.",
+        "translation_cache": "Translation cache",
+        "clear_translation_cache": "Clear cache",
+        "retry_countdown": "Rate limited — retrying in {seconds}s (attempt {attempt}/{max_attempts})",
+        "retry_failed_only": "Retry failed only",
+        "failed_cells_count": "{count} cells failed.",
         "timeout": "Timeout (s)",
         "language": "Language",
         "api_key": "API Key",
@@ -179,6 +188,7 @@ UI_TEXT = {
         "translation_settings": "翻译设置...",
         "language_settings": "界面语言...",
         "cancel": "取消",
+        "close": "关闭",
         "ok": "确定",
         "test_translation": "测试",
         "test_translation_success": "测试成功。翻译结果：\n{result}",
@@ -190,6 +200,14 @@ UI_TEXT = {
         "parallel_batches": "并行批次",
         "char_budget_tooltip": "单次请求最多携带的源文字数。行不会被拆到两个请求里。越大请求越少，但单次失败的代价也越大。",
         "parallel_batches_tooltip": "同时进行的批次数（并发请求数）。越大翻译越快但可能触发 API 限流。",
+        "concurrency_cap": "并发上限",
+        "auto_concurrency": "自动",
+        "concurrency_cap_tooltip": "自动模式起步保守，撞到限速立刻减半，之后慢慢回升。这里是最多能升到几个。",
+        "translation_cache": "翻译缓存",
+        "clear_translation_cache": "清空缓存",
+        "retry_countdown": "被限速，{seconds} 秒后重试（第 {attempt}/{max_attempts} 次）",
+        "retry_failed_only": "只重跑失败项",
+        "failed_cells_count": "有 {count} 个单元格翻译失败。",
         "timeout": "超时 (s)",
         "language": "语言",
         "api_key": "API Key",
@@ -467,8 +485,12 @@ class TranslationSettingsDialog(QDialog):
         self.char_budget_input.setSingleStep(100)
         self.char_budget_input.setValue(window.translation_char_budget)
 
+        self.auto_concurrency_check = QCheckBox(window.tr("auto_concurrency"), self)
+        self.auto_concurrency_check.setChecked(window.translation_auto_concurrency)
+
         self.parallel_batches_input = QSpinBox(self)
-        self.parallel_batches_input.setRange(1, 5)
+        self.parallel_batches_input.setRange(1, MAX_AUTO_CONCURRENCY)
+        self.parallel_batches_input.setToolTip(window.tr("concurrency_cap_tooltip"))
         self.parallel_batches_input.setValue(window.translation_parallel_batches)
 
         self.timeout_input = QSpinBox(self)
@@ -503,13 +525,25 @@ class TranslationSettingsDialog(QDialog):
         self.form_rows["preset"] = (preset_label, self._layout_widgets(preset_layout))
         self.add_form_row(form, "provider", window.tr("translation_engine"), self.provider_combo)
         self.add_form_row(form, "char_budget", window.tr("char_budget"), self.char_budget_input, window.tr("char_budget_tooltip"))
-        self.add_form_row(form, "parallel_batches", window.tr("parallel_batches"), self.parallel_batches_input, window.tr("parallel_batches_tooltip"))
+        # 并发上限那一行要放两个控件，不能走 add_form_row（它只接受单个 widget）。
+        cap_label = QLabel(window.tr("concurrency_cap"), self)
+        cap_label.setToolTip(window.tr("concurrency_cap_tooltip"))
+        cap_layout = QHBoxLayout()
+        cap_layout.setContentsMargins(0, 0, 0, 0)
+        cap_layout.addWidget(self.auto_concurrency_check)
+        cap_layout.addWidget(self.parallel_batches_input)
+        cap_layout.addStretch(1)
+        form.addRow(cap_label, cap_layout)
+        self.form_rows["parallel_batches"] = (cap_label, self._layout_widgets(cap_layout))
         self.add_form_row(form, "timeout", window.tr("timeout"), self.timeout_input)
         self.add_form_row(form, "api_key", window.tr("api_key"), self.api_key_input)
         self.add_form_row(form, "region", window.tr("region"), self.region_input)
         self.add_form_row(form, "model", window.tr("model"), self.model_input)
         self.add_form_row(form, "base_url", window.tr("base_url"), self.base_url_input)
         self.add_form_row(form, "email", window.tr("email"), self.email_input)
+        self.clear_cache_button = QPushButton(window.tr("clear_translation_cache"), self)
+        self.clear_cache_button.clicked.connect(self.clear_translation_cache)
+        self.add_form_row(form, "clear_cache", window.tr("translation_cache"), self.clear_cache_button)
         self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
         self.connect_auto_save_signals()
         self.update_visible_fields()
@@ -530,7 +564,7 @@ class TranslationSettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addLayout(buttons)
-        self.resize(660, 300)
+        self.resize(660, 340)
 
     def _layout_widgets(self, layout):
         widgets = []
@@ -643,6 +677,7 @@ class TranslationSettingsDialog(QDialog):
         self.window.translation_provider = provider
         self.window.translation_char_budget = self.char_budget_input.value()
         self.window.translation_parallel_batches = self.parallel_batches_input.value()
+        self.window.translation_auto_concurrency = self.auto_concurrency_check.isChecked()
         self.window.translation_timeout = float(self.timeout_input.value())
         # 保存当前 provider 的对话框字段到 window
         self._save_dialog_fields_to_cache(provider)
@@ -653,6 +688,9 @@ class TranslationSettingsDialog(QDialog):
         self.window.save_translation_settings()
         if close_dialog:
             self.accept()
+
+    def clear_translation_cache(self):
+        self.window.clear_translation_cache()
 
     def _build_test_config(self):
         provider_label = self.provider_combo.currentText()
@@ -801,7 +839,7 @@ class TranslationSettingsDialog(QDialog):
         self.refresh_preset_dirty_indicator()
 
     def _read_preset_values(self, name):
-        preset_keys = ["provider", "char_budget", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email", "batch_size"]
+        preset_keys = ["provider", "char_budget", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email", "batch_size", "auto_concurrency"]
         prefix = f"translation_presets/{name}/"
         values = {key: self.window.settings.value(prefix + key, "") for key in preset_keys}
         return values
@@ -821,6 +859,9 @@ class TranslationSettingsDialog(QDialog):
         parallel_batches = values.get("parallel_batches")
         if parallel_batches is not None and str(parallel_batches) != "":
             self.parallel_batches_input.setValue(int(parallel_batches))
+        auto_concurrency = values.get("auto_concurrency")
+        if auto_concurrency is not None and str(auto_concurrency) != "":
+            self.auto_concurrency_check.setChecked(str(auto_concurrency).lower() in ("true", "1", "yes"))
         timeout = values.get("timeout")
         if timeout is not None and str(timeout) != "":
             self.timeout_input.setValue(int(timeout))
@@ -840,6 +881,7 @@ class TranslationSettingsDialog(QDialog):
             "provider": provider,
             "char_budget": self.char_budget_input.value(),
             "parallel_batches": self.parallel_batches_input.value(),
+            "auto_concurrency": self.auto_concurrency_check.isChecked(),
             "timeout": self.timeout_input.value(),
             "api_key": self.api_key_input.text().strip(),
             "region": self.region_input.text().strip(),
@@ -1301,7 +1343,7 @@ class DayzTranslateTool(QMainWindow):
         self.translation_auto_concurrency = str(
             self.settings.value("translation_auto_concurrency", "true")
         ).lower() in ("true", "1", "yes")
-        self.translation_parallel_batches = int(self.settings.value("translation_parallel_batches", 1))
+        self.translation_parallel_batches = int(self.settings.value("translation_parallel_batches", 3))
         self.translation_timeout = float(self.settings.value("translation_timeout", 60.0))
         self.provider_settings = self._load_provider_settings()
         self.ui_language = self.settings.value("ui_language", "en")
@@ -1341,6 +1383,8 @@ class DayzTranslateTool(QMainWindow):
         self.translation_cache = self.translation_cache_store.load()
         self._translation_written_cells = set()
         self._translation_job_rows = set()
+        self._translation_job_cells = set()
+        self._translation_failed_cells = set()
         self._translation_copy_overwrite = True
         self.create_menus()
         self.create_edit_actions()
@@ -1478,6 +1522,12 @@ class DayzTranslateTool(QMainWindow):
         self.translation_progress_bar.setFixedWidth(260)
         self.translation_cancel_button.setFixedWidth(80)
         self.translation_cancel_button.clicked.connect(self.cancel_translation)
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setInterval(1000)
+        self._retry_timer.timeout.connect(self._tick_retry_countdown)
+        self._retry_seconds_left = 0
+        self._retry_attempt = 0
+        self._retry_max_attempts = 0
         self.statusBar().addPermanentWidget(self.translation_progress_label)
         self.statusBar().addPermanentWidget(self.translation_progress_bar)
         self.statusBar().addPermanentWidget(self.translation_cancel_button)
@@ -1485,11 +1535,13 @@ class DayzTranslateTool(QMainWindow):
         self.hide_translation_progress()
 
     def hide_translation_progress(self):
+        self._stop_retry_countdown()
         self.translation_progress_label.hide()
         self.translation_progress_bar.hide()
         self.translation_cancel_button.hide()
 
     def show_translation_progress(self, total):
+        self._stop_retry_countdown()
         self.translation_progress_label.setText(f"0/{total}")
         self.translation_progress_bar.setRange(0, total)
         self.translation_progress_bar.setValue(0)
@@ -1497,6 +1549,32 @@ class DayzTranslateTool(QMainWindow):
         self.translation_progress_bar.show()
         self.translation_cancel_button.show()
         self._translation_written_cells = set()
+
+    def on_translation_retrying(self, attempt, max_attempts, wait_seconds):
+        self._retry_seconds_left = max(0, int(round(wait_seconds)))
+        self._retry_attempt = attempt
+        self._retry_max_attempts = max_attempts
+        self._render_retry_label()
+        self._retry_timer.start()
+
+    def _tick_retry_countdown(self):
+        self._retry_seconds_left -= 1
+        if self._retry_seconds_left <= 0:
+            self._retry_timer.stop()
+            self._retry_seconds_left = 0
+        self._render_retry_label()
+
+    def _render_retry_label(self):
+        self.translation_progress_label.setText(
+            self.tr("retry_countdown",
+                    seconds=self._retry_seconds_left,
+                    attempt=self._retry_attempt,
+                    max_attempts=self._retry_max_attempts)
+        )
+
+    def _stop_retry_countdown(self):
+        self._retry_timer.stop()
+        self._retry_seconds_left = 0
 
     def open_file(self):
         start_dir = self.last_file_directory or str(DEFAULT_CSV_PATH)
@@ -1878,7 +1956,7 @@ class DayzTranslateTool(QMainWindow):
         name = (name or "").strip()
         if not name:
             return
-        preset_keys = ["provider", "char_budget", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email", "batch_size"]
+        preset_keys = ["provider", "char_budget", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email", "batch_size", "auto_concurrency"]
         prefix = f"translation_presets/{name}/"
         # Always include keys so apply overwrites previous provider fields.
         values = {key: self.settings.value(prefix + key, "") for key in preset_keys}
@@ -2369,6 +2447,7 @@ class DayzTranslateTool(QMainWindow):
         ]
         # 记录本次任务涉及的行与复制列覆盖策略，翻译完成后据此回填 original/chinese 复制列
         self._translation_job_rows = {row for row, column, text, target in raw_jobs}
+        self._translation_job_cells = {(row, column) for row, column, text, target in raw_jobs}
         self._translation_copy_overwrite = copy_overwrite
         if not jobs:
             QMessageBox.information(self, self.tr("translate"), self.tr("no_translatable_cells"))
@@ -2383,6 +2462,7 @@ class DayzTranslateTool(QMainWindow):
 
         self.translation_worker = self.create_translation_worker(jobs)
         self.translation_worker.progress.connect(self.update_translation_progress)
+        self.translation_worker.retrying.connect(self.on_translation_retrying)
         self.translation_worker.finished.connect(self.finish_translation)
         self.translation_worker.failed.connect(self.fail_translation)
 
@@ -2445,6 +2525,11 @@ class DayzTranslateTool(QMainWindow):
             ),
         )
 
+    def clear_translation_cache(self):
+        self.translation_cache = {}
+        self.translation_cache_store.clear()
+        self.statusBar().showMessage(self.tr("clear_translation_cache"), 3000)
+
     def wordbook_glossary(self):
         if self.wordbook_window is None:
             return []
@@ -2460,6 +2545,7 @@ class DayzTranslateTool(QMainWindow):
         return glossary
 
     def update_translation_progress(self, results):
+        self._stop_retry_countdown()
         # 哪批翻译完就写入哪批，跳过已写入的单元格避免重复操作
         wrote = False
         for (row, column), text in results.cell_results.items():
@@ -2490,6 +2576,7 @@ class DayzTranslateTool(QMainWindow):
         )
 
     def finish_translation(self, results):
+        self._stop_retry_countdown()
         wrote = False
         for (row, column), text in results.cell_results.items():
             cell_key = (row, column)
@@ -2531,10 +2618,41 @@ class DayzTranslateTool(QMainWindow):
         self.translation_cancel_button.setEnabled(True)
         # 取消也要存：已翻好的部分不该白花。
         self.translation_cache_store.save(self.translation_cache)
+        self._translation_failed_cells = {
+            key for key in self._translation_job_cells if key not in results.cell_results
+        }
         if not results.cancelled and results.failed and results.errors and results.translated == 0:
             QMessageBox.warning(self, self.tr("translate_failed"), "\n".join(results.errors[:3]))
+        elif not results.cancelled and self._translation_failed_cells:
+            box = QMessageBox(self)
+            box.setWindowTitle(self.tr("translate"))
+            box.setText(self.tr("failed_cells_count", count=len(self._translation_failed_cells)))
+            retry_button = box.addButton(self.tr("retry_failed_only"), QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(self.tr("close"), QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is retry_button:
+                self.retry_failed_cells()
+
+    def retry_failed_cells(self):
+        cells = sorted(self._translation_failed_cells)
+        if not cells:
+            return
+        rows = self.table_rows()
+        source_column = self.headers.index(self.source_header)
+        jobs = []
+        for row_index, column_index in cells:
+            row = rows[row_index]
+            source_text = row[source_column].strip() if source_column < len(row) else ""
+            if not source_text:
+                continue
+            target_code = language_code_for_header(self.headers[column_index])
+            if not target_code:
+                continue
+            jobs.append((row_index, column_index, source_text, target_code))
+        self.run_translation_jobs(jobs, copy_overwrite=False)
 
     def fail_translation(self, message):
+        self._stop_retry_countdown()
         self.hide_translation_progress()
         self.translation_cancel_button.setEnabled(True)
         self.translation_cache_store.save(self.translation_cache)

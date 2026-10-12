@@ -1,7 +1,9 @@
+import io
 import json
 import threading
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 from translator_service import DEFAULT_CHAR_BUDGET, DEFAULT_OUTPUT_CHAR_CAP, AdaptiveGate, GoogleTranslateTranslator, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, assign_batch_ids, matching_glossary_entries, parse_numbered_translations, parse_retry_after, retry_call, salvage_truncated_object, validate_translator_config
@@ -1417,6 +1419,54 @@ class GlossaryPromptIntegrationTests(unittest.TestCase):
 
         content = captured[0]["messages"][1]["content"]
         self.assertNotIn("Glossary", content)
+
+
+class RetryWiringTests(unittest.TestCase):
+    """429 真的会重试，并且 on_retry 真的被调用（UI 倒计时的上游契约）。"""
+
+    class _FakeResponse:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    def test_rate_limit_is_retried_and_on_retry_is_called(self):
+        seen = []
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.HTTPError(
+                    "https://example.test", 429, "Too Many Requests",
+                    {"Retry-After": "0.01"}, io.BytesIO(b"rate limited"),
+                )
+            content = json.dumps({"1": {"de": "Messer"}})
+            body = json.dumps({"choices": [{"message": {"content": content}}]})
+            return self._FakeResponse(body.encode("utf-8"))
+
+        service = TranslationService()
+        service.on_retry = lambda attempt, max_attempts, wait: seen.append((attempt, max_attempts, wait))
+        config = TranslatorConfig(
+            provider="openai", api_key="k", model="m",
+            auto_concurrency=False, parallel_batches=1,
+        )
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            results = service.translate_jobs([TranslationJob(0, 1, "Knife", "en", "de")], config)
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][:2], (1, RETRY_MAX_ATTEMPTS))
+        self.assertEqual(results.translated, 1)
+        self.assertEqual(results.cell_results[(0, 1)], "Messer")
+        self.assertEqual(calls["n"], 2)
 
 
 def _scripted_service(script, calls):

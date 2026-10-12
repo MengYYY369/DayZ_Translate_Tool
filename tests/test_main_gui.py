@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidgetSelectionRa
 
 from dayz_csv import DAYZ_HEADERS
 from main import DayzTranslateTool, LanguageSettingsDialog, SearchDialog, TranslationSettingsDialog, WordbookWindow
-from translator_service import TranslationResults
+from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationResults
 
 
 app = QApplication.instance() or QApplication([])
@@ -118,7 +118,7 @@ class MainGuiTests(unittest.TestCase):
 
     def test_default_translation_provider_is_google(self):
         self.assertEqual(self.window.translation_provider, "google")
-        self.assertEqual(self.window.translation_parallel_batches, 1)
+        self.assertEqual(self.window.translation_parallel_batches, 3)
 
     def test_provider_settings_are_isolated_between_providers(self):
         self.window.translation_provider = "deepl"
@@ -254,6 +254,7 @@ class MainGuiTests(unittest.TestCase):
         class FakeWorker:
             def __init__(self):
                 self.progress = FakeSignal()
+                self.retrying = FakeSignal()
                 self.finished = FakeSignal()
                 self.failed = FakeSignal()
 
@@ -266,10 +267,12 @@ class MainGuiTests(unittest.TestCase):
             def cancel(self):
                 pass
 
-        self.window.create_translation_worker = lambda jobs: FakeWorker()
+        worker = FakeWorker()
+        self.window.create_translation_worker = lambda jobs: worker
         self.window.start_translation_worker([(0, 2, "Knife", "de")], run_immediately=True)
 
         self.assertTrue(started)
+        self.assertIn(self.window.on_translation_retrying, worker.retrying.callbacks)
         self.assertTrue(hasattr(self.window, "translation_progress_bar"))
         self.assertTrue(hasattr(self.window, "translation_cancel_button"))
 
@@ -1629,6 +1632,69 @@ class MainGuiTests(unittest.TestCase):
     def test_wordbook_default_path_uses_config_directory(self):
         from main import DEFAULT_WORDBOOK_PATH, APP_DIR
         self.assertNotEqual(DEFAULT_WORDBOOK_PATH.parent, APP_DIR)
+
+    def test_settings_dialog_char_budget_range(self):
+        dialog = TranslationSettingsDialog(self.window)
+        self.assertEqual(dialog.char_budget_input.minimum(), MIN_CHAR_BUDGET)
+        self.assertEqual(dialog.char_budget_input.maximum(), MAX_CHAR_BUDGET)
+        self.assertEqual(dialog.char_budget_input.value(), DEFAULT_CHAR_BUDGET)
+
+    def test_settings_dialog_concurrency_cap_range(self):
+        dialog = TranslationSettingsDialog(self.window)
+        self.assertEqual(dialog.parallel_batches_input.maximum(), MAX_AUTO_CONCURRENCY)
+        self.assertTrue(hasattr(dialog, "auto_concurrency_check"))
+        self.assertTrue(dialog.auto_concurrency_check.isChecked())
+
+    def test_settings_dialog_has_clear_cache_button(self):
+        dialog = TranslationSettingsDialog(self.window)
+        self.assertTrue(hasattr(dialog, "clear_cache_button"))
+
+    def test_clear_cache_empties_memory_and_disk(self):
+        self.window.translation_cache[("m", "en", "de", "Knife", "row0")] = "Messer"
+        self.window.translation_cache_store.save(self.window.translation_cache)
+        self.assertNotEqual(self.window.translation_cache_store.load(), {})
+
+        self.window.clear_translation_cache()
+
+        self.assertEqual(self.window.translation_cache, {})
+        self.assertEqual(self.window.translation_cache_store.load(), {})
+
+    def test_legacy_preset_batch_size_migrates_to_default(self):
+        self.window.apply_translation_settings_dict({"batch_size": 30})
+        self.assertEqual(self.window.translation_char_budget, DEFAULT_CHAR_BUDGET)
+
+    def test_parallel_batches_default_is_three(self):
+        self.assertEqual(self.window.translation_parallel_batches, 3)
+
+    def test_retry_countdown_shown_and_cleared(self):
+        self.window.show_translation_progress(4)
+        self.window.on_translation_retrying(1, 5, 12)
+
+        text = self.window.translation_progress_label.text()
+        self.assertIn("12", text)
+        self.assertIn("1/5", text)
+
+        results = TranslationResults()
+        results.translated = 1
+        self.window.update_translation_progress(results)
+
+        text = self.window.translation_progress_label.text()
+        self.assertIn("1/4", text)
+        self.assertNotIn("1/5", text)
+
+    def test_retry_failed_cells_rebuilds_only_failed_jobs(self):
+        captured = []
+        self.window.run_translation_jobs = lambda jobs, **kwargs: captured.append(jobs)
+        self.window._translation_job_cells = {(0, 2), (1, 2)}
+        self.window._translation_failed_cells = {(1, 2)}
+
+        self.window.retry_failed_cells()
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            [(row, column) for row, column, _, _ in captured[0]],
+            [(1, 2)],
+        )
 
 
 if __name__ == "__main__":

@@ -65,6 +65,12 @@
 | I2 | Task 4 | Task 4 只改 `main.py` 的 `create_translation_worker` / `run_translation_test` 两处 | 实际把「`batch_size` → `char_budget`」的**全部八处重命名**（含设置持久化、预设两条链路、旧值迁移）都放进 Task 4。原因：Task 4 的 `create_translation_worker` 片段引用 `self.translation_char_budget`，若只改那两处会直接 `AttributeError`；Task 7 只保留「对话框勾选框 + 重试信号 + 倒计时 + 只重跑失败项 + 清空缓存」 |
 | I3 | Task 4 | `test_translation_settings_dialog_saves_provider_and_parallel_batches` 把 `setValue(40)` 后的断言改成 `== 40` | 改为 `setValue(2400)` 断言 `== 2400`。原因：对话框走 `QSpinBox`，下限是 `MIN_CHAR_BUDGET=200`，`setValue(40)` 会被控件夹成 200，原计划写的 `== 40` 在自己的实现下不可能通过（与问题 20 同源，但方向相反）。主窗口链路的 `test_translation_settings_loads_full_preset` 存 12 断言 12 不受影响（该路径不夹） |
 | I4 | Task 4 | `TranslationService.__init__` 去掉 `batch_size` 后，既有测试只需机械删除该参数 | 机械 `sed` 后仍有 6 个测试挂：它们靠 `batch_size` 制造「多批」场景，删掉参数后默认 `char_budget=1500` 让所有短文本并成一批。逐个补上合适的 `char_budget`（`test_batches_by_language_direction_and_dedupes_texts` 用 10、`test_char_budget_groups_jobs_by_row_count` 用 2、其余三个用 5），断言不变。两个按行数命名的测试改名为 `test_char_budget_groups_jobs_by_row_count` / `test_char_budget_rows_groups_multi_target_per_row` |
+| I5 | Task 5 | 计划只规定「缺译时带原 `assigned` 的子集补发」 | 补发**只做一次**：补发后仍缺的单元格直接记失败，不再二次补发。原因：这是「减少请求次数」的硬边界，循环补发会让最坏情况下的请求数失控；单次补发已能覆盖「模型漏译一两行」这个真实场景 |
+| I6 | Task 5 | 计划把 `build_merged_prompt` 列为 `OpenAICompatibleTranslator` 的方法 | 实现为 `@staticmethod`，`ClaudeMessagesTranslator` / `CodexResponsesTranslator` 直接调 `OpenAICompatibleTranslator.build_merged_prompt(assigned, self.glossary)`。原因：沿用文件里既有的静态复用风格（这两个类本来就不是 OpenAI 的子类，靠 `_parse_translations_static` 复用），不必为了多一个方法去改继承关系 |
+| I7 | Task 6 | 计划只加 `matching_glossary_entries` 与 `TranslatorConfig.glossary_source_key` | `create_provider` 的三个 AI 分支（`translator_service.py:305` / `:320` / `:335`）补传 `glossary_source_key=config.glossary_source_key`，三个 translator 构造器各加该参数并在 `translate_job_batch` 里传给 `build_merged_prompt`（`translator_service.py:871` / `:1056` / `:1183`）。Google 分支不传：Google 线路不走提示词，没有术语表注入点 |
+| I8 | Task 7 | 计划把「`batch_size` → `char_budget`」的对话框与持久化改名放在 Task 7 Step 5 | 已在 Task 4 一并做完（见 I2）。Task 7 实际只落地：`TranslationWorker.retrying` 信号、设置对话框的勾选框与「清空缓存」按钮、倒计时文案、只重跑失败项、清空缓存方法 |
+| I9 | Task 7 | 计划的 Task 7 测试清单不含「429 → 重试 → 成功」的端到端闸门 | 新增 `RetryWiringTests.test_rate_limit_is_retried_and_on_retry_is_called`（`tests/test_translator_service.py`，用 `mock.patch("urllib.request.urlopen")` 走**真实** `_post_json` 路径，先抛 429 带 `Retry-After: 0.01` 再成功）。原因：注入 `post_json` 会绕过 `_post_json`，既有假 provider 全都走不到重试层；没有这条测试，倒计时 UI 接到空信号也照样全绿 |
+| I10 | Task 7 | 计划未列出决定 22（默认并发 1 → 3）会打破的既有断言 | `tests/test_main_gui.py:121` 的 `test_default_translation_provider_is_google` 断言 `translation_parallel_batches == 1` 改为 `== 3`；同文件 `FakeWorker` 补 `self.retrying = FakeSignal()`（`TranslationWorker` 多了一个信号），并在 `test_run_translation_jobs_starts_worker_instead_of_sync_translate` 末尾加一行 `assertIn(self.window.on_translation_retrying, worker.retrying.callbacks)` 验证信号真的接上了 |
 
 ## Global Constraints
 
@@ -1054,7 +1060,7 @@ git commit -m "feat: batch by character budget on row boundaries instead of fixe
 
 > **本 Task 的核心约束（决定 18 + 本修订版问题 1）**：id 只在 `assign_batch_ids` 分配一次。补发时传入的是**同一份映射的子集**，因此 id 天然稳定。任何「对补发子集重新编号」的写法都会让补发的第 1 行冒充原第 1 行，静默写错单元格并污染磁盘缓存。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `IdAssignmentTests`：
 - `test_ids_follow_row_order`：3 行 → `{1: [行0 的 jobs], 2: [...], 3: [...]}`。
@@ -1080,14 +1086,14 @@ git commit -m "feat: batch by character budget on row boundaries instead of fixe
 - `test_recovery_ids_are_not_renumbered`：同上，但断言第 2 次请求的提示词里 id 是 **2**（而非重新编号后的 1）—— 本修订版问题 1 的端到端回归闸门。
 - `test_still_missing_after_recovery_counts_failed`：两次都缺 id 2 → `results.failed == 1`，`results.cell_results` 有 id 1、3。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 python -m unittest tests.test_translator_service.IdAssignmentTests tests.test_translator_service.NumberedParsingTests -v
 ```
 预期：`AttributeError` / `ImportError`。
 
-- [ ] **Step 3: 实现 id 分配与合并提示词**
+- [x] **Step 3: 实现 id 分配与合并提示词**
 
 ```python
 def assign_batch_ids(jobs):
@@ -1151,7 +1157,7 @@ def assign_batch_ids(jobs):
 
 （三个 translator 共用同一实现，`ClaudeMessagesTranslator` / `CodexResponsesTranslator` 不再各写一份 `_build_job_batch_prompt`。）
 
-- [ ] **Step 4: 实现带编号解析与截断抢救**
+- [x] **Step 4: 实现带编号解析与截断抢救**
 
 ```python
 def salvage_truncated_object(text):
@@ -1222,7 +1228,7 @@ def parse_numbered_translations(content):
 
 > `parse_numbered_translations` 必须是**模块级函数**。上一版把它缩进成了 `salvage_truncated_object` 的嵌套函数、还放在 `return` 之后 —— 那段代码永不执行，`OpenAICompatibleTranslator.parse_numbered_translations` 根本不存在。
 
-- [ ] **Step 5: 实现缺失补发**
+- [x] **Step 5: 实现缺失补发**
 
 ```python
     def _missing_assigned(self, assigned, parsed):
@@ -1278,13 +1284,13 @@ def parse_numbered_translations(content):
 
 删除 `_store_job_results`（其「数量不符就抛 `RuntimeError`」已由缺失补发取代）。
 
-- [ ] **Step 6: 提高回复上限（决定 19）**
+- [x] **Step 6: 提高回复上限（决定 19）**
 
 `ClaudeMessagesTranslator` 的两处 `"max_tokens": 4096`（`translate_batch` 与 `translate_job_batch`）改为 `8192`。
 
 `OpenAICompatibleTranslator` 与 `CodexResponsesTranslator` 的 payload **不加** `max_tokens` —— 它们本来就没有这个字段，OpenAI 的 Chat Completions 与 Responses API 都允许省略（省略即用模型默认）。上一版要求「先试 8192，失败再去掉重发一次」，那是一个无法测试的脆弱分支，已删除。
 
-- [ ] **Step 7: 修正既有测试的假 translator 与断言**
+- [x] **Step 7: 修正既有测试的假 translator 与断言**
 
 - `test_openai_translator_includes_glossary_in_job_batch_prompt`（`:419`）与 `test_openai_translator_job_batch_prompt_contains_target_language`（`:408` 附近）：
   - 断言从 `result == ["Messer", "Нож"]` 改为 `result == {1: {"de": "Messer", "ru": "Нож"}}`（同一行两个目标语言现在共用一个 id）。
@@ -1297,14 +1303,14 @@ def parse_numbered_translations(content):
   ```
 - 其余实现 `translate_job_batch` 的假 translator（`:74` / `:134` / `:450`）同样补 `assigned=None` 参数，并把返回值改成 `{id: {lang: text}}` 形状。
 
-- [ ] **Step 8: 运行测试**
+- [x] **Step 8: 运行测试**
 
 ```bash
 python -m unittest tests.test_translator_service -v
 ```
 预期：全绿。
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add translator_service.py tests/test_translator_service.py
@@ -1327,7 +1333,7 @@ git commit -m "feat: merge a row's target languages into one request with stable
 
 > **为什么源词键不是硬编码的 `original`（决定 21）**：`dayz_csv.LANGUAGE_CODES["original"] == "auto"` —— `original` 列不是一种语言，是「自动检测」。而单词本（`wordbook_csv.WORDBOOK_HEADERS`）用的列名与 stringtable **完全相同**（`original` / `english` / `czech` / …），且 `main.py` 里 `self.source_header`（默认 `"english"`）本来就是那个列名。所以正确做法是直接用**当前源列名**去取源词，不需要任何映射表：源列是 `english` 就查 `entry["english"]`，源列是 `original` 就查 `entry["original"]`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `GlossaryFilterTests`：
 - `test_only_matching_entries_included`：术语表 3 条，本批文本只含其中 1 条的源词 → 只返回那 1 条。
@@ -1341,13 +1347,13 @@ git commit -m "feat: merge a row's target languages into one request with stable
 `GlossaryPromptIntegrationTests`：
 - `test_translator_uses_config_source_key`：`TranslatorConfig(provider="openai", glossary_source_key="english", glossary=[...])` 经 `create_provider` 造出的 translator，`glossary_source_key == "english"`。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 python -m unittest tests.test_translator_service.GlossaryFilterTests -v
 ```
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 ```python
 def matching_glossary_entries(glossary, texts, source_key="", max_entries=GLOSSARY_MAX_ENTRIES):
@@ -1415,18 +1421,18 @@ def matching_glossary_entries(glossary, texts, source_key="", max_entries=GLOSSA
                 glossary_source_key=(self.source_header or "").strip().lower(),
 ```
 
-- [ ] **Step 4: 修正既有测试**
+- [x] **Step 4: 修正既有测试**
 
 `test_openai_translator_includes_glossary_in_job_batch_prompt`（`:419`）现在**不需要改数据**（它直接构造 translator，`glossary_source_key` 默认 `""` → 走「任一列」回退，`{"english": "Knife", ...}` 照样命中），但提示词形状断言要跟着 Task 5 一起改。若想让它更贴近真实路径，可显式传 `glossary_source_key="english"`。
 
-- [ ] **Step 5: 运行测试**
+- [x] **Step 5: 运行测试**
 
 ```bash
 python -m unittest tests.test_translator_service -v
 ```
 预期：全绿。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add translator_service.py main.py tests/test_translator_service.py
@@ -1452,7 +1458,7 @@ git commit -m "feat: send only glossary entries that match the batch text"
 - 移除：`DayzTranslateTool.translation_batch_size`（语义已由 `translation_char_budget` 取代）
 - Consumes: `TranslationCacheStore.clear()`
 
-- [ ] **Step 0: 补 import（本修订版问题 5）**
+- [x] **Step 0: 补 import（本修订版问题 5）**
 
 `main.py` 顶部的 `from translator_service import ...`（现为 `TranslationJob, TranslationService, TranslatorConfig, normalize_provider, validate_translator_config`）补上新常量：
 
@@ -1472,7 +1478,7 @@ from translator_service import (
 
 > 上一版计划让 `main.py` 直接用 `DEFAULT_CHAR_BUDGET` / `MAX_CHAR_BUDGET` / `MAX_AUTO_CONCURRENCY` / `MIN_CHAR_BUDGET` 却从未 import，运行期必 `NameError`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_main_gui.py` 新增：
 - `test_settings_dialog_char_budget_range`：`batch_size_input` 的 `minimum() == MIN_CHAR_BUDGET`、`maximum() == MAX_CHAR_BUDGET`、默认值 `DEFAULT_CHAR_BUDGET`。
@@ -1484,14 +1490,14 @@ from translator_service import (
 - `test_retry_countdown_shown_and_cleared`：调用 `on_translation_retrying(1, 5, 12)` → 进度标签文本含 `12` 与 `1/5`；再调用 `update_translation_progress` 后文本恢复为 `已完成/总数`。
 - `test_retry_failed_cells_rebuilds_only_failed_jobs`：构造 `results.cell_results` 与失败集合，调用 `retry_failed_cells()` → 传给 worker 的 jobs 恰好是失败的那些单元格。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 python -m unittest tests.test_main_gui -v
 ```
 预期：`AttributeError`。
 
-- [ ] **Step 3: worker 增加重试信号**
+- [x] **Step 3: worker 增加重试信号**
 
 ```python
 class TranslationWorker(QObject):
@@ -1503,7 +1509,7 @@ class TranslationWorker(QObject):
 
 `run()` 里把 `on_retry` 接上：`self.service.on_retry = self.retrying.emit`，再调用 `translate_jobs`。
 
-- [ ] **Step 4: 设置对话框原地替换**
+- [x] **Step 4: 设置对话框原地替换**
 
 `TranslationSettingsDialog.__init__`：
 
@@ -1567,7 +1573,7 @@ class TranslationWorker(QObject):
 
 （即把原来的 `translation_batch_size` 一行**换成** `translation_char_budget`，并新增 `translation_auto_concurrency`。`translation_parallel_batches` 那一行原样保留，不要删。）
 
-- [ ] **Step 5: 设置持久化、默认值与旧值迁移**
+- [x] **Step 5: 设置持久化、默认值与旧值迁移**
 
 这些是**普通属性**（不是 property），在 `DayzTranslateTool.__init__` 里从 settings 读（`main.py:1288-1291`）：
 
@@ -1653,7 +1659,7 @@ class TranslationWorker(QObject):
         )
 ```
 
-- [ ] **Step 6: 倒计时显示（决定 9）**
+- [x] **Step 6: 倒计时显示（决定 9）**
 
 ```python
     def create_translation_status_widgets(self):
@@ -1726,7 +1732,7 @@ zh：
 
 （`tr()` 用 `text.format(**kwargs)`，见 `main.py:1337`。）
 
-- [ ] **Step 7: 只重跑失败项（决定 10）**
+- [x] **Step 7: 只重跑失败项（决定 10）**
 
 `start_translation_worker` 里新增 `self._translation_job_cells = {(row, column) for row, column, _, _ in raw_jobs}`。
 
@@ -1773,21 +1779,21 @@ zh：
 
 UI 文案：`"retry_failed_only": "Retry failed only"` / `"只重跑失败项"`，`"failed_cells_count": "{count} cells failed."` / `"有 {count} 个单元格翻译失败。"`。
 
-- [ ] **Step 8: 修正既有 GUI 测试**
+- [x] **Step 8: 修正既有 GUI 测试**
 
 - `test_translation_settings_dialog_saves_provider_and_parallel_batches`（`tests/test_main_gui.py:362`）：`assertEqual(self.window.translation_batch_size, 40)` → `assertEqual(self.window.translation_char_budget, 40)`。
 - `test_translation_settings_loads_full_preset`（`:956`）：`self.window.translation_batch_size = 12` / `= 30` → `self.window.translation_char_budget = 1500` / `= DEFAULT_CHAR_BUDGET`；断言 `translation_batch_size == 12` → `translation_char_budget == 1500`。
   > 注意：`12 < MIN_CHAR_BUDGET`，所以它会被迁移成默认值 —— 这正是 `test_legacy_preset_batch_size_migrates_to_default` 要断言的行为，两个测试必须一致。
 - `test_translation_settings_batch_and_parallel_have_tooltips`（`:379`）：**不用改**，但 Task 7 Step 4 必须给 `parallel_batches_input` 设 tooltip 才能过。
 
-- [ ] **Step 9: 运行测试**
+- [x] **Step 9: 运行测试**
 
 ```bash
 python -m unittest tests.test_main_gui tests.test_translation_worker -v
 ```
 预期：全绿。
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add main.py translation_worker.py tests/test_main_gui.py

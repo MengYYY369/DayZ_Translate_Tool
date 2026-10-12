@@ -3,6 +3,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 class TranslationWorker(QObject):
     progress = Signal(object)
+    retrying = Signal(int, int, int)
     finished = Signal(object)
     failed = Signal(str)
 
@@ -19,6 +20,7 @@ class TranslationWorker(QObject):
     @Slot()
     def run(self):
         try:
+            self.service.on_retry = self.retrying.emit
             results = self.service.translate_jobs(
                 self.jobs,
                 self.config,
