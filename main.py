@@ -11,9 +11,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -43,7 +46,16 @@ from dayz_csv import (
 )
 from translation_cache import TranslationCacheStore
 from translation_worker import TranslationWorker
-from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationJob, TranslationService, TranslatorConfig, normalize_provider, validate_translator_config
+from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationJob, TranslationService, TranslatorConfig, validate_translator_config
+from free_translators import FREE_SOURCE_SPECS
+from translation_sources import (
+    ALL_RULES,
+    RULE_ALL,
+    RULE_EMPTY,
+    RULE_SELECTION,
+    SourceEntry,
+    SourceList,
+)
 from wordbook_csv import WORDBOOK_HEADERS, load_wordbook_csv, wordbook_rows_for_save, write_wordbook_csv
 from table_history import TableHistory, snapshot_table, restore_table
 
@@ -59,14 +71,12 @@ DEFAULT_COLUMN_WIDTH = 90
 SEARCH_MATCH_COLOR = QColor("#9adbe8")
 SEARCH_ACTIVE_COLOR = QColor("#ffc857")
 TABLE_GRIDLINE_COLOR = "#8c8c8c"
-PROVIDER_LABELS = {
-    "google": "Google",
-    "mymemory": "MyMemory",
-    "deepl": "DeepL",
-    "microsoft": "Microsoft",
-    "openai": "OpenAI",
-    "claude": "Claude",
-    "codex": "Codex",
+SOURCE_TABLE_HEADERS = ("name", "kind", "all", "empty", "selection")
+AI_TYPE_KEYS = ("openai", "claude", "codex")
+AI_TYPE_LABEL_KEYS = {
+    "openai": "ai_type_openai",
+    "claude": "ai_type_claude",
+    "codex": "ai_type_codex",
 }
 LANGUAGE_LABELS = {
     "en": "English",
@@ -92,11 +102,44 @@ UI_TEXT = {
         "test_translation_failed": "Test failed: {error}",
         "test_translation_running": "Testing...",
         "translation_engine": "Translation Engine",
-        "preset": "Preset",
+        "delete": "Delete",
+        "translation_sources": "Translation sources",
+        "source_rules_all": "All cells",
+        "source_rules_empty": "Empty cells",
+        "source_rules_selection": "Right-click",
+        "source_kind_free": "Free",
+        "source_kind_ai": "AI",
+        "source_name": "Name",
+        "source_type": "Interface",
+        "source_builtin": "Built-in limits",
+        "source_builtin_text": "Concurrency {concurrency}, interval {interval}s (built in)",
+        "source_concurrency": "Concurrency",
+        "source_interval": "Interval (s)",
+        "source_move_up": "Move up",
+        "source_move_down": "Move down",
+        "source_remove": "Remove source",
+        "add_ai_source": "Add AI source",
+        "source_name_required": "Please enter a name for this source.",
+        "source_name_duplicate": "A source named \"{name}\" already exists. Add another one anyway?",
+        "source_remove_confirm": "Remove \"{name}\"?",
+        "no_source_for_action": "No translation source is enabled for \"{action}\". Enable at least one source in Settings.",
+        "translation_fallback": "{previous} is unavailable — switched to {current}",
+        "no_source_selected": "No source enabled",
+        "action_all_cells": "translate all cells",
+        "action_empty_cells": "translate empty cells",
+        "action_selection": "translate selection",
+        "ai_type_openai": "OpenAI compatible",
+        "ai_type_claude": "Claude",
+        "ai_type_codex": "Codex",
+        "source_google": "Google",
+        "source_microsoft": "Microsoft (free)",
+        "source_tencent": "Tencent Interactive",
+        "source_volcano": "Volcano",
+        "source_lara": "Lara",
+        "source_mymemory": "MyMemory",
+        "source_deepl": "DeepL",
         "char_budget": "Max chars per batch",
-        "parallel_batches": "Parallel Batches",
         "char_budget_tooltip": "Source characters a single request may carry. Rows are never split across requests. Larger = fewer requests but a bigger loss if one fails.",
-        "parallel_batches_tooltip": "Number of batches processed concurrently. Larger = faster but may hit API rate limits.",
         "concurrency_cap": "Concurrency cap",
         "auto_concurrency": "Auto",
         "concurrency_cap_tooltip": "Auto mode starts low, halves on rate limits and climbs back slowly. This is the ceiling it may climb to.",
@@ -195,11 +238,44 @@ UI_TEXT = {
         "test_translation_failed": "测试失败：{error}",
         "test_translation_running": "正在测试...",
         "translation_engine": "翻译引擎",
-        "preset": "预设",
+        "delete": "删除",
+        "translation_sources": "翻译源",
+        "source_rules_all": "全表",
+        "source_rules_empty": "空白",
+        "source_rules_selection": "右键选中",
+        "source_kind_free": "免费",
+        "source_kind_ai": "AI",
+        "source_name": "名称",
+        "source_type": "接口类型",
+        "source_builtin": "内置限制",
+        "source_builtin_text": "并发 {concurrency}，间隔 {interval} 秒（内置，不可修改）",
+        "source_concurrency": "并发数",
+        "source_interval": "间隔（秒）",
+        "source_move_up": "上移",
+        "source_move_down": "下移",
+        "source_remove": "删除源",
+        "add_ai_source": "添加 AI 源",
+        "source_name_required": "请给这个翻译源起个名字。",
+        "source_name_duplicate": "已经有一个叫「{name}」的翻译源了，还要继续添加吗？",
+        "source_remove_confirm": "确定要删除「{name}」吗？",
+        "no_source_for_action": "没有任何翻译源被勾选用于「{action}」。请到设置里至少勾选一个源。",
+        "translation_fallback": "{previous} 连不上，已自动改用 {current}",
+        "no_source_selected": "未启用任何源",
+        "action_all_cells": "翻译全表",
+        "action_empty_cells": "翻译空白单元格",
+        "action_selection": "翻译选中的内容",
+        "ai_type_openai": "OpenAI 兼容",
+        "ai_type_claude": "Claude",
+        "ai_type_codex": "Codex",
+        "source_google": "Google",
+        "source_microsoft": "微软翻译（免费）",
+        "source_tencent": "腾讯交互翻译",
+        "source_volcano": "火山翻译",
+        "source_lara": "Lara 翻译",
+        "source_mymemory": "MyMemory",
+        "source_deepl": "DeepL",
         "char_budget": "每批最多字数",
-        "parallel_batches": "并行批次",
         "char_budget_tooltip": "单次请求最多携带的源文字数。行不会被拆到两个请求里。越大请求越少，但单次失败的代价也越大。",
-        "parallel_batches_tooltip": "同时进行的批次数（并发请求数）。越大翻译越快但可能触发 API 限流。",
         "concurrency_cap": "并发上限",
         "auto_concurrency": "自动",
         "concurrency_cap_tooltip": "自动模式起步保守，撞到限速立刻减半，之后慢慢回升。这里是最多能升到几个。",
@@ -280,26 +356,6 @@ UI_TEXT = {
         "import_failed": "导入失败",
     },
 }
-PROVIDER_FIELD_KEYS = {
-    "google": set(),
-    "mymemory": {"email"},
-    "deepl": {"api_key"},
-    "microsoft": {"api_key", "region"},
-    "openai": {"api_key", "model", "base_url"},
-    "claude": {"api_key", "model", "base_url"},
-    "codex": {"api_key", "model", "base_url"},
-}
-PROVIDER_DEFAULTS = {
-    "google": {},
-    "mymemory": {"email": ""},
-    "deepl": {"api_key": ""},
-    "microsoft": {"api_key": "", "region": ""},
-    "openai": {"api_key": "", "model": "gpt-3.5-turbo", "base_url": ""},
-    "claude": {"api_key": "", "model": "claude-3-5-sonnet-20241022", "base_url": ""},
-    "codex": {"api_key": "", "model": "gpt-4o-mini", "base_url": ""},
-}
-
-
 class _NoToolTipFilter(QObject):
     """拦截 viewport 的 ToolTip 事件，避免单元格文本被截断时弹出自动 tooltip 覆盖单元格。"""
 
@@ -450,35 +506,129 @@ class SearchDialog(QDialog):
         super().closeEvent(event)
 
 
+class AiSourceDialog(QDialog):
+    """「添加 AI 源」弹窗。"""
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent or window)
+        self.window = window
+        self.setWindowTitle(window.tr("add_ai_source"))
+        self.name_input = QLineEdit(self)
+        self.type_combo = QComboBox(self)
+        for key in AI_TYPE_KEYS:
+            self.type_combo.addItem(window.tr(AI_TYPE_LABEL_KEYS[key]), key)
+        self.base_url_input = QLineEdit(self)
+        self.api_key_input = QLineEdit(self)
+        self.api_key_input.setEchoMode(QLineEdit.Password)
+        self.model_input = QLineEdit(self)
+        self.concurrency_input = QSpinBox(self)
+        self.concurrency_input.setRange(1, MAX_AUTO_CONCURRENCY)
+        self.interval_input = QDoubleSpinBox(self)
+        self.interval_input.setRange(0.0, 60.0)
+        self.interval_input.setSingleStep(0.1)
+
+        form = QFormLayout()
+        form.addRow(QLabel(window.tr("source_name"), self), self.name_input)
+        form.addRow(QLabel(window.tr("source_type"), self), self.type_combo)
+        form.addRow(QLabel(window.tr("base_url"), self), self.base_url_input)
+        form.addRow(QLabel(window.tr("api_key"), self), self.api_key_input)
+        form.addRow(QLabel(window.tr("model"), self), self.model_input)
+        form.addRow(QLabel(window.tr("source_concurrency"), self), self.concurrency_input)
+        form.addRow(QLabel(window.tr("source_interval"), self), self.interval_input)
+
+        save_button = QPushButton(window.tr("save"), self)
+        save_button.clicked.connect(self.accept)
+        cancel_button = QPushButton(window.tr("cancel"), self)
+        cancel_button.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(save_button)
+        buttons.addWidget(cancel_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addLayout(buttons)
+        self.resize(440, 300)
+
+    def values(self):
+        return {
+            "name": self.name_input.text().strip(),
+            "api_type": self.type_combo.currentData(),
+            "base_url": self.base_url_input.text().strip(),
+            "api_key": self.api_key_input.text().strip(),
+            "model": self.model_input.text().strip(),
+            "concurrency": self.concurrency_input.value(),
+            "interval": self.interval_input.value(),
+        }
+
+
 class TranslationSettingsDialog(QDialog):
+    ai_dialog_class = AiSourceDialog
+
     def __init__(self, window):
         super().__init__(window)
         self.window = window
         self.form_rows = {}
-        self._loading_preset = False
+        self.source_form_rows = {}
+        self._refreshing_table = False
+        self._loaded_source_id = None
         self.setWindowTitle(window.tr("translation_settings").rstrip("."))
-        # 对话框维护自己的字段缓存，编辑期间不修改 window 的 provider_settings，
-        # 只有点击"保存"按钮才通过 apply_settings 持久化。
-        self._dialog_field_cache = {}
-        for provider, keys in PROVIDER_FIELD_KEYS.items():
-            self._dialog_field_cache[provider] = {
-                key: window.get_provider_setting(provider, key, "") for key in keys
-            }
+        # 对话框编辑的是副本；点「保存」才写回 window（取消不留痕）
+        self.sources = window.translation_sources.clone()
 
-        self.provider_combo = QComboBox(self)
-        self.provider_combo.addItems(PROVIDER_LABELS.values())
-        self.provider_combo.setCurrentText(PROVIDER_LABELS.get(window.translation_provider, "Google"))
-        self._current_dialog_provider = window.translation_provider
+        self.source_table = QTableWidget(0, len(SOURCE_TABLE_HEADERS), self)
+        self.source_table.setHorizontalHeaderLabels([
+            window.tr("source_name"), "", window.tr("source_rules_all"),
+            window.tr("source_rules_empty"), window.tr("source_rules_selection"),
+        ])
+        self.source_table.verticalHeader().setVisible(False)
+        self.source_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.source_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.source_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.source_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.source_table.itemSelectionChanged.connect(self._on_source_selection_changed)
+        self.source_table.setMinimumHeight(200)
 
-        self.preset_combo = QComboBox(self)
-        self.refresh_presets()
-        self.preset_name_input = QLineEdit(self)
-        self.dirty_indicator_label = QLabel("", self)
-        self.dirty_indicator_label.setFixedWidth(16)
-        self.save_preset_button = QPushButton(window.tr("save"), self)
-        self.save_preset_button.clicked.connect(self.save_preset)
-        self.delete_preset_button = QPushButton(window.tr("delete"), self)
-        self.delete_preset_button.clicked.connect(self.delete_preset)
+        self.move_up_button = QPushButton(window.tr("source_move_up"), self)
+        self.move_up_button.clicked.connect(lambda: self.move_source(-1))
+        self.move_down_button = QPushButton(window.tr("source_move_down"), self)
+        self.move_down_button.clicked.connect(lambda: self.move_source(1))
+        self.add_ai_source_button = QPushButton("+", self)
+        self.add_ai_source_button.setToolTip(window.tr("add_ai_source"))
+        self.add_ai_source_button.clicked.connect(self.add_ai_source)
+        self.remove_source_button = QPushButton(window.tr("source_remove"), self)
+        self.remove_source_button.clicked.connect(self.remove_source)
+
+        self.source_name_label = QLabel("", self)
+        self.source_builtin_label = QLabel("", self)
+        self.source_builtin_label.setStyleSheet("color: #808080; font-size: 11px;")
+        self.source_type_input = QComboBox(self)
+        for key in AI_TYPE_KEYS:
+            self.source_type_input.addItem(window.tr(AI_TYPE_LABEL_KEYS[key]), key)
+        self.source_base_url_input = QLineEdit(self)
+        self.source_api_key_input = QLineEdit(self)
+        self.source_api_key_input.setEchoMode(QLineEdit.Password)
+        self.source_model_input = QLineEdit(self)
+        self.source_concurrency_input = QSpinBox(self)
+        self.source_concurrency_input.setRange(1, MAX_AUTO_CONCURRENCY)
+        self.source_interval_input = QDoubleSpinBox(self)
+        self.source_interval_input.setRange(0.0, 60.0)
+        self.source_interval_input.setSingleStep(0.1)
+
+        source_form = QFormLayout()
+        self._add_source_row(source_form, "source_name", window.tr("source_name"), self.source_name_label)
+        self._add_source_row(source_form, "source_builtin", window.tr("source_builtin"), self.source_builtin_label)
+        self._add_source_row(source_form, "source_type", window.tr("source_type"), self.source_type_input)
+        self._add_source_row(source_form, "source_base_url", window.tr("base_url"), self.source_base_url_input)
+        self._add_source_row(source_form, "source_api_key", window.tr("api_key"), self.source_api_key_input)
+        self._add_source_row(source_form, "source_model", window.tr("model"), self.source_model_input)
+        self._add_source_row(source_form, "source_concurrency", window.tr("source_concurrency"), self.source_concurrency_input)
+        self._add_source_row(source_form, "source_interval", window.tr("source_interval"), self.source_interval_input)
+        for widget in (self.source_base_url_input, self.source_api_key_input,
+                       self.source_model_input, self.source_concurrency_input, self.source_interval_input):
+            widget.editingFinished.connect(self._flush_source_fields)
+        # QComboBox 没有 editingFinished，只能接 currentIndexChanged（多出来的 int 参数会被丢掉）
+        self.source_type_input.currentIndexChanged.connect(self._flush_source_fields)
 
         self.char_budget_input = QSpinBox(self)
         self.char_budget_input.setRange(MIN_CHAR_BUDGET, MAX_CHAR_BUDGET)
@@ -488,66 +638,40 @@ class TranslationSettingsDialog(QDialog):
         self.auto_concurrency_check = QCheckBox(window.tr("auto_concurrency"), self)
         self.auto_concurrency_check.setChecked(window.translation_auto_concurrency)
 
-        self.parallel_batches_input = QSpinBox(self)
-        self.parallel_batches_input.setRange(1, MAX_AUTO_CONCURRENCY)
-        self.parallel_batches_input.setToolTip(window.tr("concurrency_cap_tooltip"))
-        self.parallel_batches_input.setValue(window.translation_parallel_batches)
-
         self.timeout_input = QSpinBox(self)
         self.timeout_input.setRange(5, 300)
         self.timeout_input.setSingleStep(5)
         self.timeout_input.setValue(int(window.translation_timeout))
 
-        self.api_key_input = QLineEdit(self)
-        self.api_key_input.setText(window.translation_api_key)
-
-        self.region_input = QLineEdit(self)
-        self.region_input.setText(window.translation_region)
-
-        self.model_input = QLineEdit(self)
-        self.model_input.setText(window.translation_model)
-
-        self.base_url_input = QLineEdit(self)
-        self.base_url_input.setText(window.translation_base_url)
-
-        self.email_input = QLineEdit(self)
-        self.email_input.setText(window.translation_email)
+        self.clear_cache_button = QPushButton(window.tr("clear_translation_cache"), self)
+        self.clear_cache_button.clicked.connect(self.clear_translation_cache)
 
         form = QFormLayout()
-        preset_layout = QHBoxLayout()
-        preset_layout.addWidget(self.preset_combo)
-        preset_layout.addWidget(self.dirty_indicator_label)
-        preset_layout.addWidget(self.preset_name_input)
-        preset_layout.addWidget(self.save_preset_button)
-        preset_layout.addWidget(self.delete_preset_button)
-        preset_label = QLabel(window.tr("preset"), self)
-        form.addRow(preset_label, preset_layout)
-        self.form_rows["preset"] = (preset_label, self._layout_widgets(preset_layout))
-        self.add_form_row(form, "provider", window.tr("translation_engine"), self.provider_combo)
         self.add_form_row(form, "char_budget", window.tr("char_budget"), self.char_budget_input, window.tr("char_budget_tooltip"))
-        # 并发上限那一行要放两个控件，不能走 add_form_row（它只接受单个 widget）。
         cap_label = QLabel(window.tr("concurrency_cap"), self)
         cap_label.setToolTip(window.tr("concurrency_cap_tooltip"))
         cap_layout = QHBoxLayout()
         cap_layout.setContentsMargins(0, 0, 0, 0)
         cap_layout.addWidget(self.auto_concurrency_check)
-        cap_layout.addWidget(self.parallel_batches_input)
         cap_layout.addStretch(1)
         form.addRow(cap_label, cap_layout)
-        self.form_rows["parallel_batches"] = (cap_label, self._layout_widgets(cap_layout))
+        self.form_rows["auto_concurrency"] = (cap_label, self._layout_widgets(cap_layout))
         self.add_form_row(form, "timeout", window.tr("timeout"), self.timeout_input)
-        self.add_form_row(form, "api_key", window.tr("api_key"), self.api_key_input)
-        self.add_form_row(form, "region", window.tr("region"), self.region_input)
-        self.add_form_row(form, "model", window.tr("model"), self.model_input)
-        self.add_form_row(form, "base_url", window.tr("base_url"), self.base_url_input)
-        self.add_form_row(form, "email", window.tr("email"), self.email_input)
-        self.clear_cache_button = QPushButton(window.tr("clear_translation_cache"), self)
-        self.clear_cache_button.clicked.connect(self.clear_translation_cache)
         self.add_form_row(form, "clear_cache", window.tr("translation_cache"), self.clear_cache_button)
-        self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
-        self.connect_auto_save_signals()
-        self.update_visible_fields()
-        self.preset_combo.currentTextChanged.connect(self.auto_load_preset)
+
+        source_box = QGroupBox(window.tr("translation_sources"), self)
+        source_box_layout = QVBoxLayout(source_box)
+        table_row = QHBoxLayout()
+        table_row.addWidget(self.source_table, 1)
+        button_column = QVBoxLayout()
+        button_column.addWidget(self.move_up_button)
+        button_column.addWidget(self.move_down_button)
+        button_column.addWidget(self.add_ai_source_button)
+        button_column.addWidget(self.remove_source_button)
+        button_column.addStretch(1)
+        table_row.addLayout(button_column)
+        source_box_layout.addLayout(table_row)
+        source_box_layout.addLayout(source_form)
 
         save_button = QPushButton(window.tr("save"), self)
         save_button.clicked.connect(self.apply_settings)
@@ -563,8 +687,15 @@ class TranslationSettingsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(source_box)
         layout.addLayout(buttons)
-        self.resize(660, 340)
+
+        self.refresh_source_table(select_id=self.sources.entries[0].source_id if self.sources.entries else None)
+        self.resize(760, 620)
+    def _add_source_row(self, form, key, label_text, widget):
+        label = QLabel(label_text, self)
+        form.addRow(label, widget)
+        self.source_form_rows[key] = (label, widget)
 
     def _layout_widgets(self, layout):
         widgets = []
@@ -582,109 +713,213 @@ class TranslationSettingsDialog(QDialog):
         form.addRow(label, widget)
         self.form_rows[key] = (label, widget)
 
+    # —— 源列表 ——
+
+    def source_label(self, entry):
+        return self.window.source_label(entry)
+
+    def current_source_id(self):
+        row = self.source_table.currentRow()
+        if row < 0 or row >= len(self.sources.entries):
+            return None
+        return self.sources.entries[row].source_id
+
+    def current_source_entry(self):
+        source_id = self.current_source_id()
+        return self.sources.find(source_id) if source_id else None
+
+    def refresh_source_table(self, select_id=None):
+        if select_id is None:
+            select_id = self.current_source_id()
+        self._refreshing_table = True
+        try:
+            self.source_table.setRowCount(len(self.sources.entries))
+            for row, entry in enumerate(self.sources.entries):
+                name_item = QTableWidgetItem(self.source_label(entry))
+                name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.source_table.setItem(row, 0, name_item)
+                kind_item = QTableWidgetItem(
+                    self.window.tr("source_kind_ai") if entry.is_ai else self.window.tr("source_kind_free")
+                )
+                kind_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.source_table.setItem(row, 1, kind_item)
+                for offset, rule in enumerate(ALL_RULES, start=2):
+                    box = QCheckBox(self.source_table)
+                    box.setChecked(rule in entry.rules)
+                    box.stateChanged.connect(
+                        lambda state, sid=entry.source_id, r=rule: self.set_source_rule(sid, r, state == Qt.Checked)
+                    )
+                    self.source_table.setCellWidget(row, offset, box)
+        finally:
+            self._refreshing_table = False
+        index = self.sources.index_of(select_id) if select_id else -1
+        if index < 0 and self.sources.entries:
+            index = 0
+        if index >= 0:
+            self.source_table.selectRow(index)
+        self.update_visible_fields()
+
+    def set_source_rule(self, source_id, rule, enabled):
+        if self._refreshing_table:
+            return
+        self.sources.set_rule(source_id, rule, enabled)
+
+    def move_source(self, delta):
+        source_id = self.current_source_id()
+        if not source_id:
+            return
+        self._flush_source_fields()
+        if delta < 0:
+            self.sources.move_up(source_id)
+        else:
+            self.sources.move_down(source_id)
+        self.refresh_source_table(select_id=source_id)
+
+    def remove_source(self):
+        entry = self.current_source_entry()
+        if entry is None or not entry.is_ai:
+            return                      # 内置源不给删，只能取消勾选
+        answer = QMessageBox.question(
+            self, self.window.tr("source_remove"),
+            self.window.tr("source_remove_confirm", name=self.source_label(entry)),
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.sources.remove(entry.source_id)
+        self.refresh_source_table()
+
+    def add_ai_source(self):
+        dialog = self.ai_dialog_class(self.window, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.values()
+        if not values.get("name"):
+            QMessageBox.warning(self, self.window.tr("add_ai_source"), self.window.tr("source_name_required"))
+            return
+        if self.sources.has_name(values["name"]):
+            answer = QMessageBox.question(
+                self, self.window.tr("add_ai_source"),
+                self.window.tr("source_name_duplicate", name=values["name"]),
+            )
+            if answer != QMessageBox.Yes:
+                return
+        # 新加的 AI 源默认只勾「右键选中」。勾上「翻译全表」= 授权一次可能产生
+        # 费用的批量调用，必须由用户自己动手勾（决定 6 / 23）。
+        entry = SourceEntry(
+            kind="ai",
+            name=values["name"],
+            api_type=values.get("api_type") or "openai",
+            rules=[RULE_SELECTION],
+            api_key=values.get("api_key", ""),
+            base_url=values.get("base_url", ""),
+            model=values.get("model", ""),
+            concurrency=int(values.get("concurrency") or 1),
+            interval=float(values.get("interval") or 0.0),
+        )
+        self.sources.add_ai(entry)
+        self.refresh_source_table(select_id=entry.source_id)
+
+    # —— 每个源的设置 ——
+
+    def _on_source_selection_changed(self):
+        if self._refreshing_table:
+            return                      # 刷新表格时的选中变化不算「用户换了源」
+        self._flush_source_fields()
+        self.update_visible_fields()
+
+    def _flush_source_fields(self):
+        """把控件里的值写回**当前加载的那个源**。
+
+        必须按 `_loaded_source_id` 定位目标，不能用 `current_source_entry()`：
+        刷新表格时 `selectRow()` 会先触发本函数，而那一刻 `current_source_entry()`
+        已经是新源了 —— 会把上一个源的值（含 API Key）写进新源。
+        """
+        entry = self.sources.find(getattr(self, "_loaded_source_id", None))
+        if entry is None:
+            return
+        if not entry.is_ai:
+            # DeepL 是免费源里唯一要密钥的（`needs_key`），它的密钥也要存
+            if FREE_SOURCE_SPECS.get(entry.source_id, {}).get("needs_key"):
+                entry.api_key = self.source_api_key_input.text().strip()
+            return
+        entry.api_type = self.source_type_input.currentData() or "openai"
+        entry.base_url = self.source_base_url_input.text().strip()
+        entry.api_key = self.source_api_key_input.text().strip()
+        entry.model = self.source_model_input.text().strip()
+        entry.concurrency = self.source_concurrency_input.value()
+        entry.interval = self.source_interval_input.value()
+
     def update_visible_fields(self):
-        provider_label = self.provider_combo.currentText()
-        provider = next(key for key, label in PROVIDER_LABELS.items() if label == provider_label)
-        visible_fields = PROVIDER_FIELD_KEYS.get(provider, set())
-        preset_visible = provider in ("openai", "claude", "codex")
-        preset_label, preset_widgets = self.form_rows["preset"]
-        preset_label.setVisible(preset_visible)
-        for widget in preset_widgets:
-            widget.setVisible(preset_visible)
-        for key in ("api_key", "region", "model", "base_url", "email"):
-            label, widget = self.form_rows[key]
-            visible = key in visible_fields
+        entry = self.current_source_entry()
+        is_ai = entry is not None and entry.is_ai
+        needs_key = is_ai or (
+            entry is not None and FREE_SOURCE_SPECS.get(entry.source_id, {}).get("needs_key", False)
+        )
+        if entry is None:
+            self.source_name_label.setText("")
+            self.source_builtin_label.setText("")
+        else:
+            self.source_name_label.setText(self.source_label(entry))
+            if not is_ai:
+                spec = FREE_SOURCE_SPECS.get(entry.source_id, {})
+                self.source_builtin_label.setText(self.window.tr(
+                    "source_builtin_text",
+                    concurrency=spec.get("concurrency", 1),
+                    interval=spec.get("interval", 0.0),
+                ))
+        if is_ai:
+            self.source_type_input.blockSignals(True)
+            self.source_base_url_input.blockSignals(True)
+            self.source_api_key_input.blockSignals(True)
+            self.source_model_input.blockSignals(True)
+            self.source_concurrency_input.blockSignals(True)
+            self.source_interval_input.blockSignals(True)
+            index = self.source_type_input.findData(entry.api_type)
+            self.source_type_input.setCurrentIndex(index if index >= 0 else 0)
+            self.source_base_url_input.setText(entry.base_url)
+            self.source_api_key_input.setText(entry.api_key)
+            self.source_model_input.setText(entry.model)
+            self.source_concurrency_input.setValue(max(1, int(entry.concurrency or 1)))
+            self.source_interval_input.setValue(float(entry.interval or 0.0))
+            self.source_type_input.blockSignals(False)
+            self.source_base_url_input.blockSignals(False)
+            self.source_api_key_input.blockSignals(False)
+            self.source_model_input.blockSignals(False)
+            self.source_concurrency_input.blockSignals(False)
+            self.source_interval_input.blockSignals(False)
+        visibility = {
+            "source_builtin": entry is not None and not is_ai,
+            "source_type": is_ai,
+            "source_base_url": is_ai,
+            "source_api_key": needs_key,
+            "source_model": is_ai,
+            "source_concurrency": is_ai,
+            "source_interval": is_ai,
+        }
+        for key, visible in visibility.items():
+            label, widget = self.source_form_rows[key]
             label.setVisible(visible)
             widget.setVisible(visible)
+        # 记下「现在控件里装的是哪个源」，供 `_flush_source_fields` 定位写入目标
+        self._loaded_source_id = entry.source_id if entry is not None else None
 
     def is_field_visible(self, key):
-        label, widget = self.form_rows[key]
+        rows = self.source_form_rows if key in self.source_form_rows else self.form_rows
+        if key not in rows:
+            return False                  # 预设行已删（决定 26），"preset" 这种键查不到
+        label, widget = rows[key]
         if isinstance(widget, list):
             return not label.isHidden() and all(not item.isHidden() for item in widget)
         return not label.isHidden() and not widget.isHidden()
 
-    def connect_auto_save_signals(self):
-        self.char_budget_input.valueChanged.connect(self._on_field_changed)
-        self.parallel_batches_input.valueChanged.connect(self._on_field_changed)
-        self.timeout_input.valueChanged.connect(self._on_field_changed)
-        self.api_key_input.textChanged.connect(self._on_field_changed)
-        self.region_input.textChanged.connect(self._on_field_changed)
-        self.model_input.textChanged.connect(self._on_field_changed)
-        self.base_url_input.textChanged.connect(self._on_field_changed)
-        self.email_input.textChanged.connect(self._on_field_changed)
-
-    def _on_provider_changed(self, label):
-        if self._loading_preset:
-            return
-        old_provider = self._current_dialog_provider
-        self._save_dialog_fields_to_cache(old_provider)
-        new_provider = next(key for key, lbl in PROVIDER_LABELS.items() if lbl == label)
-        self._block_field_signals(True)
-        for key in PROVIDER_FIELD_KEYS.get(new_provider, set()):
-            value = self._dialog_field_cache.get(new_provider, {}).get(key, "")
-            self._set_field_value(key, value)
-        self._block_field_signals(False)
-        self._current_dialog_provider = new_provider
-        self.update_visible_fields()
-        self.refresh_preset_dirty_indicator()
-
-    def _save_dialog_fields_to_cache(self, provider):
-        for key in PROVIDER_FIELD_KEYS.get(provider, set()):
-            self._dialog_field_cache.setdefault(provider, {})[key] = self._get_field_value(key)
-
-    def _get_field_value(self, key):
-        field_map = {
-            "api_key": self.api_key_input,
-            "region": self.region_input,
-            "model": self.model_input,
-            "base_url": self.base_url_input,
-            "email": self.email_input,
-        }
-        widget = field_map.get(key)
-        if widget is not None:
-            return widget.text().strip()
-        return ""
-
-    def _set_field_value(self, key, value):
-        field_map = {
-            "api_key": self.api_key_input,
-            "region": self.region_input,
-            "model": self.model_input,
-            "base_url": self.base_url_input,
-            "email": self.email_input,
-        }
-        widget = field_map.get(key)
-        if widget is not None:
-            widget.setText(value or "")
-
-    def _block_field_signals(self, block):
-        self.api_key_input.blockSignals(block)
-        self.region_input.blockSignals(block)
-        self.model_input.blockSignals(block)
-        self.base_url_input.blockSignals(block)
-        self.email_input.blockSignals(block)
-
-    def _on_field_changed(self, value=None):
-        if self._loading_preset:
-            return
-        # 把当前 provider 的字段保存到对话框缓存，不写入 window
-        self._save_dialog_fields_to_cache(self._current_dialog_provider)
-        self.refresh_preset_dirty_indicator()
+    # —— 通用字段 ——
 
     def apply_settings(self, close_dialog=True):
-        provider_label = self.provider_combo.currentText()
-        provider = next(key for key, label in PROVIDER_LABELS.items() if label == provider_label)
-        self.window.translation_provider = provider
+        self._flush_source_fields()
+        self.window.translation_sources = self.sources.clone()
         self.window.translation_char_budget = self.char_budget_input.value()
-        self.window.translation_parallel_batches = self.parallel_batches_input.value()
         self.window.translation_auto_concurrency = self.auto_concurrency_check.isChecked()
         self.window.translation_timeout = float(self.timeout_input.value())
-        # 保存当前 provider 的对话框字段到 window
-        self._save_dialog_fields_to_cache(provider)
-        # 把缓存中所有 provider 的字段写入 window（包括切换过的 provider）
-        for prov, fields in self._dialog_field_cache.items():
-            for key, value in fields.items():
-                self.window.set_provider_setting(prov, key, value)
         self.window.save_translation_settings()
         if close_dialog:
             self.accept()
@@ -693,29 +928,19 @@ class TranslationSettingsDialog(QDialog):
         self.window.clear_translation_cache()
 
     def _build_test_config(self):
-        provider_label = self.provider_combo.currentText()
-        provider = next(key for key, label in PROVIDER_LABELS.items() if label == provider_label)
-        return TranslatorConfig(
-            provider=provider,
-            # 测试连接只验证密钥/模型可用，不需要分批，给一个大预算一次问完
-            char_budget=MAX_CHAR_BUDGET,
-            parallel_batches=self.parallel_batches_input.value(),
-            timeout=float(self.timeout_input.value()),
-            api_key=self._get_field_value("api_key"),
-            region=self._get_field_value("region"),
-            model=self._get_field_value("model"),
-            base_url=self._get_field_value("base_url"),
-            email=self._get_field_value("email"),
-        )
+        """测试按钮只测当前选中的源。"""
+        entry = self.current_source_entry()
+        if entry is None:
+            raise ValueError(self.window.tr("no_source_selected"))
+        return self.window.build_source_config(entry, self.char_budget_input.value(), float(self.timeout_input.value()))
 
     def run_translation_test(self):
-        config = self._build_test_config()
         try:
+            config = self._build_test_config()
             validate_translator_config(config)
         except ValueError as exc:
             QMessageBox.warning(self, self.window.tr("test_translation"), str(exc))
             return
-        # 重复点击测试按钮时，先等待旧测试线程结束，避免 QThread 被覆盖导致泄漏或崩溃。
         self._wait_for_test_thread()
         self.test_button.setEnabled(False)
         self.test_button.setText(self.window.tr("test_translation_running"))
@@ -727,23 +952,16 @@ class TranslationSettingsDialog(QDialog):
         ]
         service = TranslationService()
         self._test_thread = QThread(self)
-        self._test_worker = TranslationWorker(service=service, jobs=jobs, config=config)
+        self._test_worker = TranslationWorker(service=service, jobs=jobs, configs=[config])
         self._test_worker.moveToThread(self._test_thread)
         self._test_thread.started.connect(self._test_worker.run)
         self._test_worker.finished.connect(self._on_test_finished)
         self._test_worker.failed.connect(self._on_test_failed)
         self._test_worker.finished.connect(self._test_thread.quit)
         self._test_worker.failed.connect(self._test_thread.quit)
-        # 线程结束后释放 worker 和 thread，避免内存泄漏与重复回调。
         self._test_thread.finished.connect(self._test_worker.deleteLater)
         self._test_thread.finished.connect(self._test_thread.deleteLater)
-        # 线程结束后清空引用，避免第二次测试时 isRunning() 抛 RuntimeError。
-        self._test_thread.finished.connect(self._clear_test_thread)
         self._test_thread.start()
-
-    def _clear_test_thread(self):
-        self._test_worker = None
-        self._test_thread = None
 
     def _wait_for_test_thread(self):
         thread = getattr(self, "_test_thread", None)
@@ -787,131 +1005,6 @@ class TranslationSettingsDialog(QDialog):
             TranslationJob(row=0, column=index, text=test_word, source_code="english", target_code=lang)
             for index, lang in enumerate(target_languages)
         ]
-
-    def refresh_presets(self):
-        self.preset_combo.blockSignals(True)
-        self.preset_combo.clear()
-        self.preset_combo.addItems(self.window.translation_preset_names())
-        self.preset_combo.blockSignals(False)
-
-    def save_preset(self):
-        name = (self.preset_name_input.text() or "").strip()
-        if not name:
-            return
-        # 保存当前 provider 字段到缓存
-        provider_label = self.provider_combo.currentText()
-        provider = next(key for key, label in PROVIDER_LABELS.items() if label == provider_label)
-        self._save_dialog_fields_to_cache(provider)
-        # 从对话框当前值保存预设，不修改 window 状态
-        values = self.current_field_values()
-        self.window.settings.beginGroup(f"translation_presets/{name}")
-        for key, value in values.items():
-            self.window.settings.setValue(key, value)
-        self.window.settings.endGroup()
-        names = self.window.translation_preset_names()
-        if name not in names:
-            names.append(name)
-            self.window.settings.setValue("translation_preset_names_list", names)
-        self.window.settings.sync()
-        self.refresh_presets()
-        self.preset_combo.setCurrentText(name)
-        self._loaded_preset_values = self.current_field_values()
-        self.refresh_preset_dirty_indicator()
-
-    def delete_preset(self):
-        name = (self.preset_combo.currentText() or "").rstrip("*").strip()
-        self.window.delete_translation_preset(name)
-        self.refresh_presets()
-        self.refresh_preset_dirty_indicator()
-
-    def auto_load_preset(self, name):
-        name = (name or "").rstrip("*").strip()
-        if not name:
-            return
-        self._loading_preset = True
-        values = self._read_preset_values(name)
-        self._apply_preset_values_to_dialog(values)
-        self._loading_preset = False
-        provider = normalize_provider(values.get("provider") or "google")
-        self._current_dialog_provider = provider
-        self.update_visible_fields()
-        self._loaded_preset_values = self.current_field_values()
-        self.refresh_preset_dirty_indicator()
-
-    def _read_preset_values(self, name):
-        preset_keys = ["provider", "char_budget", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email", "batch_size", "auto_concurrency"]
-        prefix = f"translation_presets/{name}/"
-        values = {key: self.window.settings.value(prefix + key, "") for key in preset_keys}
-        return values
-
-    def _apply_preset_values_to_dialog(self, values):
-        provider = normalize_provider(values.get("provider") or "google")
-        self.provider_combo.setCurrentText(PROVIDER_LABELS.get(provider, "Google"))
-        # 旧键 batch_size 存的是「行数」（默认 30），新键 char_budget 是「字数」。
-        # 旧值 30 落在新区间里，直接拿来用就会被当成「每批 30 个字」—— 一律换成默认值。
-        char_budget = values.get("char_budget")
-        if char_budget is None or str(char_budget) == "":
-            legacy = values.get("batch_size")
-            if legacy is not None and str(legacy) != "":
-                char_budget = DEFAULT_CHAR_BUDGET
-        if char_budget is not None and str(char_budget) != "":
-            self.char_budget_input.setValue(int(char_budget))
-        parallel_batches = values.get("parallel_batches")
-        if parallel_batches is not None and str(parallel_batches) != "":
-            self.parallel_batches_input.setValue(int(parallel_batches))
-        auto_concurrency = values.get("auto_concurrency")
-        if auto_concurrency is not None and str(auto_concurrency) != "":
-            self.auto_concurrency_check.setChecked(str(auto_concurrency).lower() in ("true", "1", "yes"))
-        timeout = values.get("timeout")
-        if timeout is not None and str(timeout) != "":
-            self.timeout_input.setValue(int(timeout))
-        self._block_field_signals(True)
-        for key in PROVIDER_FIELD_KEYS.get(provider, set()):
-            value = values.get(key, "")
-            self._set_field_value(key, str(value) if value is not None else "")
-        self._block_field_signals(False)
-        # 更新对话框字段缓存，使切换 provider 时能恢复预设值
-        for key in PROVIDER_FIELD_KEYS.get(provider, set()):
-            self._dialog_field_cache.setdefault(provider, {})[key] = str(values.get(key, "")) if values.get(key) is not None else ""
-
-    def current_field_values(self):
-        provider_label = self.provider_combo.currentText()
-        provider = next(key for key, label in PROVIDER_LABELS.items() if label == provider_label)
-        return {
-            "provider": provider,
-            "char_budget": self.char_budget_input.value(),
-            "parallel_batches": self.parallel_batches_input.value(),
-            "auto_concurrency": self.auto_concurrency_check.isChecked(),
-            "timeout": self.timeout_input.value(),
-            "api_key": self.api_key_input.text().strip(),
-            "region": self.region_input.text().strip(),
-            "model": self.model_input.text().strip(),
-            "base_url": self.base_url_input.text().strip(),
-            "email": self.email_input.text().strip(),
-        }
-
-    def preset_saved_values(self):
-        return getattr(self, '_loaded_preset_values', None)
-
-    def is_preset_dirty(self):
-        saved = self.preset_saved_values()
-        if saved is None:
-            return False
-        current = self.current_field_values()
-        for key, value in current.items():
-            saved_value = saved.get(key, "")
-            if str(value) != str(saved_value):
-                return True
-        return False
-
-    def refresh_preset_dirty_indicator(self):
-        if self.preset_saved_values() is None:
-            self.dirty_indicator_label.setText("")
-            return
-        if self.is_preset_dirty():
-            self.dirty_indicator_label.setText("*")
-        else:
-            self.dirty_indicator_label.setText("")
 
 
 class LanguageSettingsDialog(QDialog):
@@ -1336,16 +1429,18 @@ class DayzTranslateTool(QMainWindow):
         self.settings = settings if settings is not None else QSettings("DayZTranslateTool", "DayZTranslateTool")
         self.last_file_directory = self.settings.value("last_file_directory", "")
         self.source_header = self.settings.value("source_header", "english")
-        self.translation_provider = normalize_provider(self.settings.value("translation_provider", "google"))
+        self.translation_sources = SourceList.from_json(
+            self.settings.value("translation_sources_json", "")
+        )
         self.translation_char_budget = int(
             self.settings.value("translation_char_budget", DEFAULT_CHAR_BUDGET)
         )
         self.translation_auto_concurrency = str(
             self.settings.value("translation_auto_concurrency", "true")
         ).lower() in ("true", "1", "yes")
-        self.translation_parallel_batches = int(self.settings.value("translation_parallel_batches", 3))
         self.translation_timeout = float(self.settings.value("translation_timeout", 60.0))
-        self.provider_settings = self._load_provider_settings()
+        self._translation_rule = RULE_SELECTION
+        self._migrate_translation_settings()
         self.ui_language = self.settings.value("ui_language", "en")
         self.qt_translators = []
         self.history = TableHistory()
@@ -1556,6 +1651,13 @@ class DayzTranslateTool(QMainWindow):
         self._retry_max_attempts = max_attempts
         self._render_retry_label()
         self._retry_timer.start()
+
+    def on_translation_fallback(self, previous_label, next_label):
+        """主备降级：状态栏显示一行小字（决定 20）。"""
+        self.statusBar().showMessage(
+            self.tr("translation_fallback", previous=previous_label, current=next_label),
+            8000,
+        )
 
     def _tick_retry_countdown(self):
         self._retry_seconds_left -= 1
@@ -1801,176 +1903,72 @@ class DayzTranslateTool(QMainWindow):
         self.wordbook_window.raise_()
         self.wordbook_window.activateWindow()
 
-    def _load_provider_settings(self):
-        result = {}
-        for provider, defaults in PROVIDER_DEFAULTS.items():
-            self.settings.beginGroup(f"provider_settings/{provider}")
-            values = {}
-            for key, default_value in defaults.items():
-                stored = self.settings.value(key, None)
-                values[key] = stored if stored is not None else default_value
-            self.settings.endGroup()
-            result[provider] = values
-        return result
+    def source_label(self, entry):
+        if entry.is_ai:
+            return entry.name or entry.api_type or "AI"
+        return self.tr(FREE_SOURCE_SPECS.get(entry.source_id, {}).get("label_key", entry.source_id))
 
-    def _save_provider_settings(self):
-        for provider, values in self.provider_settings.items():
-            self.settings.beginGroup(f"provider_settings/{provider}")
-            for key, value in values.items():
-                self.settings.setValue(key, value)
-            self.settings.endGroup()
-        self.settings.sync()
+    def translation_source_summary(self):
+        labels = [self.source_label(entry) for entry in self.translation_sources.entries if entry.rules]
+        return " → ".join(labels) if labels else self.tr("no_source_selected")
 
-    def get_provider_setting(self, provider, key, default=""):
-        return self.provider_settings.get(provider, {}).get(key, default)
-
-    def set_provider_setting(self, provider, key, value):
-        if provider not in self.provider_settings:
-            self.provider_settings[provider] = {}
-        self.provider_settings[provider][key] = value
-
-    @property
-    def translation_api_key(self):
-        return self.get_provider_setting(self.translation_provider, "api_key", "")
-
-    @translation_api_key.setter
-    def translation_api_key(self, value):
-        self.set_provider_setting(self.translation_provider, "api_key", value)
-
-    @property
-    def translation_region(self):
-        return self.get_provider_setting(self.translation_provider, "region", "")
-
-    @translation_region.setter
-    def translation_region(self, value):
-        self.set_provider_setting(self.translation_provider, "region", value)
-
-    @property
-    def translation_model(self):
-        return self.get_provider_setting(self.translation_provider, "model", "gpt-3.5-turbo")
-
-    @translation_model.setter
-    def translation_model(self, value):
-        self.set_provider_setting(self.translation_provider, "model", value)
-
-    @property
-    def translation_base_url(self):
-        return self.get_provider_setting(self.translation_provider, "base_url", "")
-
-    @translation_base_url.setter
-    def translation_base_url(self, value):
-        self.set_provider_setting(self.translation_provider, "base_url", value)
-
-    @property
-    def translation_email(self):
-        return self.get_provider_setting(self.translation_provider, "email", "")
-
-    @translation_email.setter
-    def translation_email(self, value):
-        self.set_provider_setting(self.translation_provider, "email", value)
-
-    def save_translation_settings(self):
-        self.settings.setValue("translation_provider", self.translation_provider)
-        self.settings.setValue("translation_char_budget", self.translation_char_budget)
-        self.settings.setValue("translation_auto_concurrency", self.translation_auto_concurrency)
-        self.settings.setValue("translation_parallel_batches", self.translation_parallel_batches)
-        self.settings.setValue("translation_timeout", self.translation_timeout)
-        self._save_provider_settings()
-        self.statusBar().showMessage(
-            self.tr("translation_engine_status", engine=PROVIDER_LABELS.get(self.translation_provider, self.translation_provider)),
-            5000,
+    def build_source_config(self, entry, char_budget=None, timeout=None):
+        """把一个源条目变成 TranslatorConfig。免费源的并发/间隔内置，AI 源用自己存的。"""
+        if entry.is_ai:
+            return TranslatorConfig(
+                provider=entry.api_type or "openai",
+                label=self.source_label(entry),
+                char_budget=char_budget if char_budget is not None else self.translation_char_budget,
+                parallel_batches=max(1, int(entry.concurrency or 1)),
+                min_interval=max(0.0, float(entry.interval or 0.0)),
+                auto_concurrency=self.translation_auto_concurrency,
+                timeout=timeout if timeout is not None else self.translation_timeout,
+                api_key=entry.api_key,
+                model=entry.model,
+                base_url=entry.base_url,
+                glossary=self.wordbook_glossary(),
+                glossary_source_key=(self.source_header or "").strip().lower(),
+            )
+        spec = FREE_SOURCE_SPECS.get(entry.source_id, {})
+        return TranslatorConfig(
+            provider=entry.source_id,
+            label=self.source_label(entry),
+            char_budget=char_budget if char_budget is not None else self.translation_char_budget,
+            parallel_batches=max(1, int(spec.get("concurrency", 1))),
+            min_interval=max(0.0, float(spec.get("interval", 0.0))),
+            auto_concurrency=self.translation_auto_concurrency,
+            timeout=timeout if timeout is not None else self.translation_timeout,
+            api_key=entry.api_key,
         )
 
-    def current_translation_settings_dict(self):
-        return {
-            "provider": self.translation_provider,
-            "char_budget": self.translation_char_budget,
-            "auto_concurrency": self.translation_auto_concurrency,
-            "parallel_batches": self.translation_parallel_batches,
-            "timeout": self.translation_timeout,
-            "api_key": self.translation_api_key,
-            "region": self.translation_region,
-            "model": self.translation_model,
-            "base_url": self.translation_base_url,
-            "email": self.translation_email,
-        }
+    def build_translation_configs(self, rule):
+        return [
+            self.build_source_config(entry)
+            for entry in self.translation_sources.candidates(rule)
+        ]
 
-    def apply_translation_settings_dict(self, values):
-        # Apply explicit preset/settings values. Do not use `or` for strings:
-        # empty strings and missing-vs-stale values must not keep the previous
-        # provider field (that caused flaky preset switches).
-        provider = values.get("provider")
-        if provider:
-            self.translation_provider = normalize_provider(provider)
-        # 旧键 batch_size 存的是「行数」（默认 30），新键 char_budget 是「字数」。
-        # 旧值 30 落在新区间里，直接拿来用就会被当成「每批 30 个字」—— 一律换成默认值。
-        char_budget = values.get("char_budget")
-        if char_budget is None or char_budget == "":
-            legacy = values.get("batch_size")
-            if legacy is not None and legacy != "":
-                char_budget = DEFAULT_CHAR_BUDGET
-        if char_budget is not None and char_budget != "":
-            self.translation_char_budget = int(char_budget)
-        auto_concurrency = values.get("auto_concurrency")
-        if auto_concurrency is not None and auto_concurrency != "":
-            self.translation_auto_concurrency = bool(auto_concurrency)
-        parallel_batches = values.get("parallel_batches")
-        if parallel_batches is not None and parallel_batches != "":
-            self.translation_parallel_batches = int(parallel_batches)
-        timeout = values.get("timeout")
-        if timeout is not None and timeout != "":
-            self.translation_timeout = float(timeout)
-        if "api_key" in values:
-            self.translation_api_key = "" if values.get("api_key") is None else str(values.get("api_key"))
-        if "region" in values:
-            self.translation_region = "" if values.get("region") is None else str(values.get("region"))
-        if "model" in values:
-            self.translation_model = "" if values.get("model") is None else str(values.get("model"))
-        if "base_url" in values:
-            self.translation_base_url = "" if values.get("base_url") is None else str(values.get("base_url"))
-        if "email" in values:
-            self.translation_email = "" if values.get("email") is None else str(values.get("email"))
-        self.save_translation_settings()
-
-    def translation_preset_names(self):
-        names = self.settings.value("translation_preset_names_list", [])
-        if isinstance(names, str):
-            names = [names]
-        return sorted(names)
-
-    def save_translation_preset(self, name):
-        name = (name or "").strip()
-        if not name:
+    def _migrate_translation_settings(self):
+        """首次运行：清掉旧的 provider_settings 密钥，写入新的源列表。"""
+        if str(self.settings.value("translation_sources_json", "") or "").strip():
             return
-        prefix = f"translation_presets/{name}/"
-        for key, value in self.current_translation_settings_dict().items():
-            self.settings.setValue(prefix + key, value)
-        self.settings.sync()
-        names = self.translation_preset_names()
-        if name not in names:
-            names.append(name)
-        self.settings.setValue("translation_preset_names_list", names)
+        self.settings.remove("provider_settings")
+        self.settings.remove("translation_provider")
+        self.settings.remove("translation_parallel_batches")     # 决定 24：这个设置项整个删掉
+        self.settings.remove("translation_presets")              # 决定 26：预设整个删掉（连同里面的密钥）
+        self.settings.remove("translation_preset_names_list")
+        self.settings.setValue("translation_sources_json", self.translation_sources.to_json())
         self.settings.sync()
 
-    def load_translation_preset(self, name):
-        name = (name or "").strip()
-        if not name:
-            return
-        preset_keys = ["provider", "char_budget", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email", "batch_size", "auto_concurrency"]
-        prefix = f"translation_presets/{name}/"
-        # Always include keys so apply overwrites previous provider fields.
-        values = {key: self.settings.value(prefix + key, "") for key in preset_keys}
-        self.apply_translation_settings_dict(values)
-
-    def delete_translation_preset(self, name):
-        name = (name or "").strip()
-        if not name:
-            return
-        self.settings.remove(f"translation_presets/{name}")
-        names = self.translation_preset_names()
-        if name in names:
-            names.remove(name)
-        self.settings.setValue("translation_preset_names_list", names)
+    def save_translation_settings(self):
+        self.settings.setValue("translation_sources_json", self.translation_sources.to_json())
+        self.settings.setValue("translation_char_budget", self.translation_char_budget)
+        self.settings.setValue("translation_auto_concurrency", self.translation_auto_concurrency)
+        self.settings.setValue("translation_timeout", self.translation_timeout)
+        self.settings.sync()
+        self.statusBar().showMessage(
+            self.tr("translation_engine_status", engine=self.translation_source_summary()),
+            5000,
+        )
 
     def save_ui_language(self):
         self.settings.setValue("ui_language", self.ui_language)
@@ -2277,7 +2275,7 @@ class DayzTranslateTool(QMainWindow):
                 jobs.append((item.row(), item.column(), source_text, target_code))
         # 复制列（original<-english, chinese<-chinesesimp）在翻译前填充，不受翻译成败影响
         self._fill_copy_columns(rows, overwrite=True, row_indexes={item.row() for item in self.selected_cell_items()})
-        self.run_translation_jobs(jobs)
+        self.run_translation_jobs(jobs, rule=RULE_SELECTION)
 
     def selected_cell_items(self):
         items = list(self.table.selectedItems())
@@ -2304,7 +2302,7 @@ class DayzTranslateTool(QMainWindow):
             return
         # 复制列（original<-english, chinese<-chinesesimp）在翻译前填充，不受翻译成败影响
         self._fill_copy_columns(self.table_rows(), overwrite=True, row_indexes=rows)
-        self.run_translation_jobs(jobs)
+        self.run_translation_jobs(jobs, rule=RULE_SELECTION)
 
     def translate_selected_columns(self):
         rows, columns = self.selected_rows_and_columns()
@@ -2318,7 +2316,7 @@ class DayzTranslateTool(QMainWindow):
             return
         # 复制列（original<-english, chinese<-chinesesimp）在翻译前填充，不受翻译成败影响
         self._fill_copy_columns(self.table_rows(), overwrite=True)
-        self.run_translation_jobs(jobs)
+        self.run_translation_jobs(jobs, rule=RULE_SELECTION)
 
     def translate_all_cells(self):
         try:
@@ -2340,7 +2338,7 @@ class DayzTranslateTool(QMainWindow):
                 target_code = language_code_for_header(self.headers[col_index])
                 if target_code:
                     jobs.append((row_index, col_index, source_text, target_code))
-        self.run_translation_jobs(jobs)
+        self.run_translation_jobs(jobs, rule=RULE_ALL)
 
     def translate_empty_cells(self):
         try:
@@ -2367,7 +2365,7 @@ class DayzTranslateTool(QMainWindow):
                 target_text = row[col_index].strip() if col_index < len(row) else ""
                 if not target_text:
                     jobs.append((row_index, col_index, source_text, target_code))
-        self.run_translation_jobs(jobs, copy_overwrite=False)
+        self.run_translation_jobs(jobs, copy_overwrite=False, rule=RULE_EMPTY)
 
     def _fill_copy_columns(self, rows, overwrite=False, row_indexes=None):
         """填充复制列：original<-english, chinese<-chinesesimp。
@@ -2430,9 +2428,9 @@ class DayzTranslateTool(QMainWindow):
                 columns.add(column_index)
         return columns
 
-    def run_translation_jobs(self, jobs, copy_overwrite=True):
+    def run_translation_jobs(self, jobs, copy_overwrite=True, rule=RULE_SELECTION):
         jobs = self._sort_jobs_by_row_column(jobs)
-        self.start_translation_worker(jobs, copy_overwrite=copy_overwrite)
+        self.start_translation_worker(jobs, copy_overwrite=copy_overwrite, rule=rule)
 
     def _sort_jobs_by_row_column(self, jobs):
         """按 (行, 列) 排序翻译任务，使相邻单元格聚拢，便于批次切分与进度展示。"""
@@ -2440,7 +2438,7 @@ class DayzTranslateTool(QMainWindow):
             return jobs
         return sorted(jobs, key=lambda j: (j[0], j[1]))
 
-    def start_translation_worker(self, raw_jobs, run_immediately=False, copy_overwrite=True):
+    def start_translation_worker(self, raw_jobs, run_immediately=False, copy_overwrite=True, rule=RULE_SELECTION):
         jobs = [
             TranslationJob(row, column, text, source_language_code_for_header(self.source_header), target)
             for row, column, text, target in raw_jobs
@@ -2458,11 +2456,22 @@ class DayzTranslateTool(QMainWindow):
             QMessageBox.warning(self, self.tr("translate"), self.tr("translation_in_progress"))
             return
 
+        configs = self.build_translation_configs(rule)
+        if not configs:
+            QMessageBox.warning(
+                self,
+                self.tr("translate"),
+                self.tr("no_source_for_action", action=self.tr(f"action_{'all_cells' if rule == RULE_ALL else 'empty_cells' if rule == RULE_EMPTY else 'selection'}")),
+            )
+            return
+
+        self._translation_rule = rule
         self.show_translation_progress(len(jobs))
 
-        self.translation_worker = self.create_translation_worker(jobs)
+        self.translation_worker = self.create_translation_worker(jobs, configs)
         self.translation_worker.progress.connect(self.update_translation_progress)
         self.translation_worker.retrying.connect(self.on_translation_retrying)
+        self.translation_worker.fallback.connect(self.on_translation_fallback)
         self.translation_worker.finished.connect(self.finish_translation)
         self.translation_worker.failed.connect(self.fail_translation)
 
@@ -2504,25 +2513,12 @@ class DayzTranslateTool(QMainWindow):
         self.translation_worker = None
         self.translation_thread = None
 
-    def create_translation_worker(self, jobs):
+    def create_translation_worker(self, jobs, configs):
+        # 注入共享缓存：多次翻译运行复用相同内容的翻译结果
         return TranslationWorker(
-            # 注入共享缓存：多次翻译运行复用相同内容的翻译结果
             service=TranslationService(cache=self.translation_cache),
             jobs=jobs,
-            config=TranslatorConfig(
-                provider=self.translation_provider,
-                char_budget=self.translation_char_budget,
-                auto_concurrency=self.translation_auto_concurrency,
-                parallel_batches=self.translation_parallel_batches,
-                timeout=self.translation_timeout,
-                api_key=self.translation_api_key,
-                region=self.translation_region,
-                model=self.translation_model,
-                base_url=self.translation_base_url,
-                email=self.translation_email,
-                glossary=self.wordbook_glossary(),
-                glossary_source_key=(self.source_header or "").strip().lower(),
-            ),
+            configs=configs,
         )
 
     def clear_translation_cache(self):
@@ -2649,7 +2645,7 @@ class DayzTranslateTool(QMainWindow):
             if not target_code:
                 continue
             jobs.append((row_index, column_index, source_text, target_code))
-        self.run_translation_jobs(jobs, copy_overwrite=False)
+        self.run_translation_jobs(jobs, copy_overwrite=False, rule=self._translation_rule)
 
     def fail_translation(self, message):
         self._stop_retry_countdown()

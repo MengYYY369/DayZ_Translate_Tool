@@ -13,6 +13,10 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidgetSelectionRa
 from dayz_csv import DAYZ_HEADERS
 from main import DayzTranslateTool, LanguageSettingsDialog, SearchDialog, TranslationSettingsDialog, WordbookWindow
 from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationResults
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QDialog, QLineEdit
+from main import AI_TYPE_KEYS, AiSourceDialog, TranslationSettingsDialog
+from translation_sources import ALL_RULES, RULE_ALL, RULE_EMPTY, RULE_SELECTION, SourceEntry, SourceList
 
 
 app = QApplication.instance() or QApplication([])
@@ -116,68 +120,6 @@ class MainGuiTests(unittest.TestCase):
     def test_search_action_uses_ctrl_f(self):
         self.assertEqual(self.window.search_action.shortcut().toString(), QKeySequence(QKeySequence.Find).toString())
 
-    def test_default_translation_provider_is_google(self):
-        self.assertEqual(self.window.translation_provider, "google")
-        self.assertEqual(self.window.translation_parallel_batches, 3)
-
-    def test_provider_settings_are_isolated_between_providers(self):
-        self.window.translation_provider = "deepl"
-        self.window.translation_api_key = "deepl-key"
-        self.window.save_translation_settings()
-
-        self.window.translation_provider = "microsoft"
-        self.window.translation_api_key = "ms-key"
-        self.window.translation_region = "eastus"
-        self.window.save_translation_settings()
-
-        self.window.translation_provider = "deepl"
-        self.assertEqual(self.window.translation_api_key, "deepl-key")
-
-        self.window.translation_provider = "microsoft"
-        self.assertEqual(self.window.translation_api_key, "ms-key")
-        self.assertEqual(self.window.translation_region, "eastus")
-
-    def test_dialog_switching_provider_loads_correct_per_provider_settings(self):
-        self.window.translation_provider = "deepl"
-        self.window.translation_api_key = "deepl-key"
-        self.window.save_translation_settings()
-
-        self.window.translation_provider = "microsoft"
-        self.window.translation_api_key = "ms-key"
-        self.window.save_translation_settings()
-
-        dialog = TranslationSettingsDialog(self.window)
-        dialog.provider_combo.setCurrentText("DeepL")
-        self.assertEqual(dialog.api_key_input.text(), "deepl-key")
-
-        dialog.provider_combo.setCurrentText("Microsoft")
-        self.assertEqual(dialog.api_key_input.text(), "ms-key")
-
-    def test_dialog_switching_provider_caches_old_provider_fields(self):
-        """切换 provider 时对话框字段缓存到内存，不立即写入 window。"""
-        self.window.translation_provider = "deepl"
-        self.window.translation_api_key = "original-deepl"
-        self.window.save_translation_settings()
-
-        dialog = TranslationSettingsDialog(self.window)
-        dialog.provider_combo.setCurrentText("DeepL")
-        dialog.api_key_input.setText("changed-deepl")
-
-        # 切换到 Microsoft 前，window 状态不应被修改
-        dialog.provider_combo.setCurrentText("Microsoft")
-        dialog.api_key_input.setText("ms-key")
-
-        # window 的 provider_settings 在点击"保存"前不应被修改
-        self.assertEqual(self.window.get_provider_setting("deepl", "api_key"), "original-deepl")
-        # 对话框缓存中保存了修改后的值
-        self.assertEqual(dialog._dialog_field_cache["deepl"]["api_key"], "changed-deepl")
-        self.assertEqual(dialog._dialog_field_cache["microsoft"]["api_key"], "ms-key")
-
-        # 点击"保存"后写入 window
-        dialog.apply_settings()
-        self.assertEqual(self.window.get_provider_setting("deepl", "api_key"), "changed-deepl")
-        self.assertEqual(self.window.get_provider_setting("microsoft", "api_key"), "ms-key")
-
     def test_body_context_menu_hides_translation_for_language_column_only(self):
         actions = self.window.context_action_labels(context="cell", row=0, column=0)
 
@@ -257,6 +199,7 @@ class MainGuiTests(unittest.TestCase):
                 self.retrying = FakeSignal()
                 self.finished = FakeSignal()
                 self.failed = FakeSignal()
+                self.fallback = FakeSignal()
 
             def moveToThread(self, thread):
                 pass
@@ -268,11 +211,12 @@ class MainGuiTests(unittest.TestCase):
                 pass
 
         worker = FakeWorker()
-        self.window.create_translation_worker = lambda jobs: worker
+        self.window.create_translation_worker = lambda jobs, configs: worker
         self.window.start_translation_worker([(0, 2, "Knife", "de")], run_immediately=True)
 
         self.assertTrue(started)
         self.assertIn(self.window.on_translation_retrying, worker.retrying.callbacks)
+        self.assertIn(self.window.on_translation_fallback, worker.fallback.callbacks)
         self.assertTrue(hasattr(self.window, "translation_progress_bar"))
         self.assertTrue(hasattr(self.window, "translation_cancel_button"))
 
@@ -362,89 +306,6 @@ class MainGuiTests(unittest.TestCase):
         self.window.finish_translation(results)
         self.assertNotEqual(self.window.translation_progress_bar.value(), 5)
         self.assertIn("翻译已取消", self.window.statusBar().currentMessage())
-
-    def test_translation_settings_dialog_saves_provider_and_parallel_batches(self):
-        dialog = TranslationSettingsDialog(self.window)
-        dialog.provider_combo.setCurrentText("DeepL")
-        dialog.parallel_batches_input.setValue(3)
-        dialog.char_budget_input.setValue(2400)
-        dialog.api_key_input.setText("secret")
-
-        dialog.apply_settings()
-
-        self.assertEqual(self.window.translation_provider, "deepl")
-        self.assertEqual(self.window.translation_parallel_batches, 3)
-        self.assertEqual(self.window.translation_char_budget, 2400)
-        self.assertEqual(self.window.translation_api_key, "secret")
-        self.assertFalse(hasattr(dialog, "language_combo"))
-        self.assertGreaterEqual(dialog.width(), 620)
-
-    def test_translation_settings_batch_and_parallel_have_tooltips(self):
-        dialog = TranslationSettingsDialog(self.window)
-        self.assertTrue(dialog.char_budget_input.toolTip())
-        self.assertTrue(dialog.parallel_batches_input.toolTip())
-
-    def test_translation_settings_auto_save_when_fields_change(self):
-        """字段变化不立即写入 window，只有点击"保存"才持久化。"""
-        dialog = TranslationSettingsDialog(self.window)
-
-        dialog.provider_combo.setCurrentText("OpenAI")
-        dialog.model_input.setText("gpt-test")
-        dialog.base_url_input.setText("https://example.test/v1")
-
-        # 编辑期间 window 状态不应被修改
-        self.assertNotEqual(self.window.translation_provider, "openai")
-        # 对话框字段已更新
-        self.assertEqual(dialog.model_input.text(), "gpt-test")
-        self.assertEqual(dialog.base_url_input.text(), "https://example.test/v1")
-
-        # 点击"保存"后写入 window
-        dialog.apply_settings()
-        self.assertEqual(self.window.translation_provider, "openai")
-        self.assertEqual(self.window.translation_model, "gpt-test")
-        self.assertEqual(self.window.translation_base_url, "https://example.test/v1")
-
-    def test_translation_settings_dialog_shows_fields_for_selected_provider(self):
-        dialog = TranslationSettingsDialog(self.window)
-
-        dialog.provider_combo.setCurrentText("Google")
-        self.assertFalse(dialog.is_field_visible("api_key"))
-        self.assertFalse(dialog.is_field_visible("region"))
-        self.assertFalse(dialog.is_field_visible("model"))
-        self.assertFalse(dialog.is_field_visible("email"))
-        self.assertFalse(dialog.is_field_visible("base_url"))
-
-        dialog.provider_combo.setCurrentText("Microsoft")
-        self.assertTrue(dialog.is_field_visible("api_key"))
-        self.assertTrue(dialog.is_field_visible("region"))
-        self.assertFalse(dialog.is_field_visible("model"))
-        self.assertFalse(dialog.is_field_visible("email"))
-        self.assertFalse(dialog.is_field_visible("base_url"))
-
-        dialog.provider_combo.setCurrentText("OpenAI")
-        self.assertTrue(dialog.is_field_visible("api_key"))
-        self.assertFalse(dialog.is_field_visible("region"))
-        self.assertTrue(dialog.is_field_visible("model"))
-        self.assertFalse(dialog.is_field_visible("email"))
-        self.assertTrue(dialog.is_field_visible("base_url"))
-
-    def test_translation_settings_presets_only_visible_for_openai(self):
-        dialog = TranslationSettingsDialog(self.window)
-
-        dialog.provider_combo.setCurrentText("Google")
-        self.assertFalse(dialog.is_field_visible("preset"))
-
-        dialog.provider_combo.setCurrentText("OpenAI")
-        self.assertTrue(dialog.is_field_visible("preset"))
-
-    def test_legacy_chatgpt_provider_is_shown_as_openai(self):
-        self.settings.setValue("translation_provider", "chatgpt")
-        window = DayzTranslateTool(settings=self.settings)
-        dialog = TranslationSettingsDialog(window)
-
-        self.assertEqual(window.translation_provider, "openai")
-        self.assertEqual(dialog.provider_combo.currentText(), "OpenAI")
-        window.close()
 
     def test_progress_update_writes_successful_cells_immediately(self):
         self.window.set_cell_text(0, 14, "")
@@ -864,16 +725,6 @@ class MainGuiTests(unittest.TestCase):
         self.assertIsNotNone(self.window.wordbook_window)
         self.assertTrue(self.window.wordbook_window.isVisible())
 
-    def test_translation_worker_receives_open_wordbook_glossary(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            self.window.wordbook_window = WordbookWindow(self.window, wordbook_path=Path(tmp_dir) / "wordbook.csv")
-            self.window.wordbook_window.set_cell_text(0, 1, "Knife")
-            self.window.wordbook_window.set_cell_text(0, 3, "Messer")
-
-            worker = self.window.create_translation_worker([])
-
-            self.assertEqual(worker.config.glossary, [{"english": "Knife", "german": "Messer"}])
-
     def test_wordbook_auto_saves_after_edit_when_path_exists(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "wordbook.csv"
@@ -950,216 +801,6 @@ class MainGuiTests(unittest.TestCase):
 
             self.assertTrue(wordbook.is_dirty)
             self.assertTrue(wordbook.current_file_label.text().endswith("*"))
-
-    def test_translation_settings_preset_roundtrip(self):
-        self.window.save_translation_preset("TestPreset")
-        names = self.window.translation_preset_names()
-        self.assertIn("TestPreset", names)
-
-    def test_translation_settings_loads_full_preset(self):
-        self.window.translation_provider = "openai"
-        self.window.translation_char_budget = 12
-        self.window.translation_parallel_batches = 3
-        self.window.translation_api_key = "key"
-        self.window.translation_region = "region"
-        self.window.translation_model = "model-a"
-        self.window.translation_base_url = "https://a.test/v1"
-        self.window.translation_email = "me@example.com"
-        self.window.save_translation_preset("OpenAI A")
-
-        self.window.translation_provider = "google"
-        self.window.translation_char_budget = 30
-        self.window.translation_parallel_batches = 1
-        self.window.translation_api_key = ""
-        self.window.translation_region = ""
-        self.window.translation_model = "model-b"
-        self.window.translation_base_url = ""
-        self.window.translation_email = ""
-
-        self.window.load_translation_preset("OpenAI A")
-
-        self.assertEqual(self.window.translation_provider, "openai")
-        self.assertEqual(self.window.translation_char_budget, 12)
-        self.assertEqual(self.window.translation_parallel_batches, 3)
-        self.assertEqual(self.window.translation_api_key, "key")
-        self.assertEqual(self.window.translation_region, "region")
-        self.assertEqual(self.window.translation_model, "model-a")
-        self.assertEqual(self.window.translation_base_url, "https://a.test/v1")
-        self.assertEqual(self.window.translation_email, "me@example.com")
-
-    def test_translation_settings_deletes_preset(self):
-        self.window.save_translation_preset("DeleteMe")
-
-        self.window.delete_translation_preset("DeleteMe")
-
-        self.assertNotIn("DeleteMe", self.window.translation_preset_names())
-
-    def test_preset_combo_switch_auto_loads_values(self):
-        self.window.translation_provider = "openai"
-        self.window.translation_api_key = "key-a"
-        self.window.translation_model = "model-a"
-        self.window.translation_base_url = "https://a.test/v1"
-        self.window.save_translation_preset("PresetA")
-
-        self.window.translation_api_key = "key-b"
-        self.window.translation_model = "model-b"
-        self.window.translation_base_url = "https://b.test/v1"
-        self.window.save_translation_preset("PresetB")
-
-        # Loading an older preset must overwrite the live provider fields.
-        self.window.load_translation_preset("PresetA")
-        self.assertEqual(self.window.translation_api_key, "key-a")
-        self.assertEqual(self.window.translation_model, "model-a")
-        self.assertEqual(self.window.translation_base_url, "https://a.test/v1")
-
-        dialog = TranslationSettingsDialog(self.window)
-        dialog.provider_combo.setCurrentText("OpenAI")
-
-        dialog.auto_load_preset("PresetA")
-        self.assertEqual(dialog.api_key_input.text(), "key-a")
-        self.assertEqual(dialog.model_input.text(), "model-a")
-        self.assertEqual(dialog.base_url_input.text(), "https://a.test/v1")
-
-        dialog.auto_load_preset("PresetB")
-        self.assertEqual(dialog.api_key_input.text(), "key-b")
-        self.assertEqual(dialog.model_input.text(), "model-b")
-        self.assertEqual(dialog.base_url_input.text(), "https://b.test/v1")
-
-    def test_load_translation_preset_overwrites_with_empty_fields(self):
-        self.window.translation_provider = "openai"
-        self.window.translation_api_key = "keep-me"
-        self.window.translation_model = "model-keep"
-        self.window.translation_base_url = "https://keep.test/v1"
-        self.window.save_translation_preset("FullPreset")
-
-        self.window.translation_api_key = ""
-        self.window.translation_model = ""
-        self.window.translation_base_url = ""
-        self.window.save_translation_preset("EmptyPreset")
-
-        self.window.translation_api_key = "stale"
-        self.window.translation_model = "stale-model"
-        self.window.translation_base_url = "https://stale.test/v1"
-        self.window.load_translation_preset("EmptyPreset")
-
-        self.assertEqual(self.window.translation_api_key, "")
-        self.assertEqual(self.window.translation_model, "")
-        self.assertEqual(self.window.translation_base_url, "")
-
-    def test_preset_combo_shows_star_when_field_value_changes(self):
-        self.window.translation_provider = "openai"
-        self.window.translation_api_key = "original-key"
-        self.window.translation_model = "original-model"
-        self.window.translation_base_url = "https://original.test/v1"
-        self.window.save_translation_preset("StarPreset")
-
-        dialog = TranslationSettingsDialog(self.window)
-        dialog.provider_combo.setCurrentText("OpenAI")
-        dialog.preset_combo.setCurrentText("StarPreset")
-        dialog.auto_load_preset("StarPreset")
-
-        self.assertEqual(dialog.dirty_indicator_label.text(), "")
-
-        dialog.api_key_input.setText("changed-key")
-
-        self.assertTrue(dialog.is_preset_dirty())
-        self.assertEqual(dialog.dirty_indicator_label.text(), "*")
-
-    def test_preset_combo_clears_star_after_saving_preset(self):
-        self.window.translation_provider = "openai"
-        self.window.translation_api_key = "save-key"
-        self.window.translation_model = "save-model"
-        self.window.translation_base_url = "https://save.test/v1"
-        self.window.save_translation_preset("SavePreset")
-
-        dialog = TranslationSettingsDialog(self.window)
-        dialog.provider_combo.setCurrentText("OpenAI")
-        dialog.preset_combo.setCurrentText("SavePreset")
-        dialog.auto_load_preset("SavePreset")
-
-        dialog.api_key_input.setText("changed-key")
-        self.assertTrue(dialog.is_preset_dirty())
-        self.assertEqual(dialog.dirty_indicator_label.text(), "*")
-
-        dialog.preset_name_input.setText("SavePreset")
-        dialog.save_preset()
-
-        self.assertEqual(dialog.dirty_indicator_label.text(), "")
-
-    def test_preset_load_button_is_removed(self):
-        dialog = TranslationSettingsDialog(self.window)
-        self.assertFalse(hasattr(dialog, "load_preset_button"))
-
-    def test_loading_preset_does_not_modify_provider_settings(self):
-        """加载预设只更新对话框字段，不修改 window 的 provider_settings。"""
-        self.window.translation_provider = "openai"
-        self.window.translation_api_key = "live-key"
-        self.window.translation_model = "live-model"
-        self.window.translation_base_url = "https://live.test/v1"
-        self.window.save_translation_settings()
-        self.window.save_translation_preset("PresetA")
-
-        # 修改 live 值
-        self.window.translation_api_key = "modified-key"
-        self.window.save_translation_settings()
-
-        dialog = TranslationSettingsDialog(self.window)
-        dialog.provider_combo.setCurrentText("OpenAI")
-        dialog.preset_combo.setCurrentText("PresetA")
-        dialog.auto_load_preset("PresetA")
-
-        # 对话框显示预设值
-        self.assertEqual(dialog.api_key_input.text(), "live-key")
-        self.assertEqual(dialog.model_input.text(), "live-model")
-        # window 的 provider_settings 不应被预设覆盖
-        self.assertEqual(self.window.translation_api_key, "modified-key")
-
-    def test_switching_presets_does_not_overwrite_each_other(self):
-        """切换预设不相互覆盖 provider_settings。"""
-        self.window.translation_provider = "openai"
-        self.window.translation_api_key = "key-a"
-        self.window.translation_model = "model-a"
-        self.window.save_translation_settings()
-        self.window.save_translation_preset("PresetA")
-
-        self.window.translation_api_key = "key-b"
-        self.window.translation_model = "model-b"
-        self.window.save_translation_settings()
-        self.window.save_translation_preset("PresetB")
-
-        dialog = TranslationSettingsDialog(self.window)
-        dialog.provider_combo.setCurrentText("OpenAI")
-
-        # 加载 PresetA
-        dialog.preset_combo.setCurrentText("PresetA")
-        dialog.auto_load_preset("PresetA")
-        self.assertEqual(dialog.api_key_input.text(), "key-a")
-
-        # 加载 PresetB
-        dialog.preset_combo.setCurrentText("PresetB")
-        dialog.auto_load_preset("PresetB")
-        self.assertEqual(dialog.api_key_input.text(), "key-b")
-
-        # 再切回 PresetA，应仍显示 key-a
-        dialog.preset_combo.setCurrentText("PresetA")
-        dialog.auto_load_preset("PresetA")
-        self.assertEqual(dialog.api_key_input.text(), "key-a")
-
-        # window 的 provider_settings 在点击"保存"前不应被修改
-        self.assertEqual(self.window.translation_api_key, "key-b")
-
-    def test_cancel_dialog_does_not_persist_edits(self):
-        """点击取消不持久化对话框中的编辑。"""
-        self.window.translation_provider = "openai"
-        self.window.translation_api_key = "original"
-        self.window.save_translation_settings()
-
-        dialog = TranslationSettingsDialog(self.window)
-        dialog.provider_combo.setCurrentText("OpenAI")
-        dialog.api_key_input.setText("edited")
-        dialog.reject()
-
-        self.assertEqual(self.window.translation_api_key, "original")
 
     def test_cancel_translation_calls_worker_cancel(self):
         """取消翻译按钮调用 worker.cancel()。"""
@@ -1355,13 +996,13 @@ class MainGuiTests(unittest.TestCase):
         from translation_worker import TranslationWorker
 
         class FakeService:
-            def translate_jobs(self, jobs, config, progress_callback=None, should_cancel=None):
+            def translate_jobs_with_fallback(self, jobs, configs, progress_callback=None, should_cancel=None, on_fallback=None):
                 results = TranslationResults(translated=len(jobs))
                 for job in jobs:
                     results.cell_results[(job.row, job.column)] = job.text
                 return results
 
-        self.window.create_translation_worker = lambda jobs: TranslationWorker(FakeService(), jobs, None)
+        self.window.create_translation_worker = lambda jobs, configs: TranslationWorker(FakeService(), jobs, configs)
 
         self.window.start_translation_worker([(0, 4, "Knife", "de")])
         first_thread = self.window.translation_thread
@@ -1383,7 +1024,7 @@ class MainGuiTests(unittest.TestCase):
         self.assertEqual(self.window.table.item(1, 4).text(), "Axe")
 
     def test_translation_worker_uses_shared_cache(self):
-        worker = self.window.create_translation_worker([])
+        worker = self.window.create_translation_worker([], self.window.build_translation_configs(RULE_SELECTION))
         self.assertIs(worker.service.cache, self.window.translation_cache)
 
     def test_translate_empty_cells_does_not_overwrite_copy_columns(self):
@@ -1402,7 +1043,7 @@ class MainGuiTests(unittest.TestCase):
         from translation_worker import TranslationWorker
 
         class FakeService:
-            def translate_jobs(self, jobs, config, progress_callback=None, should_cancel=None):
+            def translate_jobs_with_fallback(self, jobs, configs, progress_callback=None, should_cancel=None, on_fallback=None):
                 results = TranslationResults(translated=len(jobs))
                 for job in jobs:
                     results.cell_results[(job.row, job.column)] = f"EN:{job.text}"
@@ -1412,7 +1053,7 @@ class MainGuiTests(unittest.TestCase):
         self.window.set_cell_text(0, 14, "Dao")
         self.window.set_cell_text(0, 2, "")
         self.window.set_cell_text(0, 1, "")
-        self.window.create_translation_worker = lambda jobs: TranslationWorker(FakeService(), jobs, None)
+        self.window.create_translation_worker = lambda jobs, configs: TranslationWorker(FakeService(), jobs, configs)
 
         self.window.start_translation_worker([(0, 2, "Dao", "en"), (0, 3, "Dao", "de")], run_immediately=True)
 
@@ -1641,7 +1282,7 @@ class MainGuiTests(unittest.TestCase):
 
     def test_settings_dialog_concurrency_cap_range(self):
         dialog = TranslationSettingsDialog(self.window)
-        self.assertEqual(dialog.parallel_batches_input.maximum(), MAX_AUTO_CONCURRENCY)
+        self.assertEqual(dialog.source_concurrency_input.maximum(), MAX_AUTO_CONCURRENCY)
         self.assertTrue(hasattr(dialog, "auto_concurrency_check"))
         self.assertTrue(dialog.auto_concurrency_check.isChecked())
 
@@ -1658,13 +1299,6 @@ class MainGuiTests(unittest.TestCase):
 
         self.assertEqual(self.window.translation_cache, {})
         self.assertEqual(self.window.translation_cache_store.load(), {})
-
-    def test_legacy_preset_batch_size_migrates_to_default(self):
-        self.window.apply_translation_settings_dict({"batch_size": 30})
-        self.assertEqual(self.window.translation_char_budget, DEFAULT_CHAR_BUDGET)
-
-    def test_parallel_batches_default_is_three(self):
-        self.assertEqual(self.window.translation_parallel_batches, 3)
 
     def test_retry_countdown_shown_and_cleared(self):
         self.window.show_translation_progress(4)
@@ -1695,6 +1329,359 @@ class MainGuiTests(unittest.TestCase):
             [(row, column) for row, column, _, _ in captured[0]],
             [(1, 2)],
         )
+
+
+class TranslationSourceListDialogTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.NamedTemporaryFile(suffix=".ini", delete=False)
+        self.temp.close()
+        self.settings = QSettings(self.temp.name, QSettings.IniFormat)
+        self.window = DayzTranslateTool(settings=self.settings)
+        # `_ensure_dayz_table` 是 MainGuiTests 自己的方法，主窗口没有 —— 这里内联同一段建表逻辑
+        self.window.headers = list(DAYZ_HEADERS)
+        sample = [
+            ["STR_A", "OrigA", "EngA"] + [""] * (len(DAYZ_HEADERS) - 3),
+            ["STR_B", "OrigB", "EngB"] + [""] * (len(DAYZ_HEADERS) - 3),
+        ]
+        self.window.apply_table_rows(sample, dirty=False)
+        if self.window.current_path is None:
+            self.window.current_path = Path("stringtable.csv")
+            self.window.update_current_file_label()
+
+    def tearDown(self):
+        self.window.close()
+        os.unlink(self.temp.name)
+
+    def dialog(self):
+        return TranslationSettingsDialog(self.window)
+
+    def test_default_source_list_order_and_rules(self):
+        sources = self.window.translation_sources
+        self.assertEqual(
+            [e.source_id for e in sources.entries][:6],
+            ["google", "microsoft", "tencent", "volcano", "lara", "mymemory"],
+        )
+        self.assertEqual(sorted(sources.find("google").rules), sorted(ALL_RULES))
+        self.assertEqual(sources.find("volcano").rules, [RULE_SELECTION])
+        self.assertEqual(sources.find("deepl").rules, [])
+        self.assertFalse([e for e in sources.entries if e.is_ai])
+
+    def test_table_shows_one_row_per_source_with_three_checkboxes(self):
+        dialog = self.dialog()
+        self.assertEqual(dialog.source_table.rowCount(), len(self.window.translation_sources.entries))
+        self.assertEqual(dialog.source_table.columnCount(), 5)
+        self.assertTrue(dialog.source_table.cellWidget(0, 2).isChecked())
+        self.assertTrue(dialog.source_table.cellWidget(0, 3).isChecked())
+        self.assertTrue(dialog.source_table.cellWidget(0, 4).isChecked())
+
+    def test_toggling_a_checkbox_updates_the_working_copy_only_after_save(self):
+        dialog = self.dialog()
+        dialog.source_table.cellWidget(0, 2).setChecked(False)
+        self.assertIn(RULE_ALL, self.window.translation_sources.find("google").rules)
+        dialog.apply_settings()
+        self.assertNotIn(RULE_ALL, self.window.translation_sources.find("google").rules)
+
+    def test_move_buttons_reorder_the_list(self):
+        dialog = self.dialog()
+        dialog.source_table.selectRow(2)          # tencent
+        dialog.move_up_button.click()
+        dialog.apply_settings()
+        self.assertEqual(
+            [e.source_id for e in self.window.translation_sources.entries][:3],
+            ["google", "tencent", "microsoft"],
+        )
+
+    def test_free_source_shows_read_only_builtin_limits(self):
+        dialog = self.dialog()
+        dialog.source_table.selectRow(0)          # google
+        self.assertTrue(dialog.is_field_visible("source_builtin"))
+        self.assertFalse(dialog.is_field_visible("source_concurrency"))
+        self.assertFalse(dialog.is_field_visible("source_interval"))
+        self.assertFalse(dialog.is_field_visible("source_type"))
+        self.assertFalse(dialog.is_field_visible("source_api_key"))
+        self.assertIn("0.3", dialog.source_builtin_label.text())
+
+    def test_ai_source_shows_editable_settings(self):
+        dialog = self.dialog()
+        entry = SourceEntry(kind="ai", name="我的 GPT", api_type="openai", rules=[RULE_SELECTION],
+                            api_key="sk-x", base_url="https://x.test/v1", model="gpt-4o-mini",
+                            concurrency=4, interval=0.5)
+        dialog.sources.add_ai(entry, source_id="ai:test1")
+        dialog.refresh_source_table(select_id="ai:test1")
+        self.assertFalse(dialog.is_field_visible("source_builtin"))
+        self.assertTrue(dialog.is_field_visible("source_type"))
+        self.assertTrue(dialog.is_field_visible("source_api_key"))
+        self.assertTrue(dialog.is_field_visible("source_model"))
+        self.assertTrue(dialog.is_field_visible("source_concurrency"))
+        self.assertTrue(dialog.is_field_visible("source_interval"))
+        self.assertEqual(dialog.source_api_key_input.text(), "sk-x")
+        self.assertEqual(dialog.source_concurrency_input.value(), 4)
+        self.assertEqual(dialog.source_interval_input.value(), 0.5)
+
+    def test_ai_settings_are_saved_per_source(self):
+        dialog = self.dialog()
+        first = SourceEntry(kind="ai", name="A", api_type="openai", rules=[RULE_SELECTION], api_key="key-a")
+        second = SourceEntry(kind="ai", name="B", api_type="claude", rules=[RULE_SELECTION], api_key="key-b")
+        dialog.sources.add_ai(first, source_id="ai:a")
+        dialog.sources.add_ai(second, source_id="ai:b")
+        dialog.refresh_source_table(select_id="ai:a")
+        dialog.source_api_key_input.setText("key-a2")
+        dialog.refresh_source_table(select_id="ai:b")
+        self.assertEqual(dialog.source_api_key_input.text(), "key-b")
+        dialog.refresh_source_table(select_id="ai:a")
+        self.assertEqual(dialog.source_api_key_input.text(), "key-a2")
+
+    def test_remove_button_drops_the_selected_ai_source(self):
+        dialog = self.dialog()
+        entry = SourceEntry(kind="ai", name="临时", api_type="openai", rules=[RULE_SELECTION])
+        dialog.sources.add_ai(entry, source_id="ai:gone")
+        dialog.refresh_source_table(select_id="ai:gone")
+        with unittest.mock.patch("main.QMessageBox.question", return_value=QMessageBox.Yes):
+            dialog.remove_source_button.click()
+        self.assertIsNone(dialog.sources.find("ai:gone"))
+
+    def test_remove_button_refuses_to_drop_builtin_sources(self):
+        dialog = self.dialog()
+        dialog.source_table.selectRow(0)
+        dialog.remove_source_button.click()
+        self.assertIsNotNone(dialog.sources.find("google"))
+
+    def test_add_ai_dialog_collects_every_field(self):
+        window = self.window
+        dialog = AiSourceDialog(window, window)
+        dialog.name_input.setText("我的 Claude")
+        dialog.type_combo.setCurrentIndex(AI_TYPE_KEYS.index("claude"))
+        dialog.base_url_input.setText("https://api.test/v1")
+        dialog.api_key_input.setText("sk-secret")
+        dialog.model_input.setText("claude-3-5")
+        dialog.concurrency_input.setValue(3)
+        dialog.interval_input.setValue(0.4)
+        values = dialog.values()
+        self.assertEqual(values["name"], "我的 Claude")
+        self.assertEqual(values["api_type"], "claude")
+        self.assertEqual(values["base_url"], "https://api.test/v1")
+        self.assertEqual(values["api_key"], "sk-secret")
+        self.assertEqual(values["model"], "claude-3-5")
+        self.assertEqual(values["concurrency"], 3)
+        self.assertEqual(values["interval"], 0.4)
+
+    def test_api_key_field_is_a_password_box(self):
+        dialog = AiSourceDialog(self.window, self.window)
+        self.assertEqual(dialog.api_key_input.echoMode(), QLineEdit.Password)
+
+    def test_add_ai_source_warns_on_duplicate_name(self):
+        dialog = self.dialog()
+        dialog.sources.add_ai(SourceEntry(kind="ai", name="重复", api_type="openai"), source_id="ai:dup")
+        fake = unittest.mock.MagicMock()
+        fake.exec.return_value = QDialog.Accepted
+        fake.values.return_value = {
+            "name": "重复", "api_type": "openai", "base_url": "", "api_key": "",
+            "model": "", "concurrency": 1, "interval": 0.0,
+        }
+        dialog.ai_dialog_class = lambda *a, **k: fake
+        with unittest.mock.patch("main.QMessageBox.question", return_value=QMessageBox.No) as asked:
+            dialog.add_ai_source_button.click()
+        self.assertTrue(asked.called)
+        self.assertEqual(len([e for e in dialog.sources.entries if e.is_ai]), 1)
+
+    def test_char_budget_and_timeout_still_present(self):
+        dialog = self.dialog()
+        self.assertEqual(dialog.char_budget_input.minimum(), MIN_CHAR_BUDGET)
+        self.assertTrue(dialog.char_budget_input.toolTip())
+        self.assertTrue(dialog.is_field_visible("timeout"))
+        self.assertFalse(hasattr(dialog, "parallel_batches_input"))
+
+    def test_preset_widgets_are_gone(self):
+        # 决定 26：预设功能整个删掉。
+        dialog = self.dialog()
+        for name in ("preset_combo", "preset_name_input", "dirty_indicator_label",
+                     "save_preset_button", "delete_preset_button",
+                     "refresh_presets", "save_preset", "auto_load_preset"):
+            self.assertFalse(hasattr(dialog, name), name)
+        self.assertFalse(dialog.is_field_visible("preset"))
+
+    def test_cancel_dialog_does_not_persist_source_edits(self):
+        dialog = self.dialog()
+        dialog.source_table.cellWidget(0, 2).setChecked(False)
+        dialog.source_table.cellWidget(0, 3).setChecked(False)
+        dialog.reject()
+        self.assertIn(RULE_ALL, self.window.translation_sources.find("google").rules)
+
+    def test_legacy_settings_are_purged_on_first_run(self):
+        self.settings.setValue("provider_settings/microsoft/api_key", "old-secret")
+        self.settings.setValue("translation_provider", "microsoft")
+        self.settings.setValue("translation_sources_json", "")
+        self.settings.sync()
+        window = DayzTranslateTool(settings=self.settings)
+        self.assertFalse(self.settings.contains("provider_settings/microsoft/api_key"))
+        self.assertFalse(self.settings.contains("translation_provider"))
+        self.assertTrue(self.settings.value("translation_sources_json", ""))
+        window.close()
+
+    def test_source_list_survives_a_restart(self):
+        for _ in range(5):
+            self.window.translation_sources.move_up("mymemory")
+        self.window.save_translation_settings()
+        window = DayzTranslateTool(settings=self.settings)
+        self.assertEqual(
+            [e.source_id for e in window.translation_sources.entries][:2],
+            ["mymemory", "google"],
+        )
+        window.close()
+
+
+class TranslationRuleWiringTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.NamedTemporaryFile(suffix=".ini", delete=False)
+        self.temp.close()
+        self.settings = QSettings(self.temp.name, QSettings.IniFormat)
+        self.window = DayzTranslateTool(settings=self.settings)
+        # `_ensure_dayz_table` 是 MainGuiTests 自己的方法，主窗口没有 —— 这里内联同一段建表逻辑
+        self.window.headers = list(DAYZ_HEADERS)
+        sample = [
+            ["STR_A", "OrigA", "EngA"] + [""] * (len(DAYZ_HEADERS) - 3),
+            ["STR_B", "OrigB", "EngB"] + [""] * (len(DAYZ_HEADERS) - 3),
+        ]
+        self.window.apply_table_rows(sample, dirty=False)
+        if self.window.current_path is None:
+            self.window.current_path = Path("stringtable.csv")
+            self.window.update_current_file_label()
+
+    def tearDown(self):
+        # 假 worker 不会自己结束线程，先把线程停掉再关窗，否则 closeEvent 会弹「翻译中」确认框
+        self.window._ensure_translation_stopped()
+        self.window.close()
+        os.unlink(self.temp.name)
+
+    def fake_worker(self, box):
+        """装一个假 worker 并把收到的 configs 存进 box。
+
+        `start_translation_worker` 会调 `moveToThread` / `run` / `deleteLater` /
+        `cancel`，所以桩必须把这四个都实现掉 —— 返回普通 `object()` 会
+        `AttributeError`。
+        """
+
+        class FakeSignal:
+            def __init__(self):
+                self.callbacks = []
+
+            def connect(self, callback):
+                self.callbacks.append(callback)
+
+        class FakeWorker:
+            def __init__(self):
+                self.progress = FakeSignal()
+                self.retrying = FakeSignal()
+                self.fallback = FakeSignal()
+                self.finished = FakeSignal()
+                self.failed = FakeSignal()
+                self.cancelled = False
+
+            def moveToThread(self, thread):
+                self.thread = thread
+
+            def run(self):
+                pass
+
+            def deleteLater(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+        worker = FakeWorker()
+
+        def factory(jobs, configs):
+            box["configs"] = configs
+            return worker
+
+        self.window.create_translation_worker = factory
+        return worker
+
+    def test_all_cells_uses_only_sources_enabled_for_all(self):
+        seen = {}
+        self.fake_worker(seen)
+        self.window.translate_all_cells()
+        self.assertEqual([c.provider for c in seen["configs"]], ["google", "microsoft", "tencent"])
+
+    def test_selection_rule_includes_single_item_sources(self):
+        seen = {}
+        self.fake_worker(seen)
+        self.window.table.selectRow(0)
+        self.window.translate_selected_rows()
+        self.assertIn("mymemory", [c.provider for c in seen["configs"]])
+
+    def test_empty_rule_uses_only_sources_enabled_for_empty(self):
+        seen = {}
+        self.fake_worker(seen)
+        self.window.translate_empty_cells()
+        self.assertEqual([c.provider for c in seen["configs"]], ["google", "microsoft", "tencent"])
+
+    def test_missing_rule_reports_an_error_instead_of_silently_using_other_sources(self):
+        self.window.translation_sources.set_rule("google", RULE_ALL, False)
+        self.window.translation_sources.set_rule("microsoft", RULE_ALL, False)
+        self.window.translation_sources.set_rule("tencent", RULE_ALL, False)
+        with unittest.mock.patch("main.QMessageBox.warning") as warned:
+            self.window.translate_all_cells()
+        self.assertTrue(warned.called)
+
+    def test_free_source_concurrency_and_interval_come_from_the_spec(self):
+        configs = self.window.build_translation_configs(RULE_ALL)
+        by_provider = {c.provider: c for c in configs}
+        self.assertEqual(by_provider["microsoft"].parallel_batches, 2)
+        self.assertEqual(by_provider["microsoft"].min_interval, 0.1)
+        self.assertEqual(by_provider["tencent"].min_interval, 0.3)
+
+    def test_ai_source_config_uses_its_own_concurrency_and_interval(self):
+        entry = SourceEntry(kind="ai", name="我的 GPT", api_type="openai", rules=[RULE_SELECTION],
+                            api_key="sk-x", model="gpt-4o-mini", concurrency=5, interval=0.7)
+        self.window.translation_sources.add_ai(entry, source_id="ai:x")
+        configs = self.window.build_translation_configs(RULE_SELECTION)
+        ai = [c for c in configs if c.provider == "openai"][0]
+        self.assertEqual(ai.parallel_batches, 5)
+        self.assertEqual(ai.min_interval, 0.7)
+        self.assertEqual(ai.label, "我的 GPT")
+
+    def test_ai_source_config_carries_the_glossary(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # 用临时词库文件，避免读到用户本机已存在的词条
+            self.window.wordbook_window = WordbookWindow(self.window, wordbook_path=Path(tmp_dir) / "wordbook.csv")
+            self.window.wordbook_window.set_cell_text(0, 1, "Knife")     # 列 1 = english，不是列 0（列 0 是 original）
+            self.window.wordbook_window.set_cell_text(0, 3, "Messer")
+            entry = SourceEntry(kind="ai", name="我的 GPT", api_type="openai", rules=[RULE_SELECTION], api_key="sk-x")
+            self.window.translation_sources.add_ai(entry, source_id="ai:g")
+            configs = self.window.build_translation_configs(RULE_SELECTION)
+            ai = [c for c in configs if c.provider == "openai"][0]
+            self.assertEqual(ai.glossary, [{"english": "Knife", "german": "Messer"}])
+
+    def test_free_source_config_has_no_glossary(self):
+        configs = self.window.build_translation_configs(RULE_ALL)
+        for config in configs:
+            self.assertEqual(config.glossary, [])
+
+    def test_fallback_signal_writes_the_status_bar(self):
+        worker = self.fake_worker({})
+        self.window.table.selectRow(0)
+        self.window.translate_selected_rows()
+        worker.fallback.callbacks[0]("微软翻译", "Google")
+        self.assertIn("微软翻译", self.window.statusBar().currentMessage())
+        self.assertIn("Google", self.window.statusBar().currentMessage())
+
+    def test_worker_gets_a_config_list_not_a_single_config(self):
+        seen = {}
+        self.fake_worker(seen)
+        self.window.table.selectRow(0)
+        self.window.translate_selected_rows()
+        self.assertIsInstance(seen["configs"], list)
+        self.assertTrue(seen["configs"])
+
+    def test_retry_failed_cells_reuses_the_last_rule(self):
+        self.window._translation_failed_cells = {(0, 1)}
+        self.window._translation_rule = RULE_SELECTION
+        seen = {}
+        self.fake_worker(seen)
+        self.window.retry_failed_cells()
+        self.assertIn("mymemory", [c.provider for c in seen["configs"]])
 
 
 if __name__ == "__main__":
