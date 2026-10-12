@@ -1,5 +1,6 @@
 import json
 import random
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -8,12 +9,20 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import mktime_tz, parsedate_tz
 
+# —— 自适应并发（决定 4 / 16 / 22）——
+DEFAULT_AUTO_CONCURRENCY = 2        # 自动模式起始并发
+MIN_AUTO_CONCURRENCY = 1
+MAX_AUTO_CONCURRENCY = 8            # 自动模式上限旋钮的取值上限
+RECOVER_AFTER_SUCCESSES = 8         # 连续成功多少次后并发 +1
+
 # —— 限速与重试（决定 9 / 12 / 14）——
+GOOGLE_MIN_INTERVAL = 3.0           # 谷歌免费接口：两次请求最小间隔（约 20 请求/分钟）
 RETRY_MAX_ATTEMPTS = 5
 RETRY_BASE_DELAY = 2.0
 RETRY_MAX_DELAY = 60.0
 RETRYABLE_STATUS = frozenset({408, 409, 413, 429, 500, 502, 503, 504})
 FATAL_STATUS = frozenset({400, 401, 403, 404, 422})
+RATE_LIMIT_STATUS = frozenset({429, 503})   # 命中即让自适应闸门减半
 
 
 class TranslationCancelled(Exception):
@@ -128,6 +137,74 @@ def retry_call(func, policy=None, should_cancel=None, on_retry=None, before_atte
     raise last_error
 
 
+class RateLimiter:
+    """全局最小请求间隔。线程安全，纯标准库（决定 12）。"""
+
+    def __init__(self, min_interval=0.0):
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+        self.min_interval = float(min_interval)
+
+    def set_interval(self, seconds):
+        with self._lock:
+            self.min_interval = max(0.0, float(seconds))
+
+    def acquire(self, should_cancel=None):
+        with self._lock:
+            now = time.monotonic()
+            wait = max(0.0, self._next_allowed - now)
+            self._next_allowed = max(now, self._next_allowed) + self.min_interval
+        if wait > 0:
+            interruptible_sleep(wait, should_cancel)
+
+
+class AdaptiveGate:
+    """动态并发闸门：撞到限速立刻减半，连续平稳若干次后 +1（决定 16）。"""
+
+    def __init__(self, initial=DEFAULT_AUTO_CONCURRENCY, minimum=MIN_AUTO_CONCURRENCY,
+                 maximum=MAX_AUTO_CONCURRENCY, recover_after=RECOVER_AFTER_SUCCESSES):
+        self._cond = threading.Condition()
+        self._minimum = max(1, int(minimum))
+        self._maximum = max(self._minimum, int(maximum))
+        self._limit = min(max(int(initial), self._minimum), self._maximum)
+        self._active = 0
+        self._streak = 0
+        self._recover_after = max(1, int(recover_after))
+
+    @property
+    def limit(self):
+        with self._cond:
+            return self._limit
+
+    @property
+    def active(self):
+        with self._cond:
+            return self._active
+
+    def acquire(self, should_cancel=None):
+        with self._cond:
+            # 只在「真的被挡住」时查取消：调用方在提交每个批次之前已经查过一次，
+            # 这里再查一遍纯属多余，且会把「取消检查次数」这种脆弱断言弄乱。
+            while self._active >= self._limit:
+                if should_cancel and should_cancel():
+                    raise TranslationCancelled()
+                self._cond.wait(0.2)
+            self._active += 1
+
+    def release(self, rate_limited=False):
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            if rate_limited:
+                self._limit = max(self._minimum, self._limit // 2)
+                self._streak = 0
+            else:
+                self._streak += 1
+                if self._streak >= self._recover_after and self._limit < self._maximum:
+                    self._limit += 1
+                    self._streak = 0
+            self._cond.notify_all()
+
+
 @dataclass(frozen=True)
 class TranslationJob:
     row: int
@@ -149,6 +226,7 @@ class TranslatorConfig:
     base_url: str = ""
     timeout: float = 60.0
     glossary: list = field(default_factory=list)
+    auto_concurrency: bool = True
 
 
 @dataclass
@@ -172,6 +250,8 @@ class TranslationService:
         self.should_cancel = should_cancel
         self.retry_policy = RetryPolicy()
         self.on_retry = None
+        self.rate_limiter = None
+        self.gate = None
         self.openai_translator_class = OpenAICompatibleTranslator
         self.google_translator_class = GoogleTranslateTranslator
         self.claude_translator_class = ClaudeMessagesTranslator
@@ -188,6 +268,7 @@ class TranslationService:
                 should_cancel=self.should_cancel,
                 retry_policy=self.retry_policy,
                 on_retry=self.on_retry,
+                before_attempt=self._throttle,
             )
         if provider == "mymemory":
             from deep_translator import MyMemoryTranslator
@@ -216,6 +297,7 @@ class TranslationService:
                 should_cancel=self.should_cancel,
                 retry_policy=self.retry_policy,
                 on_retry=self.on_retry,
+                before_attempt=self._throttle,
             )
         if provider == "claude":
             return self.claude_translator_class(
@@ -229,6 +311,7 @@ class TranslationService:
                 should_cancel=self.should_cancel,
                 retry_policy=self.retry_policy,
                 on_retry=self.on_retry,
+                before_attempt=self._throttle,
             )
         if provider == "codex":
             return self.codex_translator_class(
@@ -242,6 +325,7 @@ class TranslationService:
                 should_cancel=self.should_cancel,
                 retry_policy=self.retry_policy,
                 on_retry=self.on_retry,
+                before_attempt=self._throttle,
             )
         raise ValueError(f'Unsupported translation provider "{config.provider}".')
 
@@ -254,6 +338,19 @@ class TranslationService:
         self.cache_namespace = self._cache_namespace(config)
         previous_cancel = self.should_cancel
         self.should_cancel = should_cancel
+        # 谷歌免费接口按 IP 限「短时间发太密」，与 AI 的 token 配额是两套规则（决定 1 / 12）
+        self.rate_limiter = RateLimiter(GOOGLE_MIN_INTERVAL if provider == "google" else 0.0)
+        # 自动模式的并发上限 = 用户设的并发数（决定 22）。
+        # 关掉自动时闸门为 None，并发完全由线程池大小决定。
+        ceiling = max(MIN_AUTO_CONCURRENCY, int(config.parallel_batches or MIN_AUTO_CONCURRENCY))
+        if config.auto_concurrency:
+            self.gate = AdaptiveGate(
+                initial=min(DEFAULT_AUTO_CONCURRENCY, ceiling),
+                minimum=MIN_AUTO_CONCURRENCY,
+                maximum=ceiling,
+            )
+        else:
+            self.gate = None
         try:
             if provider in ("openai", "claude", "codex"):
                 return self._translate_openai_jobs(jobs, config, results, progress_callback, should_cancel)
@@ -273,6 +370,31 @@ class TranslationService:
             return results
         finally:
             self.should_cancel = previous_cancel
+            self.rate_limiter = None
+            self.gate = None
+
+    def _throttle(self):
+        """每次 HTTP 尝试（含重试）之前调用：全局限速（决定 12）。"""
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire(self.should_cancel)
+
+    def _guarded(self, func, *args, **kwargs):
+        """把一个批次的执行包在自适应闸门里，并把限速信号回传给闸门。
+
+        func 抛 TranslationRequestError 时必须继续向外抛（调用方负责吞），
+        否则闸门永远收不到「被限速了」这个信号 —— 降速功能就是死的。
+        """
+        if self.gate is not None:
+            self.gate.acquire(self.should_cancel)
+        rate_limited = False
+        try:
+            return func(*args, **kwargs)
+        except TranslationRequestError as exc:
+            rate_limited = exc.status in RATE_LIMIT_STATUS
+            raise
+        finally:
+            if self.gate is not None:
+                self.gate.release(rate_limited=rate_limited)
 
     def _translate_openai_jobs(self, jobs, config, results, progress_callback=None, should_cancel=None):
         provider = normalize_provider(config.provider)
@@ -289,19 +411,27 @@ class TranslationService:
                 for batch in batches:
                     if should_cancel and should_cancel():
                         break
-                    self._translate_one_openai_batch(translator, batch, results, provider)
+                    try:
+                        self._guarded(self._translate_one_openai_batch, translator, batch, results, provider)
+                    except TranslationRequestError:
+                        pass          # 批内已记失败，闸门已收到限速信号
                     if progress_callback:
                         progress_callback(results)
             else:
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(self._translate_one_openai_batch, translator, batch, results, provider): batch for batch in batches}
+                    futures = {
+                        executor.submit(self._guarded, self._translate_one_openai_batch,
+                                        translator, batch, results, provider): batch
+                        for batch in batches
+                    }
                     for future in as_completed(futures):
-                        batch = futures[future]
                         try:
                             future.result()
                         except TranslationCancelled:
                             executor.shutdown(wait=False, cancel_futures=True)
                             raise
+                        except TranslationRequestError:
+                            pass
                         if progress_callback:
                             progress_callback(results)
                         if should_cancel and should_cancel():
@@ -351,7 +481,10 @@ class TranslationService:
         max_workers = max(1, int(config.parallel_batches or 1))
         if max_workers == 1 or len(batches) == 1:
             for batch_jobs in batches:
-                self._translate_one_row_batch(translator, batch_jobs, provider, source, target, results)
+                try:
+                    self._guarded(self._translate_one_row_batch, translator, batch_jobs, provider, source, target, results)
+                except TranslationRequestError:
+                    pass          # 批内已记失败，闸门已收到限速信号
                 if progress_callback:
                     progress_callback(results)
                 if should_cancel and should_cancel():
@@ -359,14 +492,15 @@ class TranslationService:
             return
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self._translate_one_row_batch, translator, batch_jobs, provider, source, target, results): batch_jobs for batch_jobs in batches}
+            futures = {executor.submit(self._guarded, self._translate_one_row_batch, translator, batch_jobs, provider, source, target, results): batch_jobs for batch_jobs in batches}
             for future in as_completed(futures):
-                batch_jobs = futures[future]
                 try:
                     future.result()
                 except TranslationCancelled:
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise
+                except TranslationRequestError:
+                    pass
                 if progress_callback:
                     progress_callback(results)
                 if should_cancel and should_cancel():
@@ -389,9 +523,12 @@ class TranslationService:
                 translated_texts = translator.translate_batch(texts)
             except TranslationCancelled:
                 raise
+            except TranslationRequestError as exc:
+                self._record_failed_batch(texts, batch_jobs, results, exc)
+                raise                    # 让闸门看到限速信号
             except Exception as exc:
                 self._record_failed_batch(texts, batch_jobs, results, exc)
-                return
+                return                   # 非限速类错误：本批记失败，不打断其它批次
             self._store_batch_results(texts, translated_texts, provider, source, target)
         self._apply_cached_results(provider, source, target, batch_jobs, results)
 
@@ -400,9 +537,12 @@ class TranslationService:
             translated_texts = translator.translate_job_batch(batch)
         except TranslationCancelled:
             raise
+        except TranslationRequestError as exc:
+            self._record_failed_jobs(batch, results, exc)
+            raise                    # 让闸门看到限速信号
         except Exception as exc:
             self._record_failed_jobs(batch, results, exc)
-            return
+            return                   # 非限速类错误：本批记失败，不打断其它批次
         self._store_job_results(batch, translated_texts, results, provider)
 
     def _record_failed_batch(self, batch, group_jobs, results, exc):

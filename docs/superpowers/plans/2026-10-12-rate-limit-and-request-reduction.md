@@ -50,6 +50,8 @@
 | 19 | **P1** 决定 22 把 `translation_parallel_batches` 默认值从 1 改成 3，会让既有测试 `test_default_translation_provider_is_google`（`test_main_gui.py:121`）直接挂，而上一版未列入同步修改表 | 已列入同步表 |
 | 20 | **P2** 上一版给 `main.py` 写了「旧值 < `MIN_CHAR_BUDGET` 就迁移成默认值」的钳制，与 `test_translation_settings_loads_full_preset`（存 12 断言 12）直接矛盾 | 去掉读取端钳制，`MIN_CHAR_BUDGET` 改作 UI 下限；迁移只认旧键 `batch_size` |
 | 21 | **P2** 上一版只列了「同步四处」，漏了对话框侧的 `_read_preset_values` / `_apply_preset_values_to_dialog` / `current_field_values` 三处 —— 只改一半会出现「对话框存 `char_budget`、主窗口读 `batch_size`」的静默不生效 | 改为列出完整八处，并给出统一的旧值迁移规则（Task 7 Step 5） |
+| 22 | **P2** Task 3 的 `AdaptiveGate.acquire` 在拿到名额后多查了一次 `should_cancel()`，使 `test_cancel_stops_before_processing_later_groups`（靠调用次数计数的脆弱断言）从「译了 1 批」变成「一批都没译」而挂 —— 与同步修改表「该测试不用改」矛盾 | 删掉那次多余的检查：调用方在提交每个批次前已经查过，闸门只需在「真的被挡住」时响应取消。既有测试因此不用改 |
+| 23 | **P2** Task 3 的闸门代码读 `config.auto_concurrency`，而该字段是 Task 4 才加进 `TranslatorConfig` 的 —— 单独实施 Task 3 会 `AttributeError` | `auto_concurrency: bool = True` 提前到 Task 3 加；Task 4 只补 `char_budget` 与 `glossary_source_key` |
 
 **行号基准**：本文所有行号是修订当日（2026-10-12）的现状。Task 2 起会在 `translator_service.py` 顶部插入约 130 行，此后行号会漂移 —— **实现时请按符号名定位，行号仅作快速跳转参考**。
 

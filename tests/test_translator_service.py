@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest import mock
 
-from translator_service import GoogleTranslateTranslator, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, parse_retry_after, retry_call, validate_translator_config
+from translator_service import AdaptiveGate, GoogleTranslateTranslator, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, parse_retry_after, retry_call, validate_translator_config
 
 
 class FakeBatchTranslator:
@@ -869,6 +869,185 @@ class RetryCallTests(unittest.TestCase):
 
         self.assertEqual(result, "ok")
         self.assertEqual(state["before"], 3)
+
+
+class RateLimiterTests(unittest.TestCase):
+    def test_first_acquire_does_not_wait(self):
+        limiter = RateLimiter(min_interval=5.0)
+
+        started = time.monotonic()
+        limiter.acquire()
+
+        self.assertLess(time.monotonic() - started, 0.05)
+
+    def test_second_acquire_waits_min_interval(self):
+        limiter = RateLimiter(min_interval=0.3)
+
+        started = time.monotonic()
+        limiter.acquire()
+        limiter.acquire()
+
+        self.assertGreaterEqual(time.monotonic() - started, 0.25)
+
+    def test_acquire_honors_cancel(self):
+        limiter = RateLimiter(min_interval=5.0)
+        limiter.acquire()
+
+        started = time.monotonic()
+        with self.assertRaises(TranslationCancelled):
+            limiter.acquire(should_cancel=lambda: True)
+
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_set_interval_clamps_negative(self):
+        limiter = RateLimiter(min_interval=1.0)
+        limiter.set_interval(-5)
+
+        self.assertEqual(limiter.min_interval, 0.0)
+
+
+class AdaptiveGateTests(unittest.TestCase):
+    def test_limit_halves_on_rate_limit(self):
+        gate = AdaptiveGate(initial=4, minimum=1, maximum=8)
+        self.assertEqual(gate.limit, 4)
+
+        gate.release(rate_limited=True)
+        self.assertEqual(gate.limit, 2)
+        gate.release(rate_limited=True)
+        self.assertEqual(gate.limit, 1)
+        gate.release(rate_limited=True)
+        self.assertEqual(gate.limit, 1)  # 已到下限，不再降
+
+    def test_limit_recovers_after_successes(self):
+        gate = AdaptiveGate(initial=2, minimum=1, maximum=4, recover_after=3)
+
+        for _ in range(3):
+            gate.release()
+        self.assertEqual(gate.limit, 3)
+        for _ in range(3):
+            gate.release()
+        self.assertEqual(gate.limit, 4)
+        for _ in range(3):
+            gate.release()
+        self.assertEqual(gate.limit, 4)  # 已到上限，不再升
+
+    def test_rate_limit_resets_success_streak(self):
+        gate = AdaptiveGate(initial=2, minimum=1, maximum=4, recover_after=3)
+
+        gate.release()
+        gate.release()
+        gate.release(rate_limited=True)  # 降回 1 并清零连胜
+        self.assertEqual(gate.limit, 1)
+
+        gate.release()
+        gate.release()
+        self.assertEqual(gate.limit, 1)  # 还差一次才回升
+
+    def test_initial_is_clamped_into_range(self):
+        self.assertEqual(AdaptiveGate(initial=99, minimum=1, maximum=4).limit, 4)
+        self.assertEqual(AdaptiveGate(initial=0, minimum=1, maximum=4).limit, 1)
+
+    def test_acquire_blocks_beyond_limit(self):
+        gate = AdaptiveGate(initial=1, minimum=1, maximum=1)
+        gate.acquire()
+
+        started = time.monotonic()
+        with self.assertRaises(TranslationCancelled):
+            gate.acquire(should_cancel=lambda: True)
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        gate.release()
+        self.assertEqual(gate.active, 0)
+
+
+class GuardedBatchTests(unittest.TestCase):
+    @staticmethod
+    def _service_with_gate(gate):
+        service = TranslationService()
+        service.gate = gate
+        service.rate_limiter = None
+        return service
+
+    def test_rate_limited_error_halves_gate(self):
+        gate = AdaptiveGate(initial=4, minimum=1, maximum=8)
+        service = self._service_with_gate(gate)
+
+        def boom():
+            raise TranslationRequestError("rate limited", status=429)
+
+        with self.assertRaises(TranslationRequestError):
+            service._guarded(boom)
+
+        self.assertEqual(gate.limit, 2)
+        self.assertEqual(gate.active, 0)
+
+    def test_non_rate_limit_error_does_not_halve_gate(self):
+        gate = AdaptiveGate(initial=4, minimum=1, maximum=8)
+        service = self._service_with_gate(gate)
+
+        def boom():
+            raise TranslationRequestError("bad key", status=401)
+
+        with self.assertRaises(TranslationRequestError):
+            service._guarded(boom)
+
+        self.assertEqual(gate.limit, 4)
+
+    def test_batch_failure_still_counts_jobs_as_failed(self):
+        """限速不该让整次运行看起来像被取消。"""
+
+        class RateLimitedTranslator:
+            def __init__(self, source, target, api_key, model, base_url="", glossary=None,
+                         glossary_source_key="", post_json=None, timeout=60.0, should_cancel=None,
+                         retry_policy=None, on_retry=None, before_attempt=None):
+                pass
+
+            def translate_job_batch(self, batch):
+                raise TranslationRequestError("rate limited", status=429)
+
+        service = TranslationService()
+        service.openai_translator_class = RateLimitedTranslator
+        config = TranslatorConfig(provider="openai", api_key="k", model="m", batch_size=2)
+        jobs = [
+            TranslationJob(0, 0, "Knife", "en", "zh-CN"),
+            TranslationJob(1, 1, "Axe", "en", "zh-CN"),
+        ]
+
+        results = service.translate_jobs(jobs, config)
+
+        self.assertEqual(results.failed, 2)
+        self.assertFalse(results.cancelled)
+
+
+    def test_google_rate_limit_reaches_gate(self):
+        """Google 线路的 429 也必须到达闸门 —— 否则自适应降速对 Google 是死的（修订表问题 18）。"""
+        seen = []
+
+        class RecordingGate(AdaptiveGate):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                seen.append(self)
+
+        class RateLimitedGoogle:
+            def __init__(self, source, target, base_url, timeout, should_cancel=None,
+                         retry_policy=None, on_retry=None, before_attempt=None):
+                pass
+
+            def translate_batch(self, texts):
+                raise TranslationRequestError("rate limited", status=429)
+
+        service = TranslationService()
+        service.google_translator_class = RateLimitedGoogle
+        config = TranslatorConfig(provider="google", parallel_batches=4)
+        jobs = [TranslationJob(0, 0, "Knife", "en", "zh-CN")]
+
+        with mock.patch("translator_service.AdaptiveGate", RecordingGate):
+            results = service.translate_jobs(jobs, config)
+
+        self.assertEqual(results.failed, 1)
+        self.assertFalse(results.cancelled)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].limit, 1)  # initial 2 → 撞 429 → 减半
 
 
 if __name__ == "__main__":
