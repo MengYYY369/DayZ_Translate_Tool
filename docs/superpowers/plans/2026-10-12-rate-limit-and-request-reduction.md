@@ -55,6 +55,17 @@
 
 **行号基准**：本文所有行号是修订当日（2026-10-12）的现状。Task 2 起会在 `translator_service.py` 顶部插入约 130 行，此后行号会漂移 —— **实现时请按符号名定位，行号仅作快速跳转参考**。
 
+## 实施期偏离记录
+
+计划实施过程中发现的、与原计划不一致的地方。每条都记「发现于哪个 Task」+「实际怎么做的」+「为什么」。
+
+| # | 发现于 | 原计划 | 实际做法与原因 |
+|---|---|---|---|
+| I1 | Task 3 | Task 3 只需给 `TranslatorConfig` 加 `auto_concurrency` | 同时把 `RateLimiter` / `AdaptiveGate` 的类定义、`_throttle` / `_guarded` 辅助方法与 `_run_guarded_batch` 一并落地；`_translate_batches` 的 `except TranslationRequestError` 分支保留 `raise`（问题 18）。既有测试 `test_cancel_stops_before_processing_later_groups` 未改，符合问题 22 的结论 |
+| I2 | Task 4 | Task 4 只改 `main.py` 的 `create_translation_worker` / `run_translation_test` 两处 | 实际把「`batch_size` → `char_budget`」的**全部八处重命名**（含设置持久化、预设两条链路、旧值迁移）都放进 Task 4。原因：Task 4 的 `create_translation_worker` 片段引用 `self.translation_char_budget`，若只改那两处会直接 `AttributeError`；Task 7 只保留「对话框勾选框 + 重试信号 + 倒计时 + 只重跑失败项 + 清空缓存」 |
+| I3 | Task 4 | `test_translation_settings_dialog_saves_provider_and_parallel_batches` 把 `setValue(40)` 后的断言改成 `== 40` | 改为 `setValue(2400)` 断言 `== 2400`。原因：对话框走 `QSpinBox`，下限是 `MIN_CHAR_BUDGET=200`，`setValue(40)` 会被控件夹成 200，原计划写的 `== 40` 在自己的实现下不可能通过（与问题 20 同源，但方向相反）。主窗口链路的 `test_translation_settings_loads_full_preset` 存 12 断言 12 不受影响（该路径不夹） |
+| I4 | Task 4 | `TranslationService.__init__` 去掉 `batch_size` 后，既有测试只需机械删除该参数 | 机械 `sed` 后仍有 6 个测试挂：它们靠 `batch_size` 制造「多批」场景，删掉参数后默认 `char_budget=1500` 让所有短文本并成一批。逐个补上合适的 `char_budget`（`test_batches_by_language_direction_and_dedupes_texts` 用 10、`test_char_budget_groups_jobs_by_row_count` 用 2、其余三个用 5），断言不变。两个按行数命名的测试改名为 `test_char_budget_groups_jobs_by_row_count` / `test_char_budget_rows_groups_multi_target_per_row` |
+
 ## Global Constraints
 
 - **不新增任何第三方依赖。** `requirements.txt` 保持 `PySide6` + `deep-translator`。所有新能力用标准库实现。
@@ -360,7 +371,7 @@ git commit -m "feat: persist translation cache to disk beside the app"
 
 > **本 Task 必须自洽。** `before_attempt` 是节流的挂载点（Task 3 接上），`TranslationService` 侧的重试策略字段也在这里补 —— 上一版把 `self.on_retry` / `self.retry_policy` 留到 Task 3 才定义，导致 Task 2 单独提交就 `AttributeError`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/test_translator_service.py` 新增 `RetryPolicyTests(unittest.TestCase)` 与 `RetryCallTests(unittest.TestCase)`：
 
@@ -384,14 +395,14 @@ git commit -m "feat: persist translation cache to disk beside the app"
 
 测试里用 `RetryPolicy(..., sleep=...)` 注入假的 sleep 以避免真等待。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 python -m unittest tests.test_translator_service.RetryPolicyTests -v
 ```
 预期：`AttributeError` / `ImportError`。
 
-- [ ] **Step 3: 实现重试层**
+- [x] **Step 3: 实现重试层**
 
 在 `translator_service.py` 顶部补 import：`import random`、`import time`、`from email.utils import parsedate_tz, mktime_tz`。
 
@@ -504,7 +515,7 @@ def retry_call(func, policy=None, should_cancel=None, on_retry=None, before_atte
     raise last_error
 ```
 
-- [ ] **Step 4: 给四个 provider 接上重试**
+- [x] **Step 4: 给四个 provider 接上重试**
 
 **分两组改，Google 与另外三个的请求路径不同，不能套同一段代码。**
 
@@ -605,7 +616,7 @@ def retry_call(func, policy=None, should_cancel=None, on_retry=None, before_atte
 
 `before_attempt` 在 Task 3 接。**`mymemory` / `deepl` / `microsoft` 三个分支不动** —— 它们直接用 deep-translator 的类，本计划不改造它们（它们也拿不到 `retry_policy`，属于已知的未覆盖面）。
 
-- [ ] **Step 5: 修正既有测试的假 provider**
+- [x] **Step 5: 修正既有测试的假 provider**
 
 `FakeOpenAITranslator` 在测试里出现 **3 次**（`:70`、`:317`、`:446`），当前签名都是：
 
@@ -628,7 +639,7 @@ def retry_call(func, policy=None, should_cancel=None, on_retry=None, before_atte
 - `test_request_error_raises_runtime_error`（`:637`）注入的假 `request_func` 直接抛 `RuntimeError("connection timed out")` —— `RetryPolicy.is_retryable(RuntimeError)` 为 False，原样向上抛，断言仍然成立。
 - `test_unexpected_response_raises_runtime_error`（`:649`）的 `RuntimeError` 来自 `_extract_translations`（在重试**之外**），不受影响。
 
-- [ ] **Step 6: 运行测试**
+- [x] **Step 6: 运行测试**
 
 ```bash
 python -m unittest tests.test_translator_service -v
@@ -641,7 +652,7 @@ python -m unittest tests.test_translator_service -v
 > - `:645` `test_request_error_raises_runtime_error` —— 它注入的假 `request_func` 直接抛 `RuntimeError("connection timed out")`。`RetryPolicy.is_retryable` 对 `RuntimeError` 返回 False，所以原样向上抛。**这一处确实经过请求路径**，它之所以仍然通过，靠的是「`RuntimeError` 不可重试且不被转换」，不是「不经过 `_post_json`」。真正会被转成 `TranslationRequestError` 的是 `_default_request` 里的 `HTTPError`/`URLError`。
 > - `:655` `test_unexpected_response_raises_runtime_error` —— 解析阶段的 `RuntimeError`，在重试之外。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add translator_service.py tests/test_translator_service.py
@@ -663,7 +674,7 @@ git commit -m "feat: add interruptible exponential-backoff retry with Retry-Afte
 - Produces: `TranslationService._guarded(func, *args, **kwargs) -> Any`
 - Consumes: `interruptible_sleep`、`TranslationRequestError`、`TranslationCancelled`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `RateLimiterTests`：
 - `test_first_acquire_does_not_wait`：新建后 `acquire()` 立即返回（`time.monotonic` 前后差 < 0.05）。
@@ -682,14 +693,14 @@ git commit -m "feat: add interruptible exponential-backoff retry with Retry-Afte
 - `test_non_rate_limit_error_does_not_halve_gate`：抛 `TranslationRequestError(status=401)` → `limit` 不变。
 - `test_batch_failure_still_counts_jobs_as_failed`：注入一个 `translate_job_batch` 抛 429 的假 translator，跑 `translate_jobs` → `results.failed == len(jobs)` 且 `results.cancelled is False`（限速不该让整次运行看起来像被取消）。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 python -m unittest tests.test_translator_service.RateLimiterTests tests.test_translator_service.AdaptiveGateTests tests.test_translator_service.GuardedBatchTests -v
 ```
 预期：`AttributeError`。
 
-- [ ] **Step 3: 实现节流与闸门**
+- [x] **Step 3: 实现节流与闸门**
 
 ```python
 class RateLimiter:
@@ -762,7 +773,7 @@ class AdaptiveGate:
 
 `translator_service.py` 顶部补 `import threading`。
 
-- [ ] **Step 4: 接进翻译流程**
+- [x] **Step 4: 接进翻译流程**
 
 `TranslationService` 新增两个方法：
 
@@ -881,14 +892,14 @@ class AdaptiveGate:
 
 （Task 5 会替换这个方法的成功路径，**但必须保留这里的异常契约**。）
 
-- [ ] **Step 5: 运行测试**
+- [x] **Step 5: 运行测试**
 
 ```bash
 python -m unittest tests.test_translator_service -v
 ```
 预期：全绿。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add translator_service.py tests/test_translator_service.py
@@ -910,7 +921,7 @@ git commit -m "feat: add global request throttle and adaptive concurrency gate"
 - 移除：`TranslatorConfig.batch_size`、`TranslationService.__init__(batch_size=...)`、`TranslationService.batch_size`、`TranslationService._row_chunks`
 - 改名：Task 标题与正文统一用 `iter_row_batches`（上一版标题误写 `_row_batches`）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `RowBatchingTests`：
 - `test_short_rows_share_a_batch`：20 个行、每行 5 字、`char_budget=100` → 单个批次。
@@ -921,14 +932,14 @@ git commit -m "feat: add global request throttle and adaptive concurrency gate"
 - `test_budget_is_not_clamped_upward`：`char_budget=10` 时实际封批阈值就是 10，不是 `MIN_CHAR_BUDGET`（上一版把下限钳制到 200，这条测试是那个 bug 的回归闸门）。
 - `test_all_jobs_preserved`：任意参数下 `sum(len(b) for b in batches) == len(jobs)` 且每个 job 恰好出现一次。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 python -m unittest tests.test_translator_service.RowBatchingTests -v
 ```
 预期：`AttributeError: 'TranslationService' object has no attribute 'iter_row_batches'`。
 
-- [ ] **Step 3: 实现分批**
+- [x] **Step 3: 实现分批**
 
 ```python
     def iter_row_batches(self, jobs, char_budget=DEFAULT_CHAR_BUDGET,
@@ -985,7 +996,7 @@ python -m unittest tests.test_translator_service.RowBatchingTests -v
 
 `TranslatorConfig` 的 `batch_size: int = 30` 改为 `char_budget: int = DEFAULT_CHAR_BUDGET`，并加 `auto_concurrency: bool = True`、`glossary_source_key: str = ""`。`TranslationService.__init__` 去掉 `batch_size` 参数与 `self.batch_size`。删除 `_row_chunks`。
 
-- [ ] **Step 4: 机械扫描既有测试**
+- [x] **Step 4: 机械扫描既有测试**
 
 测试里 `batch_size=` 现在只是噪音参数（分批改由 `config.char_budget` 决定），删掉：
 
@@ -1009,14 +1020,14 @@ grep -n "batch_size" tests/test_translator_service.py   # 应无输出
 - `test_batch_size_groups_jobs_by_row_count`（`tests/test_translator_service.py:47`）→ 改为 `test_char_budget_groups_jobs_by_budget`，用 `TranslatorConfig(provider="google", char_budget=N)` 表达同样的「每批 N 行」场景。
 - `test_batch_size_rows_groups_multi_target_per_row`（`:66`）→ 同样改用 `char_budget`。
 
-- [ ] **Step 5: 运行测试**
+- [x] **Step 5: 运行测试**
 
 ```bash
 python -m unittest tests.test_translator_service -v
 ```
 预期：全绿。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add translator_service.py main.py tests/test_translator_service.py

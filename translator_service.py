@@ -9,6 +9,12 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import mktime_tz, parsedate_tz
 
+# —— 分批（决定 5 / 19 / 20）——
+DEFAULT_CHAR_BUDGET = 1500          # 每批源文字数预算默认值
+MAX_CHAR_BUDGET = 100000            # 「每批最多字数」旋钮上限
+MIN_CHAR_BUDGET = 200               # 仅用于「旧值迁移」判定，不参与分批钳制
+DEFAULT_OUTPUT_CHAR_CAP = 16000     # 单批预估产出字符上限（≈ 8000 token）
+
 # —— 自适应并发（决定 4 / 16 / 22）——
 DEFAULT_AUTO_CONCURRENCY = 2        # 自动模式起始并发
 MIN_AUTO_CONCURRENCY = 1
@@ -217,7 +223,7 @@ class TranslationJob:
 @dataclass(frozen=True)
 class TranslatorConfig:
     provider: str = "google"
-    batch_size: int = 30
+    char_budget: int = DEFAULT_CHAR_BUDGET
     parallel_batches: int = 1
     api_key: str = ""
     region: str = ""
@@ -226,6 +232,7 @@ class TranslatorConfig:
     base_url: str = ""
     timeout: float = 60.0
     glossary: list = field(default_factory=list)
+    glossary_source_key: str = ""
     auto_concurrency: bool = True
 
 
@@ -241,9 +248,8 @@ class TranslationResults:
 
 
 class TranslationService:
-    def __init__(self, provider_factory=None, batch_size=30, should_cancel=None, cache=None):
+    def __init__(self, provider_factory=None, should_cancel=None, cache=None):
         self.provider_factory = provider_factory or self.create_provider
-        self.batch_size = batch_size
         # cache 允许外部注入：多次翻译运行共享同一个字典即可复用相同内容的翻译结果
         self.cache = cache if cache is not None else {}
         self.cache_namespace = ""
@@ -402,7 +408,7 @@ class TranslationService:
         if not jobs:
             return results
         translator = self._create_provider("auto", "multi", config)
-        batches = list(self._row_chunks(jobs))
+        batches = list(self.iter_row_batches(jobs, config.char_budget, DEFAULT_OUTPUT_CHAR_CAP))
         if not batches:
             return results
         max_workers = max(1, int(config.parallel_batches or 1))
@@ -458,15 +464,49 @@ class TranslationService:
             grouped.setdefault((job.source_code, job.target_code), []).append(job)
         return grouped
 
-    def _row_chunks(self, jobs):
-        """按 job.row 分批，每批包含 batch_size 个不同行的 job。"""
+    def iter_row_batches(self, jobs, char_budget=DEFAULT_CHAR_BUDGET,
+                         output_char_cap=DEFAULT_OUTPUT_CHAR_CAP):
+        """按行累积、按字数预算封批。行永不被劈开。
+
+        形状参照 bilingual_book_maker 的 _assign_batch_indexes
+        （book_maker/loader/epub_loader.py:3143-3160）：累到预算就封批，
+        超长条目单独成批，不拖累下一条。
+        """
         if not jobs:
             return
-        unique_rows = sorted(set(job.row for job in jobs))
-        size = max(1, self.batch_size)
-        for index in range(0, len(unique_rows), size):
-            batch_rows = set(unique_rows[index:index + size])
-            yield [job for job in jobs if job.row in batch_rows]
+        # 只防零，不做下限钳制 —— 下限钳制会让「传 10」变成 200，测试与实现互相矛盾。
+        budget = max(1, int(char_budget or DEFAULT_CHAR_BUDGET))
+        cap = max(1, int(output_char_cap or DEFAULT_OUTPUT_CHAR_CAP))
+
+        by_row = {}
+        for job in jobs:
+            by_row.setdefault(job.row, []).append(job)
+
+        batch = []
+        batch_chars = 0
+        batch_cost = 0
+        for row in sorted(by_row):
+            row_jobs = by_row[row]
+            # 同一行共享同一句原文，源文字数按最长的那条算
+            row_chars = max(len(job.text) for job in row_jobs)
+            # 预估产出量：源文字数 × 目标语言数（同一目标语言只算一次）
+            targets = {(job.source_code, job.target_code) for job in row_jobs}
+            row_cost = row_chars * max(1, len(targets))
+
+            if batch and (batch_chars + row_chars > budget or batch_cost + row_cost > cap):
+                yield batch
+                batch, batch_chars, batch_cost = [], 0, 0
+
+            batch.extend(row_jobs)
+            batch_chars += row_chars
+            batch_cost += row_cost
+
+            if row_chars > budget or row_cost > cap:
+                yield batch
+                batch, batch_chars, batch_cost = [], 0, 0
+
+        if batch:
+            yield batch
 
     def _create_provider(self, source, target, config):
         try:
@@ -475,7 +515,7 @@ class TranslationService:
             return self.provider_factory(source, target)
 
     def _translate_batches(self, translator, group_jobs, config, provider, source, target, results, progress_callback=None, should_cancel=None):
-        batches = list(self._row_chunks(group_jobs))
+        batches = list(self.iter_row_batches(group_jobs, config.char_budget, DEFAULT_OUTPUT_CHAR_CAP))
         if not batches:
             return
         max_workers = max(1, int(config.parallel_batches or 1))

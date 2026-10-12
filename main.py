@@ -43,7 +43,7 @@ from dayz_csv import (
 )
 from translation_cache import TranslationCacheStore
 from translation_worker import TranslationWorker
-from translator_service import TranslationJob, TranslationService, TranslatorConfig, normalize_provider, validate_translator_config
+from translator_service import DEFAULT_CHAR_BUDGET, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationJob, TranslationService, TranslatorConfig, normalize_provider, validate_translator_config
 from wordbook_csv import WORDBOOK_HEADERS, load_wordbook_csv, wordbook_rows_for_save, write_wordbook_csv
 from table_history import TableHistory, snapshot_table, restore_table
 
@@ -92,9 +92,9 @@ UI_TEXT = {
         "test_translation_running": "Testing...",
         "translation_engine": "Translation Engine",
         "preset": "Preset",
-        "batch_size": "Rows Per Batch",
+        "char_budget": "Max chars per batch",
         "parallel_batches": "Parallel Batches",
-        "batch_size_tooltip": "Number of rows translated per batch. Each batch groups N rows of cells into one API request. Larger = fewer requests but slower per request.",
+        "char_budget_tooltip": "Source characters a single request may carry. Rows are never split across requests. Larger = fewer requests but a bigger loss if one fails.",
         "parallel_batches_tooltip": "Number of batches processed concurrently. Larger = faster but may hit API rate limits.",
         "timeout": "Timeout (s)",
         "language": "Language",
@@ -186,9 +186,9 @@ UI_TEXT = {
         "test_translation_running": "正在测试...",
         "translation_engine": "翻译引擎",
         "preset": "预设",
-        "batch_size": "每批次行数",
+        "char_budget": "每批最多字数",
         "parallel_batches": "并行批次",
-        "batch_size_tooltip": "每批次翻译的行数。每批将 N 行的单元格合并为一次 API 请求。越大请求数越少但单次请求越慢。",
+        "char_budget_tooltip": "单次请求最多携带的源文字数。行不会被拆到两个请求里。越大请求越少，但单次失败的代价也越大。",
         "parallel_batches_tooltip": "同时进行的批次数（并发请求数）。越大翻译越快但可能触发 API 限流。",
         "timeout": "超时 (s)",
         "language": "语言",
@@ -462,9 +462,10 @@ class TranslationSettingsDialog(QDialog):
         self.delete_preset_button = QPushButton(window.tr("delete"), self)
         self.delete_preset_button.clicked.connect(self.delete_preset)
 
-        self.batch_size_input = QSpinBox(self)
-        self.batch_size_input.setRange(1, 200)
-        self.batch_size_input.setValue(window.translation_batch_size)
+        self.char_budget_input = QSpinBox(self)
+        self.char_budget_input.setRange(MIN_CHAR_BUDGET, MAX_CHAR_BUDGET)
+        self.char_budget_input.setSingleStep(100)
+        self.char_budget_input.setValue(window.translation_char_budget)
 
         self.parallel_batches_input = QSpinBox(self)
         self.parallel_batches_input.setRange(1, 5)
@@ -501,7 +502,7 @@ class TranslationSettingsDialog(QDialog):
         form.addRow(preset_label, preset_layout)
         self.form_rows["preset"] = (preset_label, self._layout_widgets(preset_layout))
         self.add_form_row(form, "provider", window.tr("translation_engine"), self.provider_combo)
-        self.add_form_row(form, "batch_size", window.tr("batch_size"), self.batch_size_input, window.tr("batch_size_tooltip"))
+        self.add_form_row(form, "char_budget", window.tr("char_budget"), self.char_budget_input, window.tr("char_budget_tooltip"))
         self.add_form_row(form, "parallel_batches", window.tr("parallel_batches"), self.parallel_batches_input, window.tr("parallel_batches_tooltip"))
         self.add_form_row(form, "timeout", window.tr("timeout"), self.timeout_input)
         self.add_form_row(form, "api_key", window.tr("api_key"), self.api_key_input)
@@ -569,7 +570,7 @@ class TranslationSettingsDialog(QDialog):
         return not label.isHidden() and not widget.isHidden()
 
     def connect_auto_save_signals(self):
-        self.batch_size_input.valueChanged.connect(self._on_field_changed)
+        self.char_budget_input.valueChanged.connect(self._on_field_changed)
         self.parallel_batches_input.valueChanged.connect(self._on_field_changed)
         self.timeout_input.valueChanged.connect(self._on_field_changed)
         self.api_key_input.textChanged.connect(self._on_field_changed)
@@ -640,7 +641,7 @@ class TranslationSettingsDialog(QDialog):
         provider_label = self.provider_combo.currentText()
         provider = next(key for key, label in PROVIDER_LABELS.items() if label == provider_label)
         self.window.translation_provider = provider
-        self.window.translation_batch_size = self.batch_size_input.value()
+        self.window.translation_char_budget = self.char_budget_input.value()
         self.window.translation_parallel_batches = self.parallel_batches_input.value()
         self.window.translation_timeout = float(self.timeout_input.value())
         # 保存当前 provider 的对话框字段到 window
@@ -658,7 +659,8 @@ class TranslationSettingsDialog(QDialog):
         provider = next(key for key, label in PROVIDER_LABELS.items() if label == provider_label)
         return TranslatorConfig(
             provider=provider,
-            batch_size=self.batch_size_input.value(),
+            # 测试连接只验证密钥/模型可用，不需要分批，给一个大预算一次问完
+            char_budget=MAX_CHAR_BUDGET,
             parallel_batches=self.parallel_batches_input.value(),
             timeout=float(self.timeout_input.value()),
             api_key=self._get_field_value("api_key"),
@@ -685,7 +687,7 @@ class TranslationSettingsDialog(QDialog):
             TranslationJob(row=0, column=index, text=test_word, source_code="english", target_code=lang)
             for index, lang in enumerate(target_languages)
         ]
-        service = TranslationService(batch_size=len(jobs))
+        service = TranslationService()
         self._test_thread = QThread(self)
         self._test_worker = TranslationWorker(service=service, jobs=jobs, config=config)
         self._test_worker.moveToThread(self._test_thread)
@@ -799,7 +801,7 @@ class TranslationSettingsDialog(QDialog):
         self.refresh_preset_dirty_indicator()
 
     def _read_preset_values(self, name):
-        preset_keys = ["provider", "batch_size", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email"]
+        preset_keys = ["provider", "char_budget", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email", "batch_size"]
         prefix = f"translation_presets/{name}/"
         values = {key: self.window.settings.value(prefix + key, "") for key in preset_keys}
         return values
@@ -807,9 +809,15 @@ class TranslationSettingsDialog(QDialog):
     def _apply_preset_values_to_dialog(self, values):
         provider = normalize_provider(values.get("provider") or "google")
         self.provider_combo.setCurrentText(PROVIDER_LABELS.get(provider, "Google"))
-        batch_size = values.get("batch_size")
-        if batch_size is not None and str(batch_size) != "":
-            self.batch_size_input.setValue(int(batch_size))
+        # 旧键 batch_size 存的是「行数」（默认 30），新键 char_budget 是「字数」。
+        # 旧值 30 落在新区间里，直接拿来用就会被当成「每批 30 个字」—— 一律换成默认值。
+        char_budget = values.get("char_budget")
+        if char_budget is None or str(char_budget) == "":
+            legacy = values.get("batch_size")
+            if legacy is not None and str(legacy) != "":
+                char_budget = DEFAULT_CHAR_BUDGET
+        if char_budget is not None and str(char_budget) != "":
+            self.char_budget_input.setValue(int(char_budget))
         parallel_batches = values.get("parallel_batches")
         if parallel_batches is not None and str(parallel_batches) != "":
             self.parallel_batches_input.setValue(int(parallel_batches))
@@ -830,7 +838,7 @@ class TranslationSettingsDialog(QDialog):
         provider = next(key for key, label in PROVIDER_LABELS.items() if label == provider_label)
         return {
             "provider": provider,
-            "batch_size": self.batch_size_input.value(),
+            "char_budget": self.char_budget_input.value(),
             "parallel_batches": self.parallel_batches_input.value(),
             "timeout": self.timeout_input.value(),
             "api_key": self.api_key_input.text().strip(),
@@ -1287,7 +1295,12 @@ class DayzTranslateTool(QMainWindow):
         self.last_file_directory = self.settings.value("last_file_directory", "")
         self.source_header = self.settings.value("source_header", "english")
         self.translation_provider = normalize_provider(self.settings.value("translation_provider", "google"))
-        self.translation_batch_size = int(self.settings.value("translation_batch_size", 30))
+        self.translation_char_budget = int(
+            self.settings.value("translation_char_budget", DEFAULT_CHAR_BUDGET)
+        )
+        self.translation_auto_concurrency = str(
+            self.settings.value("translation_auto_concurrency", "true")
+        ).lower() in ("true", "1", "yes")
         self.translation_parallel_batches = int(self.settings.value("translation_parallel_batches", 1))
         self.translation_timeout = float(self.settings.value("translation_timeout", 60.0))
         self.provider_settings = self._load_provider_settings()
@@ -1780,7 +1793,8 @@ class DayzTranslateTool(QMainWindow):
 
     def save_translation_settings(self):
         self.settings.setValue("translation_provider", self.translation_provider)
-        self.settings.setValue("translation_batch_size", self.translation_batch_size)
+        self.settings.setValue("translation_char_budget", self.translation_char_budget)
+        self.settings.setValue("translation_auto_concurrency", self.translation_auto_concurrency)
         self.settings.setValue("translation_parallel_batches", self.translation_parallel_batches)
         self.settings.setValue("translation_timeout", self.translation_timeout)
         self._save_provider_settings()
@@ -1792,7 +1806,8 @@ class DayzTranslateTool(QMainWindow):
     def current_translation_settings_dict(self):
         return {
             "provider": self.translation_provider,
-            "batch_size": self.translation_batch_size,
+            "char_budget": self.translation_char_budget,
+            "auto_concurrency": self.translation_auto_concurrency,
             "parallel_batches": self.translation_parallel_batches,
             "timeout": self.translation_timeout,
             "api_key": self.translation_api_key,
@@ -1809,9 +1824,18 @@ class DayzTranslateTool(QMainWindow):
         provider = values.get("provider")
         if provider:
             self.translation_provider = normalize_provider(provider)
-        batch_size = values.get("batch_size")
-        if batch_size is not None and batch_size != "":
-            self.translation_batch_size = int(batch_size)
+        # 旧键 batch_size 存的是「行数」（默认 30），新键 char_budget 是「字数」。
+        # 旧值 30 落在新区间里，直接拿来用就会被当成「每批 30 个字」—— 一律换成默认值。
+        char_budget = values.get("char_budget")
+        if char_budget is None or char_budget == "":
+            legacy = values.get("batch_size")
+            if legacy is not None and legacy != "":
+                char_budget = DEFAULT_CHAR_BUDGET
+        if char_budget is not None and char_budget != "":
+            self.translation_char_budget = int(char_budget)
+        auto_concurrency = values.get("auto_concurrency")
+        if auto_concurrency is not None and auto_concurrency != "":
+            self.translation_auto_concurrency = bool(auto_concurrency)
         parallel_batches = values.get("parallel_batches")
         if parallel_batches is not None and parallel_batches != "":
             self.translation_parallel_batches = int(parallel_batches)
@@ -1854,7 +1878,7 @@ class DayzTranslateTool(QMainWindow):
         name = (name or "").strip()
         if not name:
             return
-        preset_keys = ["provider", "batch_size", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email"]
+        preset_keys = ["provider", "char_budget", "parallel_batches", "timeout", "api_key", "region", "model", "base_url", "email", "batch_size"]
         prefix = f"translation_presets/{name}/"
         # Always include keys so apply overwrites previous provider fields.
         values = {key: self.settings.value(prefix + key, "") for key in preset_keys}
@@ -2403,11 +2427,12 @@ class DayzTranslateTool(QMainWindow):
     def create_translation_worker(self, jobs):
         return TranslationWorker(
             # 注入共享缓存：多次翻译运行复用相同内容的翻译结果
-            service=TranslationService(batch_size=self.translation_batch_size, cache=self.translation_cache),
+            service=TranslationService(cache=self.translation_cache),
             jobs=jobs,
             config=TranslatorConfig(
                 provider=self.translation_provider,
-                batch_size=self.translation_batch_size,
+                char_budget=self.translation_char_budget,
+                auto_concurrency=self.translation_auto_concurrency,
                 parallel_batches=self.translation_parallel_batches,
                 timeout=self.translation_timeout,
                 api_key=self.translation_api_key,
