@@ -157,7 +157,7 @@ GLOSSARY_MAX_ENTRIES = 200
 - Produces: `TranslationCacheStore.is_writable() -> bool`
 - Consumes: `TranslationService._cache_key` 返回的 5 元组
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_translation_cache.py`：
 - `test_save_then_load_roundtrip`：存 `{("openai","english","chinese","gpt-4o","Knife"): "刀"}`，新实例 `load()` 得到等值字典（键还原成元组）。
@@ -167,14 +167,14 @@ GLOSSARY_MAX_ENTRIES = 200
 - `test_falls_back_when_base_dir_unwritable`：`base_dir` 指向一个不可写路径（用一个同名**文件**占位，使 `mkdir` 失败），`path` 落在 `fallback_dir`。
 - `test_clear_removes_file`：`clear()` 后文件不存在且 `load() == {}`。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 python -m unittest tests.test_translation_cache -v
 ```
 预期：`ModuleNotFoundError: No module named 'translation_cache'`。
 
-- [ ] **Step 3: 实现 `translation_cache.py`**
+- [x] **Step 3: 实现 `translation_cache.py`**
 
 ```python
 """翻译缓存的磁盘持久化：软件目录旁一个 JSON 文件，写不进去就回退到用户数据目录。"""
@@ -266,7 +266,7 @@ class TranslationCacheStore:
             pass
 ```
 
-- [ ] **Step 4: 缓存键去掉术语表（决定 6）**
+- [x] **Step 4: 缓存键去掉术语表（决定 6）**
 
 `translator_service.py` 的 `_cache_namespace` 改为只含模型名：
 
@@ -309,7 +309,7 @@ class TranslationCacheStore:
 
 （`batch_size=` 参数已在本版删除，见 Task 4 Step 4 的扫描步骤。）
 
-- [ ] **Step 5: main.py 接线**
+- [x] **Step 5: main.py 接线**
 
 `DayzTranslateTool.__init__`（`main.py:1325` 附近）把
 
@@ -326,14 +326,14 @@ class TranslationCacheStore:
 
 在 `finish_translation`、`fail_translation` 的收尾处、以及 `_clear_translation_thread` 之前，加入 `self.translation_cache_store.save(self.translation_cache)`（取消也要存：已翻好的部分不该白花）。
 
-- [ ] **Step 6: 运行测试**
+- [x] **Step 6: 运行测试**
 
 ```bash
 python -m unittest tests.test_translation_cache tests.test_translator_service -v
 ```
 预期：全绿。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add translation_cache.py tests/test_translation_cache.py translator_service.py main.py tests/test_translator_service.py

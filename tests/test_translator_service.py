@@ -3,7 +3,7 @@ import threading
 import time
 import unittest
 
-from translator_service import GoogleTranslateTranslator, OpenAICompatibleTranslator, TranslationJob, TranslationService, TranslatorConfig, validate_translator_config
+from translator_service import GoogleTranslateTranslator, OpenAICompatibleTranslator, TranslationCancelled, TranslationJob, TranslationService, TranslatorConfig, TranslationResults, validate_translator_config
 
 
 class FakeBatchTranslator:
@@ -24,6 +24,7 @@ class TranslationServiceTests(unittest.TestCase):
             created.append((source, target))
             return fake
 
+        # batch_size=2 行：3 行分 2 批（行 0,1 + 行 2），批内去重
         service = TranslationService(provider_factory=factory, batch_size=2)
         config = TranslatorConfig(provider="google")
         jobs = [
@@ -35,12 +36,64 @@ class TranslationServiceTests(unittest.TestCase):
         results = service.translate_jobs(jobs, config)
 
         self.assertEqual(created, [("en", "de")])
-        self.assertEqual(fake.calls, [["Knife", "Gun"]])
+        # 批 1（行 0,1）去重后 ["Knife"]，批 2（行 2）["Gun"]
+        self.assertEqual(fake.calls, [["Knife"], ["Gun"]])
         self.assertEqual(results.translated, 3)
         self.assertEqual(results.failed, 0)
         self.assertEqual(results.cell_results[(0, 3)], "translated:Knife")
         self.assertEqual(results.cell_results[(1, 3)], "translated:Knife")
         self.assertEqual(results.cell_results[(2, 3)], "translated:Gun")
+
+    def test_batch_size_groups_jobs_by_row_count(self):
+        """batch_size 按 行数 切分：每批包含 N 行的所有单元格。"""
+        fake = FakeBatchTranslator()
+        service = TranslationService(provider_factory=lambda source, target: fake, batch_size=2)
+        config = TranslatorConfig(provider="google")
+        # 4 行，每行 2 个不同 target 列 → 按 (source,target) 分组后每组 4 个 job（4 行）
+        # batch_size=2 行 → 每组 2 批，每批 2 行
+        jobs = [
+            TranslationJob(0, 3, "A", "en", "de"),
+            TranslationJob(1, 3, "B", "en", "de"),
+            TranslationJob(2, 3, "C", "en", "de"),
+            TranslationJob(3, 3, "D", "en", "de"),
+        ]
+
+        service.translate_jobs(jobs, config)
+
+        # 4 行 / batch_size=2 = 2 批：批1 [A,B]，批2 [C,D]
+        self.assertEqual(fake.calls, [["A", "B"], ["C", "D"]])
+
+    def test_batch_size_rows_groups_multi_target_per_row(self):
+        """OpenAI 多语言场景：batch_size 按行切分，每批包含 N 行的所有语言单元格。"""
+        calls = []
+
+        class FakeOpenAITranslator:
+            def __init__(self, source, target, api_key, model, base_url, glossary, timeout=60.0, should_cancel=None):
+                pass
+
+            def translate_job_batch(self, jobs):
+                calls.append(list(jobs))
+                return [f"{job.target_code}:{job.text}" for job in jobs]
+
+        service = TranslationService(batch_size=1)
+        service.openai_translator_class = FakeOpenAITranslator
+        config = TranslatorConfig(provider="openai", api_key="key", model="m")
+        # 2 行，每行 2 个语言 → batch_size=1 行 → 2 批，每批 1 行 2 个 job
+        jobs = [
+            TranslationJob(0, 4, "Knife", "en", "de"),
+            TranslationJob(0, 5, "Knife", "en", "ru"),
+            TranslationJob(1, 4, "Gun", "en", "de"),
+            TranslationJob(1, 5, "Gun", "en", "ru"),
+        ]
+
+        results = service.translate_jobs(jobs, config)
+
+        # 2 批，每批 1 行的 2 个 job
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([j.row for j in calls[0]], [0, 0])
+        self.assertEqual([j.row for j in calls[1]], [1, 1])
+        self.assertEqual(results.cell_results[(0, 4)], "de:Knife")
+        self.assertEqual(results.cell_results[(1, 5)], "ru:Gun")
 
     def test_cache_prevents_second_batch_call(self):
         fake = FakeBatchTranslator()
@@ -54,6 +107,66 @@ class TranslationServiceTests(unittest.TestCase):
         self.assertEqual(fake.calls, [["Knife"]])
         self.assertEqual(first.cell_results[(0, 3)], "translated:Knife")
         self.assertEqual(second.cell_results[(0, 3)], "translated:Knife")
+        self.assertEqual(second.cache_hits, 1)
+
+    def test_shared_cache_reused_across_service_instances(self):
+        # 模拟窗口多次翻译：每次运行新建 service 但共享同一个缓存字典
+        fake = FakeBatchTranslator()
+        shared_cache = {}
+        config = TranslatorConfig(provider="google")
+        jobs = [TranslationJob(0, 3, "Knife", "en", "de")]
+
+        first_service = TranslationService(provider_factory=lambda source, target: fake, batch_size=30, cache=shared_cache)
+        first = first_service.translate_jobs(jobs, config)
+        second_service = TranslationService(provider_factory=lambda source, target: fake, batch_size=30, cache=shared_cache)
+        second = second_service.translate_jobs(jobs, config)
+
+        self.assertEqual(fake.calls, [["Knife"]])
+        self.assertEqual(first.cell_results[(0, 3)], "translated:Knife")
+        self.assertEqual(second.cell_results[(0, 3)], "translated:Knife")
+        self.assertEqual(second.cache_hits, 1)
+
+    def test_cache_miss_when_model_changes(self):
+        class FakeJobBatchTranslator:
+            def __init__(self):
+                self.calls = []
+
+            def translate_job_batch(self, jobs):
+                self.calls.append([job.text for job in jobs])
+                return [f"translated:{job.text}" for job in jobs]
+
+        fake = FakeJobBatchTranslator()
+        shared_cache = {}
+        jobs = [TranslationJob(0, 3, "Knife", "en", "de")]
+
+        first_service = TranslationService(provider_factory=lambda source, target: fake, batch_size=30, cache=shared_cache)
+        first = first_service.translate_jobs(jobs, TranslatorConfig(provider="openai", api_key="k", model="gpt-4o-mini"))
+        # 相同 model 命中缓存
+        same_model_service = TranslationService(provider_factory=lambda source, target: fake, batch_size=30, cache=shared_cache)
+        same_model = same_model_service.translate_jobs(jobs, TranslatorConfig(provider="openai", api_key="k", model="gpt-4o-mini"))
+        # 更换 model 不命中旧缓存
+        changed_service = TranslationService(provider_factory=lambda source, target: fake, batch_size=30, cache=shared_cache)
+        changed = changed_service.translate_jobs(jobs, TranslatorConfig(provider="openai", api_key="k", model="gpt-4o"))
+
+        self.assertEqual(first.translated, 1)
+        self.assertEqual(same_model.cache_hits, 1)
+        self.assertEqual(changed.cache_hits, 0)
+        self.assertEqual(fake.calls, [["Knife"], ["Knife"]])
+
+    def test_cache_hit_when_glossary_changes(self):
+        """决定 6：改单词本不作废已有译文，缓存照常命中。"""
+        fake = FakeBatchTranslator()
+        shared_cache = {}
+        jobs = [TranslationJob(0, 3, "Knife", "en", "de")]
+
+        first_service = TranslationService(provider_factory=lambda source, target: fake, batch_size=30, cache=shared_cache)
+        first_service.translate_jobs(jobs, TranslatorConfig(provider="google"))
+        second_service = TranslationService(provider_factory=lambda source, target: fake, batch_size=30, cache=shared_cache)
+        second = second_service.translate_jobs(
+            jobs,
+            TranslatorConfig(provider="google", glossary=[{"english": "Knife", "german": "Messer"}]),
+        )
+
         self.assertEqual(second.cache_hits, 1)
 
     def test_batch_failure_records_error_and_continues_next_direction(self):
@@ -100,6 +213,37 @@ class TranslationServiceTests(unittest.TestCase):
         results = service.translate_jobs(jobs, config, should_cancel=should_cancel)
 
         self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(results.translated, 1)
+
+    def test_cancel_stops_between_batches_in_single_thread_mode(self):
+        """单线程模式下批次之间检查 should_cancel，取消后不处理后续批次。"""
+        fake = FakeBatchTranslator()
+        translate_count = 0
+
+        def should_cancel():
+            # 第一批翻译完成后返回 True
+            return translate_count >= 1
+
+        service = TranslationService(provider_factory=lambda source, target: fake, batch_size=1)
+        config = TranslatorConfig(provider="google")
+        jobs = [
+            TranslationJob(0, 3, "Knife", "en", "de"),
+            TranslationJob(1, 3, "Gun", "en", "de"),
+            TranslationJob(2, 3, "Hat", "en", "de"),
+        ]
+
+        original_translate = fake.translate_batch
+
+        def counting_translate(texts):
+            nonlocal translate_count
+            translate_count += 1
+            return original_translate(texts)
+
+        fake.translate_batch = counting_translate
+        results = service.translate_jobs(jobs, config, should_cancel=should_cancel)
+
+        # 第一批处理后 should_cancel 返回 True，后续批次不处理
+        self.assertEqual(translate_count, 1)
         self.assertEqual(results.translated, 1)
 
     def test_parallel_batches_run_more_than_one_batch_at_a_time(self):
@@ -172,7 +316,7 @@ class TranslationServiceTests(unittest.TestCase):
         seen = {}
 
         class FakeOpenAITranslator:
-            def __init__(self, source, target, api_key, model, base_url, glossary):
+            def __init__(self, source, target, api_key, model, base_url, glossary, timeout=60.0, should_cancel=None):
                 seen.update(
                     {
                         "source": source,
@@ -301,7 +445,7 @@ class TranslationServiceTests(unittest.TestCase):
         calls = []
 
         class FakeOpenAITranslator:
-            def __init__(self, source, target, api_key, model, base_url, glossary):
+            def __init__(self, source, target, api_key, model, base_url, glossary, timeout=60.0, should_cancel=None):
                 pass
 
             def translate_job_batch(self, jobs):
@@ -337,6 +481,41 @@ class TranslationServiceTests(unittest.TestCase):
 
         self.assertEqual(snapshots[0], {(0, 3): "translated:Knife"})
         self.assertEqual(snapshots[-1], {(0, 3): "translated:Knife", (1, 3): "translated:Gun"})
+
+    def test_translator_config_default_timeout_is_60_seconds(self):
+        config = TranslatorConfig(provider="openai")
+        self.assertEqual(config.timeout, 60.0)
+
+    def test_openai_translator_stores_configured_timeout(self):
+        translator = OpenAICompatibleTranslator(
+            source="auto", target="multi", api_key="key", model="m", timeout=42.0,
+        )
+        self.assertEqual(translator.timeout, 42.0)
+
+    def test_openai_post_json_raises_translation_cancelled(self):
+        translator = OpenAICompatibleTranslator(
+            source="auto", target="multi", api_key="key", model="m",
+            should_cancel=lambda: True,
+        )
+        with self.assertRaises(TranslationCancelled):
+            translator.translate_batch(["Knife"])
+
+    def test_translate_jobs_marks_cancelled_on_translation_cancelled(self):
+        class CancellingTranslator:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def translate_job_batch(self, jobs):
+                raise TranslationCancelled()
+
+        service = TranslationService(batch_size=10)
+        service.openai_translator_class = CancellingTranslator
+        config = TranslatorConfig(provider="openai", api_key="key", model="m")
+        jobs = [TranslationJob(0, 4, "Knife", "en", "de")]
+
+        results = service.translate_jobs(jobs, config)
+
+        self.assertTrue(results.cancelled)
 
 
 def _google_response(*pairs):
@@ -511,7 +690,7 @@ class GoogleProviderIntegrationTests(unittest.TestCase):
         calls = []
 
         class FakeGoogle:
-            def __init__(self, source, target, base_url, timeout):
+            def __init__(self, source, target, base_url, timeout, should_cancel=None):
                 calls.append((source, target, base_url, timeout))
 
             def translate_batch(self, texts):
