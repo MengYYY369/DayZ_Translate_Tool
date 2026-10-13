@@ -49,7 +49,7 @@ from dayz_csv import (
 )
 from translation_cache import TranslationCacheStore
 from translation_worker import TranslationWorker
-from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationJob, TranslationService, TranslatorConfig, validate_translator_config
+from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, RetryPolicy, TranslationJob, TranslationService, TranslatorConfig, validate_translator_config
 from free_translators import FREE_SOURCE_SPECS
 from translation_sources import (
     ALL_RULES,
@@ -80,6 +80,8 @@ AI_TYPE_LABEL_KEYS = {
     "claude": "ai_type_claude",
     "codex": "ai_type_codex",
 }
+# 测试按钮是「探活」：失败要立刻看到原因，不套用正式翻译那套 5 次重试的长退避
+TEST_RETRY_POLICY = RetryPolicy(max_attempts=2, base_delay=1.0, max_delay=2.0)
 LANGUAGE_LABELS = {
     "en": "English",
     "zh": "中文",
@@ -104,7 +106,7 @@ UI_TEXT = {
         "test_translation_partial": "Test finished, but some languages failed:\n{result}",
         "test_translation_no_result": "No translation came back from this source.",
         "test_translation_failed": "Test failed: {error}",
-        "test_translation_running": "Testing...",
+        "test_translation_running": "Testing... (click another source to switch)",
         "translation_engine": "Translation Engine",
         "delete": "Delete",
         "translation_sources": "Translation sources",
@@ -242,7 +244,7 @@ UI_TEXT = {
         "test_translation_partial": "测试完成，但有语言没翻出来：\n{result}",
         "test_translation_no_result": "这个源没有返回任何译文。",
         "test_translation_failed": "测试失败：{error}",
-        "test_translation_running": "正在测试...",
+        "test_translation_running": "正在测试…（点其它源可以切换）",
         "translation_engine": "翻译引擎",
         "delete": "删除",
         "translation_sources": "翻译源",
@@ -954,10 +956,11 @@ class TranslationSettingsDialog(QDialog):
         except ValueError as exc:
             QMessageBox.warning(self, self.window.tr("test_translation"), str(exc))
             return
-        self._wait_for_test_thread()
-        self._set_test_running(True)
-        service = TranslationService()
-        self._test_thread = QThread(self)
+        # 上一个测试可能还卡在网络上：直接放弃它（结果不再弹窗），这次测试照跑不误。
+        self._cancel_test_thread()
+        service = self._build_test_service()
+        # 线程挂在主窗口下：对话框先关掉时线程不会跟着被销毁（QThread 运行时被销毁会崩）。
+        self._test_thread = QThread(self.window)
         self._test_worker = TranslationWorker(service=service, jobs=self._current_test_jobs(), configs=[config])
         self._test_worker.moveToThread(self._test_thread)
         self._test_thread.started.connect(self._test_worker.run)
@@ -968,18 +971,42 @@ class TranslationSettingsDialog(QDialog):
         self._test_thread.finished.connect(self._test_worker.deleteLater)
         self._test_thread.finished.connect(self._test_thread.deleteLater)
         self._test_thread.start()
+        self._set_test_running(entry.source_id)
 
-    def _set_test_running(self, running):
-        for row in self.source_rows.values():
-            row.test_button.setEnabled(not running)
-            if running:
-                row.test_button.setToolTip(self.window.tr("test_translation_running"))
+    def _build_test_service(self):
+        """测试用的翻译服务：探活只试两次，失败立刻报，不等重试退避。"""
+        service = TranslationService()
+        service.retry_policy = TEST_RETRY_POLICY
+        return service
 
-    def _wait_for_test_thread(self):
+    def _set_test_running(self, source_id):
+        """只改提示，不禁用按钮：正在跑的源可能卡在网络上，不能让它挡住别的源。"""
+        for row_source_id, row in self.source_rows.items():
+            key = "test_translation_running" if row_source_id == source_id else "source_test"
+            row.test_button.setToolTip(self.window.tr(key))
+
+    def _cancel_test_thread(self, wait_ms=0):
+        """放弃正在跑的测试：断开结果回调、置取消位（请求返回后线程自然退出）。"""
+        worker = getattr(self, "_test_worker", None)
         thread = getattr(self, "_test_thread", None)
+        if worker is not None:
+            for signal, slot in ((worker.finished, self._on_test_finished), (worker.failed, self._on_test_failed)):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+            worker.cancel()
         if thread is not None and thread.isRunning():
             thread.quit()
-            thread.wait(3000)
+            if wait_ms:
+                thread.wait(wait_ms)
+        self._test_worker = None
+        self._test_thread = None
+
+    def done(self, result):
+        # 关窗/确定时别把还在跑的测试线程丢在后台。
+        self._cancel_test_thread(wait_ms=3000)
+        super().done(result)
 
     def _on_test_finished(self, results):
         self._reset_test_button()

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QColor, QKeySequence
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QObject, QSettings, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidgetSelectionRange, QTableWidgetItem
 
 from dayz_csv import DAYZ_HEADERS
@@ -15,7 +15,7 @@ from main import DayzTranslateTool, LanguageSettingsDialog, SearchDialog, Transl
 from translator_service import DEFAULT_CHAR_BUDGET, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationResults
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QLineEdit
-from main import AI_TYPE_KEYS, AiSourceDialog, TranslationSettingsDialog
+from main import AI_TYPE_KEYS, TEST_RETRY_POLICY, AiSourceDialog, TranslationSettingsDialog
 from translation_sources import ALL_RULES, RULE_ALL, RULE_EMPTY, RULE_SELECTION, SourceEntry, SourceList
 
 
@@ -1549,6 +1549,78 @@ class TranslationSourceListDialogTests(unittest.TestCase):
         dialog.run_source_test = lambda entry: seen.append(entry.source_id)
         dialog.source_rows["volcano"].test_button.click()
         self.assertEqual(seen, ["volcano"])
+
+    def test_test_buttons_stay_usable_while_a_test_runs(self):
+        dialog = self.dialog()
+        dialog._set_test_running("google")
+        for source_id, row in dialog.source_rows.items():
+            self.assertTrue(row.test_button.isEnabled(), source_id)
+        self.assertEqual(
+            dialog.source_rows["google"].test_button.toolTip(), self.window.tr("test_translation_running")
+        )
+        self.assertEqual(dialog.source_rows["volcano"].test_button.toolTip(), self.window.tr("source_test"))
+
+    def test_starting_another_test_cancels_the_running_one(self):
+        class FakeWorker(QObject):
+            finished = Signal(object)
+            failed = Signal(str)
+
+            def __init__(self):
+                super().__init__()
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        class FakeThread(QObject):
+            def __init__(self):
+                super().__init__()
+                self.quit_calls = 0
+
+            def isRunning(self):
+                return True
+
+            def quit(self):
+                self.quit_calls += 1
+
+        dialog = self.dialog()
+        worker = FakeWorker()
+        thread = FakeThread()
+        dialog._test_worker = worker
+        dialog._test_thread = thread
+        dialog._cancel_test_thread()
+        self.assertTrue(worker.cancelled)
+        self.assertEqual(thread.quit_calls, 1)
+        self.assertIsNone(dialog._test_worker)
+        self.assertIsNone(dialog._test_thread)
+
+    def test_a_cancelled_test_no_longer_reports(self):
+        class FakeWorker(QObject):
+            finished = Signal(object)
+            failed = Signal(str)
+
+            def cancel(self):
+                pass
+
+        dialog = self.dialog()
+        worker = FakeWorker()
+        dialog._test_worker = worker
+        dialog._cancel_test_thread()
+        with (
+            patch("main.QMessageBox.information") as information,
+            patch("main.QMessageBox.warning") as warning,
+            patch("main.QMessageBox.critical") as critical,
+        ):
+            worker.finished.emit(TranslationResults())
+            worker.failed.emit("boom")
+        self.assertFalse(information.called)
+        self.assertFalse(warning.called)
+        self.assertFalse(critical.called)
+
+    def test_test_service_uses_the_short_retry_policy(self):
+        service = self.dialog()._build_test_service()
+        self.assertEqual(service.retry_policy.max_attempts, 2)
+        self.assertEqual(service.retry_policy.max_attempts, TEST_RETRY_POLICY.max_attempts)
 
     def test_test_config_comes_from_that_source(self):
         dialog = self.dialog()
