@@ -1,5 +1,9 @@
 param(
-    [string]$AppName = "DayZ_Translate_Tool"
+    [string]$AppName = "DayZ_Translate_Tool",
+    # Python used for the build. Empty means: prefer the local 3.13 install,
+    # so a `python` from PATH that belongs to some other tool's virtualenv
+    # does not get PySide6 installed into it.
+    [string]$PythonPath = ""
 )
 
 Set-StrictMode -Version Latest
@@ -16,28 +20,32 @@ if (-not (Test-Path -LiteralPath $EntryPoint)) {
     throw "Entry point not found: $EntryPoint"
 }
 
-$PythonCommand = Get-Command python -ErrorAction SilentlyContinue
-if (-not $PythonCommand) {
-    throw "Python was not found in PATH."
+if (-not $PythonPath) {
+    $LocalPython = Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"
+    if (Test-Path -LiteralPath $LocalPython) {
+        $PythonPath = $LocalPython
+    }
+}
+if (-not $PythonPath) {
+    $PythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $PythonCommand) {
+        throw "Python was not found in PATH. Pass -PythonPath <python.exe>."
+    }
+    $PythonPath = $PythonCommand.Source
+}
+if (-not (Test-Path -LiteralPath $PythonPath)) {
+    throw "Python not found: $PythonPath"
 }
 
-Write-Host "Using Python: $($PythonCommand.Source)"
+Write-Host "Using Python: $PythonPath"
 
 if (Test-Path -LiteralPath $Requirements) {
     Write-Host "Installing project requirements..."
-    & $PythonCommand.Source -m pip install -r $Requirements
+    & $PythonPath -m pip install -r $Requirements
 }
 
 Write-Host "Ensuring PyInstaller is installed..."
-& $PythonCommand.Source -m pip install pyinstaller
-
-$dataArgs = @()
-foreach ($DataFileName in @("stringtable.csv", "wordbook.csv")) {
-    $SourceDataFile = Join-Path $ProjectRoot $DataFileName
-    if (Test-Path -LiteralPath $SourceDataFile) {
-        $dataArgs += @("--add-data", "$SourceDataFile;.")
-    }
-}
+& $PythonPath -m pip install pyinstaller
 
 $pyInstallerArgs = @(
     "--noconfirm",
@@ -75,21 +83,35 @@ $pyInstallerArgs = @(
     "--exclude-module", "websockets",
     "--exclude-module", "yaml"
 )
-$pyInstallerArgs += $dataArgs
 $pyInstallerArgs += $EntryPoint
 
+# PyInstaller COLLECT wipes the dist folder: back up user data files living next
+# to the exe first, restore them after the build.
+$ExeDir = Split-Path -Parent $ExePath
+$BackupDir = Join-Path $BuildRoot "user_data_backup"
+$preservedFiles = @()
+if (Test-Path -LiteralPath $ExeDir) {
+    foreach ($DataFileName in @("stringtable.csv", "wordbook.csv")) {
+        $LiveFile = Join-Path $ExeDir $DataFileName
+        if (Test-Path -LiteralPath $LiveFile) {
+            New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
+            Copy-Item -LiteralPath $LiveFile -Destination (Join-Path $BackupDir $DataFileName) -Force
+            $preservedFiles += $DataFileName
+        }
+    }
+}
+
 Write-Host "Building executable..."
-& $PythonCommand.Source -m PyInstaller @pyInstallerArgs
+& $PythonPath -m PyInstaller @pyInstallerArgs
 
 if (-not (Test-Path -LiteralPath $ExePath)) {
     throw "Build finished but executable was not found: $ExePath"
 }
 
-foreach ($DataFileName in @("stringtable.csv", "wordbook.csv")) {
-    $SourceDataFile = Join-Path $ProjectRoot $DataFileName
-    if (Test-Path -LiteralPath $SourceDataFile) {
-        Copy-Item -LiteralPath $SourceDataFile -Destination (Join-Path (Split-Path -Parent $ExePath) $DataFileName) -Force
-    }
+# Restore the user data files that lived next to the exe before the build.
+# Never copy project-root csv files over them: those are the user's live data.
+foreach ($DataFileName in $preservedFiles) {
+    Copy-Item -LiteralPath (Join-Path $BackupDir $DataFileName) -Destination (Join-Path $ExeDir $DataFileName) -Force
 }
 
 Write-Host "Build complete: $ExePath"

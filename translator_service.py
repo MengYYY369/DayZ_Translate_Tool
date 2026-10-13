@@ -21,6 +21,10 @@ MIN_AUTO_CONCURRENCY = 1
 MAX_AUTO_CONCURRENCY = 8            # 自动模式上限旋钮的取值上限
 RECOVER_AFTER_SUCCESSES = 8         # 连续成功多少次后并发 +1
 
+# 部分第三方网关会拦掉 Python 默认的 User-Agent（实测 B 站 Index-Translate 返回 412），
+# AI 源统一带上自己的名字。
+AI_USER_AGENT = "DayZ-Translate-Tool/1.0"
+
 # —— 限速与重试（决定 9 / 12 / 14）——
 RETRY_MAX_ATTEMPTS = 5
 RETRY_BASE_DELAY = 2.0
@@ -507,7 +511,8 @@ class TranslationService:
                             progress_callback(results)
                         if should_cancel and should_cancel():
                             executor.shutdown(wait=False, cancel_futures=True)
-                            return
+                            results.cancelled = True
+                            return results
         except TranslationCancelled:
             results.cancelled = True
         return results
@@ -905,6 +910,7 @@ class OpenAICompatibleTranslator:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "User-Agent": AI_USER_AGENT,
         }
         response = self.post_json(self._chat_completions_url(), headers, payload)
         content = self._extract_content(response)
@@ -944,6 +950,7 @@ class OpenAICompatibleTranslator:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "User-Agent": AI_USER_AGENT,
         }
         response = self.post_json(self._chat_completions_url(), headers, payload)
         content = self._extract_content(response)

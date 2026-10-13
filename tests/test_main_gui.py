@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidgetSelectionRa
 
 from dayz_csv import DAYZ_HEADERS
 from main import DayzTranslateTool, LanguageSettingsDialog, SearchDialog, TranslationSettingsDialog, WordbookWindow
-from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationResults
+from translator_service import DEFAULT_CHAR_BUDGET, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, TranslationResults
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QLineEdit
 from main import AI_TYPE_KEYS, AiSourceDialog, TranslationSettingsDialog
@@ -1282,9 +1282,9 @@ class MainGuiTests(unittest.TestCase):
 
     def test_settings_dialog_concurrency_cap_range(self):
         dialog = TranslationSettingsDialog(self.window)
-        self.assertEqual(dialog.source_concurrency_input.maximum(), MAX_AUTO_CONCURRENCY)
-        self.assertTrue(hasattr(dialog, "auto_concurrency_check"))
-        self.assertTrue(dialog.auto_concurrency_check.isChecked())
+        # 「并发上限」整行已删：并发数改成每个源自己管（免费源内置，AI 源在源设置里填）
+        self.assertFalse(hasattr(dialog, "auto_concurrency_check"))
+        self.assertFalse(dialog.is_field_visible("auto_concurrency"))
 
     def test_settings_dialog_has_clear_cache_button(self):
         dialog = TranslationSettingsDialog(self.window)
@@ -1331,6 +1331,39 @@ class MainGuiTests(unittest.TestCase):
         )
 
 
+class FakeAiSourceDialog:
+    """假的「添加 / 编辑 AI 源」弹窗。用法：先设 next_values，再触发点击。"""
+
+    instances = []
+    next_values = {}
+
+    def __init__(self, window, parent=None, entry=None):
+        self.entry = entry
+        self.values_returned = dict(FakeAiSourceDialog.next_values)
+        FakeAiSourceDialog.instances.append(self)
+
+    def exec(self):
+        return QDialog.Accepted
+
+    def values(self):
+        return dict(self.values_returned)
+
+
+class FakeApiKeyDialog:
+    """假的密钥弹窗（DeepL 用）。"""
+
+    next_value = ""
+
+    def __init__(self, window, parent=None, api_key=""):
+        self.initial_key = api_key
+
+    def exec(self):
+        return QDialog.Accepted
+
+    def value(self):
+        return FakeApiKeyDialog.next_value
+
+
 class TranslationSourceListDialogTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.NamedTemporaryFile(suffix=".ini", delete=False)
@@ -1366,57 +1399,61 @@ class TranslationSourceListDialogTests(unittest.TestCase):
         self.assertEqual(sources.find("deepl").rules, [])
         self.assertFalse([e for e in sources.entries if e.is_ai])
 
-    def test_table_shows_one_row_per_source_with_three_checkboxes(self):
+    def test_source_list_shows_one_row_per_source_with_rules(self):
         dialog = self.dialog()
-        self.assertEqual(dialog.source_table.rowCount(), len(self.window.translation_sources.entries))
-        self.assertEqual(dialog.source_table.columnCount(), 5)
-        self.assertTrue(dialog.source_table.cellWidget(0, 2).isChecked())
-        self.assertTrue(dialog.source_table.cellWidget(0, 3).isChecked())
-        self.assertTrue(dialog.source_table.cellWidget(0, 4).isChecked())
+        rows = dialog.source_rows
+        self.assertEqual(
+            list(rows), [e.source_id for e in self.window.translation_sources.entries]
+        )
+        self.assertEqual(rows["google"].rules_button.rules(), list(ALL_RULES))
+        self.assertEqual(rows["volcano"].rules_button.rules(), [RULE_SELECTION])
+        self.assertEqual(rows["deepl"].rules_button.rules(), [])
 
-    def test_toggling_a_checkbox_updates_the_working_copy_only_after_save(self):
+    def test_toggling_a_rule_updates_the_working_copy_only_after_save(self):
         dialog = self.dialog()
-        dialog.source_table.cellWidget(0, 2).setChecked(False)
+        dialog.source_rows["google"].rules_button.checkboxes[RULE_ALL].setChecked(False)
         self.assertIn(RULE_ALL, self.window.translation_sources.find("google").rules)
         dialog.apply_settings()
         self.assertNotIn(RULE_ALL, self.window.translation_sources.find("google").rules)
 
     def test_move_buttons_reorder_the_list(self):
         dialog = self.dialog()
-        dialog.source_table.selectRow(2)          # tencent
-        dialog.move_up_button.click()
+        dialog.source_rows["tencent"].move_up_button.click()
         dialog.apply_settings()
         self.assertEqual(
             [e.source_id for e in self.window.translation_sources.entries][:3],
             ["google", "tencent", "microsoft"],
         )
 
-    def test_free_source_shows_read_only_builtin_limits(self):
+    def test_move_buttons_are_disabled_at_the_edges(self):
         dialog = self.dialog()
-        dialog.source_table.selectRow(0)          # google
-        self.assertTrue(dialog.is_field_visible("source_builtin"))
-        self.assertFalse(dialog.is_field_visible("source_concurrency"))
-        self.assertFalse(dialog.is_field_visible("source_interval"))
-        self.assertFalse(dialog.is_field_visible("source_type"))
-        self.assertFalse(dialog.is_field_visible("source_api_key"))
-        self.assertIn("0.3", dialog.source_builtin_label.text())
+        first = dialog.source_rows["google"]
+        last = dialog.source_rows["deepl"]
+        self.assertFalse(first.move_up_button.isEnabled())
+        self.assertTrue(first.move_down_button.isEnabled())
+        self.assertTrue(last.move_up_button.isEnabled())
+        self.assertFalse(last.move_down_button.isEnabled())
 
-    def test_ai_source_shows_editable_settings(self):
+    def test_free_source_has_no_edit_button_and_builtin_limits_in_tooltip(self):
+        dialog = self.dialog()
+        row = dialog.source_rows["google"]
+        self.assertIsNone(row.edit_button)          # 免费源没有可改的参数
+        self.assertIsNone(row.remove_button)        # 内置源也不给删
+        self.assertIn("0.3", row.name_label.toolTip())
+        self.assertIn("2", row.name_label.toolTip())
+
+    def test_ai_source_has_edit_and_remove_buttons(self):
         dialog = self.dialog()
         entry = SourceEntry(kind="ai", name="我的 GPT", api_type="openai", rules=[RULE_SELECTION],
                             api_key="sk-x", base_url="https://x.test/v1", model="gpt-4o-mini",
                             concurrency=4, interval=0.5)
         dialog.sources.add_ai(entry, source_id="ai:test1")
-        dialog.refresh_source_table(select_id="ai:test1")
-        self.assertFalse(dialog.is_field_visible("source_builtin"))
-        self.assertTrue(dialog.is_field_visible("source_type"))
-        self.assertTrue(dialog.is_field_visible("source_api_key"))
-        self.assertTrue(dialog.is_field_visible("source_model"))
-        self.assertTrue(dialog.is_field_visible("source_concurrency"))
-        self.assertTrue(dialog.is_field_visible("source_interval"))
-        self.assertEqual(dialog.source_api_key_input.text(), "sk-x")
-        self.assertEqual(dialog.source_concurrency_input.value(), 4)
-        self.assertEqual(dialog.source_interval_input.value(), 0.5)
+        dialog.refresh_source_rows()
+        row = dialog.source_rows["ai:test1"]
+        self.assertIsNotNone(row.edit_button)
+        self.assertIsNotNone(row.remove_button)
+        self.assertIn("gpt-4o-mini", row.name_label.toolTip())
+        self.assertEqual(row.rules_button.rules(), [RULE_SELECTION])
 
     def test_ai_settings_are_saved_per_source(self):
         dialog = self.dialog()
@@ -1424,27 +1461,103 @@ class TranslationSourceListDialogTests(unittest.TestCase):
         second = SourceEntry(kind="ai", name="B", api_type="claude", rules=[RULE_SELECTION], api_key="key-b")
         dialog.sources.add_ai(first, source_id="ai:a")
         dialog.sources.add_ai(second, source_id="ai:b")
-        dialog.refresh_source_table(select_id="ai:a")
-        dialog.source_api_key_input.setText("key-a2")
-        dialog.refresh_source_table(select_id="ai:b")
-        self.assertEqual(dialog.source_api_key_input.text(), "key-b")
-        dialog.refresh_source_table(select_id="ai:a")
-        self.assertEqual(dialog.source_api_key_input.text(), "key-a2")
+        dialog.refresh_source_rows()
+        dialog.ai_dialog_class = FakeAiSourceDialog
+        FakeAiSourceDialog.instances.clear()
+        FakeAiSourceDialog.next_values = {
+            "name": "A2", "api_type": "openai", "base_url": "https://a.test/v1",
+            "api_key": "key-a2", "model": "gpt-4o-mini", "concurrency": 4, "interval": 0.5,
+        }
+        dialog.source_rows["ai:a"].edit_button.click()
+        # 弹窗拿到的是 A 的值，改完只动 A，B 不受影响
+        self.assertEqual(FakeAiSourceDialog.instances[0].entry.source_id, "ai:a")
+        self.assertEqual(dialog.sources.find("ai:a").api_key, "key-a2")
+        self.assertEqual(dialog.sources.find("ai:a").name, "A2")
+        self.assertEqual(dialog.sources.find("ai:a").concurrency, 4)
+        self.assertEqual(dialog.sources.find("ai:b").api_key, "key-b")
 
-    def test_remove_button_drops_the_selected_ai_source(self):
+    def test_deepl_pen_edits_the_api_key(self):
+        dialog = self.dialog()
+        FakeApiKeyDialog.next_value = "deepl-key-1"
+        dialog.key_dialog_class = FakeApiKeyDialog
+        dialog.source_rows["deepl"].edit_button.click()
+        self.assertEqual(dialog.sources.find("deepl").api_key, "deepl-key-1")
+
+    def test_remove_button_drops_the_ai_source(self):
         dialog = self.dialog()
         entry = SourceEntry(kind="ai", name="临时", api_type="openai", rules=[RULE_SELECTION])
         dialog.sources.add_ai(entry, source_id="ai:gone")
-        dialog.refresh_source_table(select_id="ai:gone")
+        dialog.refresh_source_rows()
         with unittest.mock.patch("main.QMessageBox.question", return_value=QMessageBox.Yes):
-            dialog.remove_source_button.click()
+            dialog.source_rows["ai:gone"].remove_button.click()
         self.assertIsNone(dialog.sources.find("ai:gone"))
+        self.assertNotIn("ai:gone", dialog.source_rows)
 
-    def test_remove_button_refuses_to_drop_builtin_sources(self):
+    def test_builtin_sources_have_no_remove_button(self):
         dialog = self.dialog()
-        dialog.source_table.selectRow(0)
-        dialog.remove_source_button.click()
+        for source_id in ("google", "deepl"):
+            self.assertIsNone(dialog.source_rows[source_id].remove_button)
         self.assertIsNotNone(dialog.sources.find("google"))
+
+    def test_source_rows_use_standard_icons(self):
+        dialog = self.dialog()
+        for source_id, row in dialog.source_rows.items():
+            self.assertFalse(row.move_up_button.icon().isNull(), source_id)
+            self.assertFalse(row.move_down_button.icon().isNull(), source_id)
+            self.assertFalse(row.test_button.icon().isNull(), source_id)
+
+    def test_source_rows_align_their_columns(self):
+        dialog = self.dialog()
+        entry = SourceEntry(kind="ai", name="我的 GPT", api_type="openai", rules=[RULE_SELECTION])
+        dialog.sources.add_ai(entry, source_id="ai:align")
+        dialog.refresh_source_rows()
+        rows = list(dialog.source_rows.values())
+        # 规则下拉框宽度一致
+        self.assertEqual(len({row.rules_button.maximumWidth() for row in rows}), 1)
+        # 每行列数一致（没有图标的位置用等宽占位补上）
+        self.assertEqual(len({row.layout().count() for row in rows}), 1)
+
+    def test_test_run_reports_failure_when_nothing_translated(self):
+        """一条都没翻出来时不能报「测试成功」（曾经全部显示 (failed) 却弹成功）。"""
+        dialog = self.dialog()
+        results = TranslationResults(errors=["OpenAI HTTP 412: blocked"])
+        with patch("main.QMessageBox.critical") as critical, \
+                patch("main.QMessageBox.information") as information:
+            dialog._on_test_finished(results)
+        self.assertTrue(critical.called)
+        self.assertFalse(information.called)
+        self.assertIn("412", critical.call_args[0][2])
+
+    def test_test_run_reports_partial_failure(self):
+        dialog = self.dialog()
+        results = TranslationResults(cell_results={(0, 0): "刀"})
+        with patch("main.QMessageBox.warning") as warning, \
+                patch("main.QMessageBox.information") as information:
+            dialog._on_test_finished(results)
+        self.assertTrue(warning.called)
+        self.assertFalse(information.called)
+
+    def test_every_source_row_has_a_test_button(self):
+        dialog = self.dialog()
+        for source_id, row in dialog.source_rows.items():
+            self.assertIsNotNone(row.test_button, source_id)
+            self.assertTrue(row.test_button.toolTip(), source_id)
+
+    def test_test_button_targets_its_own_source(self):
+        dialog = self.dialog()
+        seen = []
+        dialog.run_source_test = lambda entry: seen.append(entry.source_id)
+        dialog.source_rows["volcano"].test_button.click()
+        self.assertEqual(seen, ["volcano"])
+
+    def test_test_config_comes_from_that_source(self):
+        dialog = self.dialog()
+        google = dialog._build_test_config(dialog.sources.find("google"))
+        volcano = dialog._build_test_config(dialog.sources.find("volcano"))
+        self.assertEqual(google.provider, "google")
+        self.assertEqual(volcano.provider, "volcano")
+        self.assertEqual(volcano.parallel_batches, 1)
+        self.assertEqual(google.parallel_batches, 2)
 
     def test_add_ai_dialog_collects_every_field(self):
         window = self.window
@@ -1472,14 +1585,14 @@ class TranslationSourceListDialogTests(unittest.TestCase):
     def test_add_ai_source_warns_on_duplicate_name(self):
         dialog = self.dialog()
         dialog.sources.add_ai(SourceEntry(kind="ai", name="重复", api_type="openai"), source_id="ai:dup")
-        fake = unittest.mock.MagicMock()
+        fake = MagicMock()
         fake.exec.return_value = QDialog.Accepted
         fake.values.return_value = {
             "name": "重复", "api_type": "openai", "base_url": "", "api_key": "",
             "model": "", "concurrency": 1, "interval": 0.0,
         }
         dialog.ai_dialog_class = lambda *a, **k: fake
-        with unittest.mock.patch("main.QMessageBox.question", return_value=QMessageBox.No) as asked:
+        with patch("main.QMessageBox.question", return_value=QMessageBox.No) as asked:
             dialog.add_ai_source_button.click()
         self.assertTrue(asked.called)
         self.assertEqual(len([e for e in dialog.sources.entries if e.is_ai]), 1)
@@ -1502,8 +1615,7 @@ class TranslationSourceListDialogTests(unittest.TestCase):
 
     def test_cancel_dialog_does_not_persist_source_edits(self):
         dialog = self.dialog()
-        dialog.source_table.cellWidget(0, 2).setChecked(False)
-        dialog.source_table.cellWidget(0, 3).setChecked(False)
+        dialog.source_rows["google"].rules_button.checkboxes[RULE_ALL].setChecked(False)
         dialog.reject()
         self.assertIn(RULE_ALL, self.window.translation_sources.find("google").rules)
 

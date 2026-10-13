@@ -2,8 +2,8 @@ import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QLibraryInfo, QObject, QSettings, QStandardPaths, QThread, Qt, QItemSelectionModel, QTimer, QTranslator
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtCore import QEvent, QLibraryInfo, QObject, QSettings, QSize, QStandardPaths, QThread, Qt, QItemSelectionModel, QTimer, QTranslator, Signal
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -27,9 +26,13 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
+    QWidget,
+    QWidgetAction,
 )
 
 from config_cpp import collect_config_cpp_files, extract_keys_from_paths, merge_language_keys
@@ -71,7 +74,6 @@ DEFAULT_COLUMN_WIDTH = 90
 SEARCH_MATCH_COLOR = QColor("#9adbe8")
 SEARCH_ACTIVE_COLOR = QColor("#ffc857")
 TABLE_GRIDLINE_COLOR = "#8c8c8c"
-SOURCE_TABLE_HEADERS = ("name", "kind", "all", "empty", "selection")
 AI_TYPE_KEYS = ("openai", "claude", "codex")
 AI_TYPE_LABEL_KEYS = {
     "openai": "ai_type_openai",
@@ -99,6 +101,8 @@ UI_TEXT = {
         "ok": "OK",
         "test_translation": "Test",
         "test_translation_success": "Test succeeded. Translations:\n{result}",
+        "test_translation_partial": "Test finished, but some languages failed:\n{result}",
+        "test_translation_no_result": "No translation came back from this source.",
         "test_translation_failed": "Test failed: {error}",
         "test_translation_running": "Testing...",
         "translation_engine": "Translation Engine",
@@ -107,17 +111,20 @@ UI_TEXT = {
         "source_rules_all": "All cells",
         "source_rules_empty": "Empty cells",
         "source_rules_selection": "Right-click",
+        "source_rules_none": "None",
         "source_kind_free": "Free",
         "source_kind_ai": "AI",
         "source_name": "Name",
         "source_type": "Interface",
-        "source_builtin": "Built-in limits",
         "source_builtin_text": "Concurrency {concurrency}, interval {interval}s (built in)",
         "source_concurrency": "Concurrency",
         "source_interval": "Interval (s)",
         "source_move_up": "Move up",
         "source_move_down": "Move down",
         "source_remove": "Remove source",
+        "source_test": "Test this source",
+        "source_edit": "Edit source",
+        "edit_ai_source": "Edit AI source",
         "add_ai_source": "Add AI source",
         "source_name_required": "Please enter a name for this source.",
         "source_name_duplicate": "A source named \"{name}\" already exists. Add another one anyway?",
@@ -140,9 +147,6 @@ UI_TEXT = {
         "source_deepl": "DeepL",
         "char_budget": "Max chars per batch",
         "char_budget_tooltip": "Source characters a single request may carry. Rows are never split across requests. Larger = fewer requests but a bigger loss if one fails.",
-        "concurrency_cap": "Concurrency cap",
-        "auto_concurrency": "Auto",
-        "concurrency_cap_tooltip": "Auto mode starts low, halves on rate limits and climbs back slowly. This is the ceiling it may climb to.",
         "translation_cache": "Translation cache",
         "clear_translation_cache": "Clear cache",
         "retry_countdown": "Rate limited — retrying in {seconds}s (attempt {attempt}/{max_attempts})",
@@ -235,6 +239,8 @@ UI_TEXT = {
         "ok": "确定",
         "test_translation": "测试",
         "test_translation_success": "测试成功。翻译结果：\n{result}",
+        "test_translation_partial": "测试完成，但有语言没翻出来：\n{result}",
+        "test_translation_no_result": "这个源没有返回任何译文。",
         "test_translation_failed": "测试失败：{error}",
         "test_translation_running": "正在测试...",
         "translation_engine": "翻译引擎",
@@ -243,17 +249,20 @@ UI_TEXT = {
         "source_rules_all": "全表",
         "source_rules_empty": "空白",
         "source_rules_selection": "右键选中",
+        "source_rules_none": "未启用",
         "source_kind_free": "免费",
         "source_kind_ai": "AI",
         "source_name": "名称",
         "source_type": "接口类型",
-        "source_builtin": "内置限制",
         "source_builtin_text": "并发 {concurrency}，间隔 {interval} 秒（内置，不可修改）",
         "source_concurrency": "并发数",
         "source_interval": "间隔（秒）",
         "source_move_up": "上移",
         "source_move_down": "下移",
         "source_remove": "删除源",
+        "source_test": "测试这个源",
+        "source_edit": "编辑这个源",
+        "edit_ai_source": "编辑 AI 源",
         "add_ai_source": "添加 AI 源",
         "source_name_required": "请给这个翻译源起个名字。",
         "source_name_duplicate": "已经有一个叫「{name}」的翻译源了，还要继续添加吗？",
@@ -276,9 +285,6 @@ UI_TEXT = {
         "source_deepl": "DeepL",
         "char_budget": "每批最多字数",
         "char_budget_tooltip": "单次请求最多携带的源文字数。行不会被拆到两个请求里。越大请求越少，但单次失败的代价也越大。",
-        "concurrency_cap": "并发上限",
-        "auto_concurrency": "自动",
-        "concurrency_cap_tooltip": "自动模式起步保守，撞到限速立刻减半，之后慢慢回升。这里是最多能升到几个。",
         "translation_cache": "翻译缓存",
         "clear_translation_cache": "清空缓存",
         "retry_countdown": "被限速，{seconds} 秒后重试（第 {attempt}/{max_attempts} 次）",
@@ -383,7 +389,7 @@ class _ClipTextDelegate(QStyledItemDelegate):
 class SearchDialog(QDialog):
     SEARCH_DEBOUNCE_MS = 200
 
-    def __init__(self, window):
+    def __init__(self, window: "DayzTranslateTool"):
         super().__init__(window)
         self.window = window
         self.setWindowTitle(window.tr("search"))
@@ -507,12 +513,12 @@ class SearchDialog(QDialog):
 
 
 class AiSourceDialog(QDialog):
-    """「添加 AI 源」弹窗。"""
+    """「添加 / 编辑 AI 源」弹窗。"""
 
-    def __init__(self, window, parent=None):
+    def __init__(self, window, parent=None, entry=None):
         super().__init__(parent or window)
         self.window = window
-        self.setWindowTitle(window.tr("add_ai_source"))
+        self.setWindowTitle(window.tr("edit_ai_source" if entry is not None else "add_ai_source"))
         self.name_input = QLineEdit(self)
         self.type_combo = QComboBox(self)
         for key in AI_TYPE_KEYS:
@@ -526,6 +532,18 @@ class AiSourceDialog(QDialog):
         self.interval_input = QDoubleSpinBox(self)
         self.interval_input.setRange(0.0, 60.0)
         self.interval_input.setSingleStep(0.1)
+
+        if entry is not None:
+            # 编辑已有源：把现在的值填进去
+            self.name_input.setText(entry.name)
+            type_index = self.type_combo.findData(entry.api_type)
+            if type_index >= 0:
+                self.type_combo.setCurrentIndex(type_index)
+            self.base_url_input.setText(entry.base_url)
+            self.api_key_input.setText(entry.api_key)
+            self.model_input.setText(entry.model)
+            self.concurrency_input.setValue(max(1, int(entry.concurrency or 1)))
+            self.interval_input.setValue(float(entry.interval or 0.0))
 
         form = QFormLayout()
         form.addRow(QLabel(window.tr("source_name"), self), self.name_input)
@@ -562,81 +580,189 @@ class AiSourceDialog(QDialog):
         }
 
 
+RULE_LABEL_KEYS = {
+    RULE_ALL: "source_rules_all",
+    RULE_EMPTY: "source_rules_empty",
+    RULE_SELECTION: "source_rules_selection",
+}
+
+
+class RulesButton(QToolButton):
+    """三个规则的多选下拉框：勾选项，收起时显示「全表 / 空白」这样的汇总。"""
+
+    rules_changed = Signal(object)
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self.window = window
+        self.setPopupMode(QToolButton.InstantPopup)
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # 固定宽度：各行规则下拉框宽度一致，后面的图标才能对齐
+        longest = " / ".join(window.tr(RULE_LABEL_KEYS[rule]) for rule in ALL_RULES)
+        self.setFixedWidth(self.fontMetrics().horizontalAdvance(longest) + 34)
+        menu = QMenu(self)
+        container = QWidget(menu)
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(8, 4, 8, 4)
+        container_layout.setSpacing(2)
+        self.checkboxes = {}
+        for rule in ALL_RULES:
+            box = QCheckBox(window.tr(RULE_LABEL_KEYS[rule]), container)
+            box.stateChanged.connect(self._on_toggled)
+            container_layout.addWidget(box)
+            self.checkboxes[rule] = box
+        # 用 QWidgetAction 装勾选框：点勾选框不会关掉下拉，可以一次勾好几个
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(container)
+        menu.addAction(action)
+        self.setMenu(menu)
+        self.refresh_text()
+
+    def rules(self):
+        return [rule for rule in ALL_RULES if self.checkboxes[rule].isChecked()]
+
+    def set_rules(self, rules):
+        for rule, box in self.checkboxes.items():
+            box.blockSignals(True)
+            box.setChecked(rule in rules)
+            box.blockSignals(False)
+        self.refresh_text()
+
+    def refresh_text(self):
+        labels = [self.window.tr(RULE_LABEL_KEYS[rule]) for rule in self.rules()]
+        self.setText(" / ".join(labels) if labels else self.window.tr("source_rules_none"))
+
+    def _on_toggled(self, _state):
+        self.refresh_text()
+        self.rules_changed.emit(self.rules())
+
+
+class SourceRowWidget(QWidget):
+    """翻译源列表里的一行：上移/下移 + 名称 + 规则多选 + 测试 + 编辑 + 删除。"""
+
+    ICON_SLOT_WIDTH = 26
+
+    def __init__(self, dialog, entry, parent=None):
+        super().__init__(parent)
+        self.dialog = dialog
+        self.entry = entry
+        window = dialog.window
+
+        self.move_up_button = self._icon_button(QStyle.StandardPixmap.SP_ArrowUp, window.tr("source_move_up"))
+        self.move_up_button.clicked.connect(lambda: dialog.move_source(entry.source_id, -1))
+        self.move_down_button = self._icon_button(QStyle.StandardPixmap.SP_ArrowDown, window.tr("source_move_down"))
+        self.move_down_button.clicked.connect(lambda: dialog.move_source(entry.source_id, 1))
+        self.name_label = QLabel(dialog.source_label(entry), self)
+        self.name_label.setToolTip(dialog.source_tooltip(entry))
+        self.rules_button = RulesButton(window, self)
+        self.rules_button.set_rules(entry.rules)
+        self.rules_button.rules_changed.connect(self._on_rules_changed)
+        self.test_button = self._icon_button(QStyle.StandardPixmap.SP_MediaPlay, window.tr("source_test"),
+                                            color=QColor("white"))
+        self.test_button.clicked.connect(lambda: dialog.run_source_test(entry))
+
+        self.edit_button = None
+        if dialog.is_source_editable(entry):
+            self.edit_button = self._icon_button(QStyle.StandardPixmap.SP_FileDialogInfoView, window.tr("source_edit"))
+            self.edit_button.clicked.connect(lambda: dialog.edit_source(entry))
+
+        self.remove_button = None
+        if entry.is_ai:
+            self.remove_button = self._icon_button(QStyle.StandardPixmap.SP_TrashIcon, window.tr("source_remove"))
+            self.remove_button.clicked.connect(lambda: dialog.remove_source(entry))
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(4)
+        layout.addWidget(self.move_up_button)
+        layout.addWidget(self.move_down_button)
+        layout.addWidget(self.name_label, 1)
+        layout.addWidget(self.rules_button)
+        layout.addWidget(self.test_button)
+        # 没有图标的位置用等宽占位，保证每行的图标列都对齐
+        layout.addWidget(self.edit_button if self.edit_button is not None else self._icon_slot())
+        layout.addWidget(self.remove_button if self.remove_button is not None else self._icon_slot())
+
+    def _icon_button(self, pixmap, tooltip, color=None):
+        button = QToolButton(self)
+        icon = self.style().standardIcon(pixmap)
+        if color is not None:
+            icon = self._tinted_icon(icon, color)
+        button.setIcon(icon)
+        button.setIconSize(QSize(16, 16))
+        button.setToolTip(tooltip)
+        button.setAutoRaise(True)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setFixedWidth(self.ICON_SLOT_WIDTH)
+        return button
+
+    @staticmethod
+    def _tinted_icon(icon, color):
+        """把标准图标涂成指定颜色（测试按钮用白色）。"""
+        source = icon.pixmap(QSize(16, 16))
+        tinted = QPixmap(source.size())
+        tinted.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(tinted)
+        painter.drawPixmap(0, 0, source)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(tinted.rect(), color)
+        painter.end()
+        return QIcon(tinted)
+
+    def _icon_slot(self):
+        slot = QWidget(self)
+        slot.setFixedWidth(self.ICON_SLOT_WIDTH)
+        return slot
+
+    def _on_rules_changed(self, rules):
+        self.entry.rules = list(rules)
+
+class ApiKeyDialog(QDialog):
+    """内置源里只有 DeepL 要密钥，点它的笔弹这个。"""
+
+    def __init__(self, window, parent=None, api_key=""):
+        super().__init__(parent or window)
+        self.window = window
+        self.setWindowTitle(window.tr("source_deepl"))
+        self.api_key_input = QLineEdit(api_key, self)
+        self.api_key_input.setEchoMode(QLineEdit.Password)
+        form = QFormLayout()
+        form.addRow(QLabel(window.tr("api_key"), self), self.api_key_input)
+        save_button = QPushButton(window.tr("save"), self)
+        save_button.clicked.connect(self.accept)
+        cancel_button = QPushButton(window.tr("cancel"), self)
+        cancel_button.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(save_button)
+        buttons.addWidget(cancel_button)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addLayout(buttons)
+        self.resize(420, 120)
+
+    def value(self):
+        return self.api_key_input.text().strip()
+
+
 class TranslationSettingsDialog(QDialog):
     ai_dialog_class = AiSourceDialog
+    key_dialog_class = ApiKeyDialog
 
     def __init__(self, window):
         super().__init__(window)
         self.window = window
         self.form_rows = {}
-        self.source_form_rows = {}
-        self._refreshing_table = False
-        self._loaded_source_id = None
+        self.source_rows = {}
         self.setWindowTitle(window.tr("translation_settings").rstrip("."))
         # 对话框编辑的是副本；点「保存」才写回 window（取消不留痕）
         self.sources = window.translation_sources.clone()
-
-        self.source_table = QTableWidget(0, len(SOURCE_TABLE_HEADERS), self)
-        self.source_table.setHorizontalHeaderLabels([
-            window.tr("source_name"), "", window.tr("source_rules_all"),
-            window.tr("source_rules_empty"), window.tr("source_rules_selection"),
-        ])
-        self.source_table.verticalHeader().setVisible(False)
-        self.source_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.source_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.source_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.source_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.source_table.itemSelectionChanged.connect(self._on_source_selection_changed)
-        self.source_table.setMinimumHeight(200)
-
-        self.move_up_button = QPushButton(window.tr("source_move_up"), self)
-        self.move_up_button.clicked.connect(lambda: self.move_source(-1))
-        self.move_down_button = QPushButton(window.tr("source_move_down"), self)
-        self.move_down_button.clicked.connect(lambda: self.move_source(1))
-        self.add_ai_source_button = QPushButton("+", self)
-        self.add_ai_source_button.setToolTip(window.tr("add_ai_source"))
-        self.add_ai_source_button.clicked.connect(self.add_ai_source)
-        self.remove_source_button = QPushButton(window.tr("source_remove"), self)
-        self.remove_source_button.clicked.connect(self.remove_source)
-
-        self.source_name_label = QLabel("", self)
-        self.source_builtin_label = QLabel("", self)
-        self.source_builtin_label.setStyleSheet("color: #808080; font-size: 11px;")
-        self.source_type_input = QComboBox(self)
-        for key in AI_TYPE_KEYS:
-            self.source_type_input.addItem(window.tr(AI_TYPE_LABEL_KEYS[key]), key)
-        self.source_base_url_input = QLineEdit(self)
-        self.source_api_key_input = QLineEdit(self)
-        self.source_api_key_input.setEchoMode(QLineEdit.Password)
-        self.source_model_input = QLineEdit(self)
-        self.source_concurrency_input = QSpinBox(self)
-        self.source_concurrency_input.setRange(1, MAX_AUTO_CONCURRENCY)
-        self.source_interval_input = QDoubleSpinBox(self)
-        self.source_interval_input.setRange(0.0, 60.0)
-        self.source_interval_input.setSingleStep(0.1)
-
-        source_form = QFormLayout()
-        self._add_source_row(source_form, "source_name", window.tr("source_name"), self.source_name_label)
-        self._add_source_row(source_form, "source_builtin", window.tr("source_builtin"), self.source_builtin_label)
-        self._add_source_row(source_form, "source_type", window.tr("source_type"), self.source_type_input)
-        self._add_source_row(source_form, "source_base_url", window.tr("base_url"), self.source_base_url_input)
-        self._add_source_row(source_form, "source_api_key", window.tr("api_key"), self.source_api_key_input)
-        self._add_source_row(source_form, "source_model", window.tr("model"), self.source_model_input)
-        self._add_source_row(source_form, "source_concurrency", window.tr("source_concurrency"), self.source_concurrency_input)
-        self._add_source_row(source_form, "source_interval", window.tr("source_interval"), self.source_interval_input)
-        for widget in (self.source_base_url_input, self.source_api_key_input,
-                       self.source_model_input, self.source_concurrency_input, self.source_interval_input):
-            widget.editingFinished.connect(self._flush_source_fields)
-        # QComboBox 没有 editingFinished，只能接 currentIndexChanged（多出来的 int 参数会被丢掉）
-        self.source_type_input.currentIndexChanged.connect(self._flush_source_fields)
 
         self.char_budget_input = QSpinBox(self)
         self.char_budget_input.setRange(MIN_CHAR_BUDGET, MAX_CHAR_BUDGET)
         self.char_budget_input.setSingleStep(100)
         self.char_budget_input.setValue(window.translation_char_budget)
-
-        self.auto_concurrency_check = QCheckBox(window.tr("auto_concurrency"), self)
-        self.auto_concurrency_check.setChecked(window.translation_auto_concurrency)
 
         self.timeout_input = QSpinBox(self)
         self.timeout_input.setRange(5, 300)
@@ -648,62 +774,39 @@ class TranslationSettingsDialog(QDialog):
 
         form = QFormLayout()
         self.add_form_row(form, "char_budget", window.tr("char_budget"), self.char_budget_input, window.tr("char_budget_tooltip"))
-        cap_label = QLabel(window.tr("concurrency_cap"), self)
-        cap_label.setToolTip(window.tr("concurrency_cap_tooltip"))
-        cap_layout = QHBoxLayout()
-        cap_layout.setContentsMargins(0, 0, 0, 0)
-        cap_layout.addWidget(self.auto_concurrency_check)
-        cap_layout.addStretch(1)
-        form.addRow(cap_label, cap_layout)
-        self.form_rows["auto_concurrency"] = (cap_label, self._layout_widgets(cap_layout))
         self.add_form_row(form, "timeout", window.tr("timeout"), self.timeout_input)
         self.add_form_row(form, "clear_cache", window.tr("translation_cache"), self.clear_cache_button)
 
+        self.source_rows_layout = QVBoxLayout()
+        self.source_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.source_rows_layout.setSpacing(2)
+        self.add_ai_source_button = QPushButton("+ " + window.tr("add_ai_source"), self)
+        self.add_ai_source_button.clicked.connect(self.add_ai_source)
+
         source_box = QGroupBox(window.tr("translation_sources"), self)
         source_box_layout = QVBoxLayout(source_box)
-        table_row = QHBoxLayout()
-        table_row.addWidget(self.source_table, 1)
-        button_column = QVBoxLayout()
-        button_column.addWidget(self.move_up_button)
-        button_column.addWidget(self.move_down_button)
-        button_column.addWidget(self.add_ai_source_button)
-        button_column.addWidget(self.remove_source_button)
-        button_column.addStretch(1)
-        table_row.addLayout(button_column)
-        source_box_layout.addLayout(table_row)
-        source_box_layout.addLayout(source_form)
+        source_box_layout.addLayout(self.source_rows_layout)
+        source_box_layout.addWidget(self.add_ai_source_button, 0, Qt.AlignLeft)
 
         save_button = QPushButton(window.tr("save"), self)
         save_button.clicked.connect(self.apply_settings)
-        self.test_button = QPushButton(window.tr("test_translation"), self)
-        self.test_button.clicked.connect(self.run_translation_test)
         cancel_button = QPushButton(window.tr("cancel"), self)
         cancel_button.clicked.connect(self.reject)
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        buttons.addWidget(self.test_button)
         buttons.addWidget(save_button)
         buttons.addWidget(cancel_button)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(source_box)
+        layout.addStretch(1)
         layout.addLayout(buttons)
 
-        self.refresh_source_table(select_id=self.sources.entries[0].source_id if self.sources.entries else None)
-        self.resize(760, 620)
-    def _add_source_row(self, form, key, label_text, widget):
-        label = QLabel(label_text, self)
-        form.addRow(label, widget)
-        self.source_form_rows[key] = (label, widget)
+        self.refresh_source_rows()
+        self.resize(760, 560)
 
-    def _layout_widgets(self, layout):
-        widgets = []
-        for index in range(layout.count()):
-            widget = layout.itemAt(index).widget()
-            if widget:
-                widgets.append(widget)
-        return widgets
+    # —— 通用字段 ——
 
     def add_form_row(self, form, key, label_text, widget, tooltip=None):
         label = QLabel(label_text, self)
@@ -713,71 +816,60 @@ class TranslationSettingsDialog(QDialog):
         form.addRow(label, widget)
         self.form_rows[key] = (label, widget)
 
-    # —— 源列表 ——
+    def is_field_visible(self, key):
+        if key not in self.form_rows:
+            return False                  # 预设行已删，"preset" 这种键查不到
+        label, widget = self.form_rows[key]
+        return not label.isHidden() and not widget.isHidden()
+
+    # —— 翻译源列表 ——
 
     def source_label(self, entry):
         return self.window.source_label(entry)
 
-    def current_source_id(self):
-        row = self.source_table.currentRow()
-        if row < 0 or row >= len(self.sources.entries):
-            return None
-        return self.sources.entries[row].source_id
+    def source_tooltip(self, entry):
+        """免费源显示内置的并发/间隔；AI 源显示接口类型与模型。"""
+        if entry.is_ai:
+            parts = [self.window.tr("source_kind_ai"), entry.api_type, entry.model]
+            return " · ".join(part for part in parts if part)
+        spec = FREE_SOURCE_SPECS.get(entry.source_id, {})
+        return " · ".join([
+            self.window.tr("source_kind_free"),
+            self.window.tr(
+                "source_builtin_text",
+                concurrency=spec.get("concurrency", 1),
+                interval=spec.get("interval", 0.0),
+            ),
+        ])
 
-    def current_source_entry(self):
-        source_id = self.current_source_id()
-        return self.sources.find(source_id) if source_id else None
+    def is_source_editable(self, entry):
+        """AI 源都能改；免费源里只有要密钥的（DeepL）有可改的东西。"""
+        return entry.is_ai or bool(FREE_SOURCE_SPECS.get(entry.source_id, {}).get("needs_key"))
 
-    def refresh_source_table(self, select_id=None):
-        if select_id is None:
-            select_id = self.current_source_id()
-        self._refreshing_table = True
-        try:
-            self.source_table.setRowCount(len(self.sources.entries))
-            for row, entry in enumerate(self.sources.entries):
-                name_item = QTableWidgetItem(self.source_label(entry))
-                name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                self.source_table.setItem(row, 0, name_item)
-                kind_item = QTableWidgetItem(
-                    self.window.tr("source_kind_ai") if entry.is_ai else self.window.tr("source_kind_free")
-                )
-                kind_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                self.source_table.setItem(row, 1, kind_item)
-                for offset, rule in enumerate(ALL_RULES, start=2):
-                    box = QCheckBox(self.source_table)
-                    box.setChecked(rule in entry.rules)
-                    box.stateChanged.connect(
-                        lambda state, sid=entry.source_id, r=rule: self.set_source_rule(sid, r, state == Qt.Checked)
-                    )
-                    self.source_table.setCellWidget(row, offset, box)
-        finally:
-            self._refreshing_table = False
-        index = self.sources.index_of(select_id) if select_id else -1
-        if index < 0 and self.sources.entries:
-            index = 0
-        if index >= 0:
-            self.source_table.selectRow(index)
-        self.update_visible_fields()
+    def refresh_source_rows(self):
+        while self.source_rows_layout.count():
+            item = self.source_rows_layout.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.deleteLater()
+        self.source_rows = {}
+        last_index = len(self.sources.entries) - 1
+        for index, entry in enumerate(self.sources.entries):
+            row = SourceRowWidget(self, entry, self)
+            row.move_up_button.setEnabled(index > 0)
+            row.move_down_button.setEnabled(index < last_index)
+            self.source_rows[entry.source_id] = row
+            self.source_rows_layout.addWidget(row)
 
-    def set_source_rule(self, source_id, rule, enabled):
-        if self._refreshing_table:
-            return
-        self.sources.set_rule(source_id, rule, enabled)
-
-    def move_source(self, delta):
-        source_id = self.current_source_id()
-        if not source_id:
-            return
-        self._flush_source_fields()
+    def move_source(self, source_id, delta):
         if delta < 0:
             self.sources.move_up(source_id)
         else:
             self.sources.move_down(source_id)
-        self.refresh_source_table(select_id=source_id)
+        self.refresh_source_rows()
 
-    def remove_source(self):
-        entry = self.current_source_entry()
-        if entry is None or not entry.is_ai:
+    def remove_source(self, entry):
+        if not entry.is_ai:
             return                      # 内置源不给删，只能取消勾选
         answer = QMessageBox.question(
             self, self.window.tr("source_remove"),
@@ -786,7 +878,7 @@ class TranslationSettingsDialog(QDialog):
         if answer != QMessageBox.Yes:
             return
         self.sources.remove(entry.source_id)
-        self.refresh_source_table()
+        self.refresh_source_rows()
 
     def add_ai_source(self):
         dialog = self.ai_dialog_class(self.window, self)
@@ -804,7 +896,7 @@ class TranslationSettingsDialog(QDialog):
             if answer != QMessageBox.Yes:
                 return
         # 新加的 AI 源默认只勾「右键选中」。勾上「翻译全表」= 授权一次可能产生
-        # 费用的批量调用，必须由用户自己动手勾（决定 6 / 23）。
+        # 费用的批量调用，必须由用户自己动手勾。
         entry = SourceEntry(
             kind="ai",
             name=values["name"],
@@ -817,142 +909,56 @@ class TranslationSettingsDialog(QDialog):
             interval=float(values.get("interval") or 0.0),
         )
         self.sources.add_ai(entry)
-        self.refresh_source_table(select_id=entry.source_id)
+        self.refresh_source_rows()
 
-    # —— 每个源的设置 ——
-
-    def _on_source_selection_changed(self):
-        if self._refreshing_table:
-            return                      # 刷新表格时的选中变化不算「用户换了源」
-        self._flush_source_fields()
-        self.update_visible_fields()
-
-    def _flush_source_fields(self):
-        """把控件里的值写回**当前加载的那个源**。
-
-        必须按 `_loaded_source_id` 定位目标，不能用 `current_source_entry()`：
-        刷新表格时 `selectRow()` 会先触发本函数，而那一刻 `current_source_entry()`
-        已经是新源了 —— 会把上一个源的值（含 API Key）写进新源。
-        """
-        entry = self.sources.find(getattr(self, "_loaded_source_id", None))
-        if entry is None:
+    def edit_source(self, entry):
+        if entry.is_ai:
+            dialog = self.ai_dialog_class(self.window, self, entry)
+            if dialog.exec() != QDialog.Accepted:
+                return
+            values = dialog.values()
+            if not values.get("name"):
+                QMessageBox.warning(self, self.window.tr("edit_ai_source"), self.window.tr("source_name_required"))
+                return
+            if values["name"] != entry.name and self.sources.has_name(values["name"]):
+                answer = QMessageBox.question(
+                    self, self.window.tr("edit_ai_source"),
+                    self.window.tr("source_name_duplicate", name=values["name"]),
+                )
+                if answer != QMessageBox.Yes:
+                    return
+            entry.name = values["name"]
+            entry.api_type = values.get("api_type") or "openai"
+            entry.base_url = values.get("base_url", "")
+            entry.api_key = values.get("api_key", "")
+            entry.model = values.get("model", "")
+            entry.concurrency = int(values.get("concurrency") or 1)
+            entry.interval = float(values.get("interval") or 0.0)
+            self.refresh_source_rows()
             return
-        if not entry.is_ai:
-            # DeepL 是免费源里唯一要密钥的（`needs_key`），它的密钥也要存
-            if FREE_SOURCE_SPECS.get(entry.source_id, {}).get("needs_key"):
-                entry.api_key = self.source_api_key_input.text().strip()
-            return
-        entry.api_type = self.source_type_input.currentData() or "openai"
-        entry.base_url = self.source_base_url_input.text().strip()
-        entry.api_key = self.source_api_key_input.text().strip()
-        entry.model = self.source_model_input.text().strip()
-        entry.concurrency = self.source_concurrency_input.value()
-        entry.interval = self.source_interval_input.value()
+        dialog = self.key_dialog_class(self.window, self, entry.api_key)
+        if dialog.exec() == QDialog.Accepted:
+            entry.api_key = dialog.value()
 
-    def update_visible_fields(self):
-        entry = self.current_source_entry()
-        is_ai = entry is not None and entry.is_ai
-        needs_key = is_ai or (
-            entry is not None and FREE_SOURCE_SPECS.get(entry.source_id, {}).get("needs_key", False)
+    # —— 每个源单独测试 ——
+
+    def _build_test_config(self, entry):
+        return self.window.build_source_config(
+            entry, self.char_budget_input.value(), float(self.timeout_input.value())
         )
-        if entry is None:
-            self.source_name_label.setText("")
-            self.source_builtin_label.setText("")
-        else:
-            self.source_name_label.setText(self.source_label(entry))
-            if not is_ai:
-                spec = FREE_SOURCE_SPECS.get(entry.source_id, {})
-                self.source_builtin_label.setText(self.window.tr(
-                    "source_builtin_text",
-                    concurrency=spec.get("concurrency", 1),
-                    interval=spec.get("interval", 0.0),
-                ))
-        if is_ai:
-            self.source_type_input.blockSignals(True)
-            self.source_base_url_input.blockSignals(True)
-            self.source_api_key_input.blockSignals(True)
-            self.source_model_input.blockSignals(True)
-            self.source_concurrency_input.blockSignals(True)
-            self.source_interval_input.blockSignals(True)
-            index = self.source_type_input.findData(entry.api_type)
-            self.source_type_input.setCurrentIndex(index if index >= 0 else 0)
-            self.source_base_url_input.setText(entry.base_url)
-            self.source_api_key_input.setText(entry.api_key)
-            self.source_model_input.setText(entry.model)
-            self.source_concurrency_input.setValue(max(1, int(entry.concurrency or 1)))
-            self.source_interval_input.setValue(float(entry.interval or 0.0))
-            self.source_type_input.blockSignals(False)
-            self.source_base_url_input.blockSignals(False)
-            self.source_api_key_input.blockSignals(False)
-            self.source_model_input.blockSignals(False)
-            self.source_concurrency_input.blockSignals(False)
-            self.source_interval_input.blockSignals(False)
-        visibility = {
-            "source_builtin": entry is not None and not is_ai,
-            "source_type": is_ai,
-            "source_base_url": is_ai,
-            "source_api_key": needs_key,
-            "source_model": is_ai,
-            "source_concurrency": is_ai,
-            "source_interval": is_ai,
-        }
-        for key, visible in visibility.items():
-            label, widget = self.source_form_rows[key]
-            label.setVisible(visible)
-            widget.setVisible(visible)
-        # 记下「现在控件里装的是哪个源」，供 `_flush_source_fields` 定位写入目标
-        self._loaded_source_id = entry.source_id if entry is not None else None
 
-    def is_field_visible(self, key):
-        rows = self.source_form_rows if key in self.source_form_rows else self.form_rows
-        if key not in rows:
-            return False                  # 预设行已删（决定 26），"preset" 这种键查不到
-        label, widget = rows[key]
-        if isinstance(widget, list):
-            return not label.isHidden() and all(not item.isHidden() for item in widget)
-        return not label.isHidden() and not widget.isHidden()
-
-    # —— 通用字段 ——
-
-    def apply_settings(self, close_dialog=True):
-        self._flush_source_fields()
-        self.window.translation_sources = self.sources.clone()
-        self.window.translation_char_budget = self.char_budget_input.value()
-        self.window.translation_auto_concurrency = self.auto_concurrency_check.isChecked()
-        self.window.translation_timeout = float(self.timeout_input.value())
-        self.window.save_translation_settings()
-        if close_dialog:
-            self.accept()
-
-    def clear_translation_cache(self):
-        self.window.clear_translation_cache()
-
-    def _build_test_config(self):
-        """测试按钮只测当前选中的源。"""
-        entry = self.current_source_entry()
-        if entry is None:
-            raise ValueError(self.window.tr("no_source_selected"))
-        return self.window.build_source_config(entry, self.char_budget_input.value(), float(self.timeout_input.value()))
-
-    def run_translation_test(self):
+    def run_source_test(self, entry):
         try:
-            config = self._build_test_config()
+            config = self._build_test_config(entry)
             validate_translator_config(config)
         except ValueError as exc:
             QMessageBox.warning(self, self.window.tr("test_translation"), str(exc))
             return
         self._wait_for_test_thread()
-        self.test_button.setEnabled(False)
-        self.test_button.setText(self.window.tr("test_translation_running"))
-        test_word = "Knife"
-        target_languages = ["chinese", "russian", "japanese", "german"]
-        jobs = [
-            TranslationJob(row=0, column=index, text=test_word, source_code="english", target_code=lang)
-            for index, lang in enumerate(target_languages)
-        ]
+        self._set_test_running(True)
         service = TranslationService()
         self._test_thread = QThread(self)
-        self._test_worker = TranslationWorker(service=service, jobs=jobs, configs=[config])
+        self._test_worker = TranslationWorker(service=service, jobs=self._current_test_jobs(), configs=[config])
         self._test_worker.moveToThread(self._test_thread)
         self._test_thread.started.connect(self._test_worker.run)
         self._test_worker.finished.connect(self._on_test_finished)
@@ -963,6 +969,12 @@ class TranslationSettingsDialog(QDialog):
         self._test_thread.finished.connect(self._test_thread.deleteLater)
         self._test_thread.start()
 
+    def _set_test_running(self, running):
+        for row in self.source_rows.values():
+            row.test_button.setEnabled(not running)
+            if running:
+                row.test_button.setToolTip(self.window.tr("test_translation_running"))
+
     def _wait_for_test_thread(self):
         thread = getattr(self, "_test_thread", None)
         if thread is not None and thread.isRunning():
@@ -972,14 +984,33 @@ class TranslationSettingsDialog(QDialog):
     def _on_test_finished(self, results):
         self._reset_test_button()
         lines = []
+        succeeded = 0
         # 按 job 的 (row, column) 查找结果，而非用 zip 按位置配对：
         # 某语言失败时 cell_results 会缺少该条目，zip 会让剩余语言错位显示。
         for job in self._current_test_jobs():
             text = results.cell_results.get((job.row, job.column))
             if text is None:
-                text = "(failed)"
-            lines.append(f"{job.target_code}: {text}")
+                lines.append(f"{job.target_code}: (failed)")
+            else:
+                succeeded += 1
+                lines.append(f"{job.target_code}: {text}")
         result_text = "\n".join(lines)
+        if succeeded == 0:
+            # 一条都没翻出来：不能报「测试成功」，要把失败原因显示出来
+            reason = "\n".join(results.errors[:3]) or self.window.tr("test_translation_no_result")
+            QMessageBox.critical(
+                self,
+                self.window.tr("test_translation"),
+                self.window.tr("test_translation_failed", error=reason),
+            )
+            return
+        if succeeded < len(self._current_test_jobs()):
+            QMessageBox.warning(
+                self,
+                self.window.tr("test_translation"),
+                self.window.tr("test_translation_partial", result=result_text),
+            )
+            return
         QMessageBox.information(
             self,
             self.window.tr("test_translation"),
@@ -995,8 +1026,9 @@ class TranslationSettingsDialog(QDialog):
         )
 
     def _reset_test_button(self):
-        self.test_button.setEnabled(True)
-        self.test_button.setText(self.window.tr("test_translation"))
+        for row in self.source_rows.values():
+            row.test_button.setEnabled(True)
+            row.test_button.setToolTip(self.window.tr("source_test"))
 
     def _current_test_jobs(self):
         test_word = "Knife"
@@ -1005,6 +1037,19 @@ class TranslationSettingsDialog(QDialog):
             TranslationJob(row=0, column=index, text=test_word, source_code="english", target_code=lang)
             for index, lang in enumerate(target_languages)
         ]
+
+    # —— 保存 ——
+
+    def apply_settings(self, close_dialog=True):
+        self.window.translation_sources = self.sources.clone()
+        self.window.translation_char_budget = self.char_budget_input.value()
+        self.window.translation_timeout = float(self.timeout_input.value())
+        self.window.save_translation_settings()
+        if close_dialog:
+            self.accept()
+
+    def clear_translation_cache(self):
+        self.window.clear_translation_cache()
 
 
 class LanguageSettingsDialog(QDialog):
@@ -1435,9 +1480,7 @@ class DayzTranslateTool(QMainWindow):
         self.translation_char_budget = int(
             self.settings.value("translation_char_budget", DEFAULT_CHAR_BUDGET)
         )
-        self.translation_auto_concurrency = str(
-            self.settings.value("translation_auto_concurrency", "true")
-        ).lower() in ("true", "1", "yes")
+        self.translation_auto_concurrency = True      # 并发调节固定为自动（设置界面已去掉这个开关）
         self.translation_timeout = float(self.settings.value("translation_timeout", 60.0))
         self._translation_rule = RULE_SELECTION
         self._migrate_translation_settings()
@@ -1954,6 +1997,7 @@ class DayzTranslateTool(QMainWindow):
         self.settings.remove("provider_settings")
         self.settings.remove("translation_provider")
         self.settings.remove("translation_parallel_batches")     # 决定 24：这个设置项整个删掉
+        self.settings.remove("translation_auto_concurrency")      # 自动并发开关也没了，固定自动
         self.settings.remove("translation_presets")              # 决定 26：预设整个删掉（连同里面的密钥）
         self.settings.remove("translation_preset_names_list")
         self.settings.setValue("translation_sources_json", self.translation_sources.to_json())
@@ -1962,7 +2006,6 @@ class DayzTranslateTool(QMainWindow):
     def save_translation_settings(self):
         self.settings.setValue("translation_sources_json", self.translation_sources.to_json())
         self.settings.setValue("translation_char_budget", self.translation_char_budget)
-        self.settings.setValue("translation_auto_concurrency", self.translation_auto_concurrency)
         self.settings.setValue("translation_timeout", self.translation_timeout)
         self.settings.sync()
         self.statusBar().showMessage(

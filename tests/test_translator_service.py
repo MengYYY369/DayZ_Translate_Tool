@@ -533,6 +533,32 @@ class TranslationServiceTests(unittest.TestCase):
 
         self.assertTrue(results.cancelled)
 
+    def test_openai_parallel_cancel_returns_results_instead_of_none(self):
+        """并行分支取消时也必须返回 TranslationResults（曾经 return None，调用方会炸）。"""
+        state = {"cancel": False}
+
+        class CancellingTranslator:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def translate_job_batch(self, jobs, assigned=None):
+                state["cancel"] = True
+                return {}
+
+        service = TranslationService()
+        service.openai_translator_class = CancellingTranslator
+        # char_budget=1 逼着每行各自成一批，这样才能走到并行分支
+        config = TranslatorConfig(provider="openai", api_key="k", model="m", parallel_batches=2, char_budget=1)
+        jobs = [
+            TranslationJob(0, 1, "Knife", "en", "zh-CN"),
+            TranslationJob(1, 1, "Gun", "en", "zh-CN"),
+        ]
+
+        results = service.translate_jobs(jobs, config, should_cancel=lambda: state["cancel"])
+
+        self.assertIsInstance(results, TranslationResults)
+        self.assertTrue(results.cancelled)
+
 
 class FreeProviderTests(unittest.TestCase):
     def test_config_carries_label_and_min_interval(self):
@@ -1067,6 +1093,39 @@ class IdAssignmentTests(unittest.TestCase):
         self.assertIn('"id": 1', prompt)
         self.assertIn('"id": 3', prompt)
         self.assertNotIn('"id": 2', prompt)
+
+
+class OpenAIRequestHeaderTests(unittest.TestCase):
+    """第三方网关（如 B 站 Index-Translate）会拦掉 Python 默认 UA，实测返回 412。"""
+
+    def test_batch_request_carries_a_user_agent(self):
+        captured = {}
+
+        def fake_post(url, headers, payload):
+            captured.update(headers)
+            return {"choices": [{"message": {"content": '["刀"]'}}]}
+
+        translator = OpenAICompatibleTranslator(
+            source="en", target="zh-CN", api_key="k", model="m", post_json=fake_post
+        )
+
+        self.assertEqual(translator.translate_batch(["Knife"]), ["刀"])
+        self.assertTrue(captured.get("User-Agent"))
+
+    def test_job_batch_request_carries_a_user_agent(self):
+        captured = {}
+
+        def fake_post(url, headers, payload):
+            captured.update(headers)
+            return {"choices": [{"message": {"content": '{"1": {"zh-CN": "刀"}}'}}]}
+
+        translator = OpenAICompatibleTranslator(
+            source="en", target="zh-CN", api_key="k", model="m", post_json=fake_post
+        )
+
+        translator.translate_job_batch([TranslationJob(0, 1, "Knife", "en", "zh-CN")])
+
+        self.assertTrue(captured.get("User-Agent"))
 
 
 class MergedPromptTests(unittest.TestCase):
