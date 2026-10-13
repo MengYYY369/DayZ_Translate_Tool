@@ -1,0 +1,20 @@
+# 打包产物与构建中间文件
+build/
+dist/
+*.spec
+
+# Python 缓存与测试/检查工具产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 运行时生成的文件
+translation_cache.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
