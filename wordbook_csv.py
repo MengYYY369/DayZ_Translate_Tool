@@ -41,19 +41,21 @@ def write_wordbook_csv(path, rows):
 
 
 def wordbook_rows_for_save(rows):
-    normalized = [_normalize_row(row) for row in rows]
-    while normalized and _is_empty_row(normalized[-1]):
-        normalized.pop()
-    return normalized
+    # ponytail: drop all-empty rows on save, not only trailing blanks
+    return [row for row in (_normalize_row(r) for r in rows) if not _is_empty_row(row)]
 
 
 def _build_header_map(headers):
-    fixed_indexes = {header: index for index, header in enumerate(WORDBOOK_HEADERS)}
+    fixed_indexes = {
+        (header or "").strip().lower(): index
+        for index, header in enumerate(WORDBOOK_HEADERS)
+    }
     column_map = []
     for source_index, header in enumerate(headers):
-        if header not in fixed_indexes:
+        normalized = (header or "").strip().lower()
+        if normalized not in fixed_indexes:
             raise ValueError(f'Unsupported wordbook language column "{header}".')
-        column_map.append((source_index, fixed_indexes[header]))
+        column_map.append((source_index, fixed_indexes[normalized]))
     return column_map
 
 

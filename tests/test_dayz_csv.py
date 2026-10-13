@@ -6,6 +6,9 @@ from dayz_csv import (
     DAYZ_HEADERS,
     build_column_translation_jobs,
     build_row_translation_jobs,
+    copy_source_for_header,
+    dayz_rows_for_save,
+    is_copy_only_column,
     language_code_for_header,
     load_dayz_csv,
     source_language_code_for_header,
@@ -118,6 +121,24 @@ class DayzCsvTests(unittest.TestCase):
             self.assertTrue(lines[1].endswith('"",'))
             self.assertIn('"A ""sharp"" knife"', lines[1])
 
+    def test_rows_for_save_drops_empty_rows(self):
+        filled = ["STR_A", "Knife", "Knife"] + [""] * (len(DAYZ_HEADERS) - 3)
+        empty = [""] * len(DAYZ_HEADERS)
+
+        self.assertEqual(dayz_rows_for_save([empty, filled, empty]), [filled])
+
+    def test_write_skips_empty_rows(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "stringtable.csv"
+            filled = ["STR_A", "Knife", "Knife"] + [""] * (len(DAYZ_HEADERS) - 3)
+            empty = [""] * len(DAYZ_HEADERS)
+
+            write_dayz_csv(path, DAYZ_HEADERS, [empty, filled, empty])
+
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertIn('"STR_A"', lines[1])
+
     def test_language_code_for_dayz_headers(self):
         self.assertEqual(language_code_for_header("english"), "en")
         self.assertEqual(language_code_for_header("czech"), "cs")
@@ -153,6 +174,30 @@ class DayzCsvTests(unittest.TestCase):
         jobs = build_column_translation_jobs(DAYZ_HEADERS, rows, source_header="english", selected_columns={13, 14})
 
         self.assertEqual(jobs, [(0, 13, "Knife", "pt"), (0, 14, "Knife", "zh-CN")])
+
+    def test_copy_column_sources(self):
+        self.assertEqual(copy_source_for_header("original"), "english")
+        self.assertEqual(copy_source_for_header("chinese"), "chinesesimp")
+        self.assertIsNone(copy_source_for_header("english"))
+        self.assertIsNone(copy_source_for_header("russian"))
+
+    def test_is_copy_only_column(self):
+        self.assertTrue(is_copy_only_column("original"))
+        self.assertTrue(is_copy_only_column("chinese"))
+        self.assertFalse(is_copy_only_column("chinesesimp"))
+        self.assertFalse(is_copy_only_column("english"))
+
+    def test_row_jobs_skip_chinese_copy_only_column(self):
+        rows = [["STR_A", "Knife", "Knife", "", "", "", "", "", "", "", "", "", "", "", "", ""]]
+
+        jobs = build_row_translation_jobs(DAYZ_HEADERS, rows, source_header="english", selected_rows={0})
+
+        job_columns = {job[1] for job in jobs}
+        # original (1) and chinese (11) are copy-only columns, must be excluded
+        self.assertNotIn(1, job_columns)
+        self.assertNotIn(11, job_columns)
+        # chinesesimp (14) is a normal translation target
+        self.assertIn(14, job_columns)
 
 
 if __name__ == "__main__":

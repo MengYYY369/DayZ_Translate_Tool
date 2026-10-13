@@ -46,13 +46,12 @@ class WordbookCsvTests(unittest.TestCase):
             self.assertFalse(lines[0].endswith(","))
             self.assertIn('"A ""sharp"" knife"', lines[1])
 
-    def test_rows_for_save_ignores_final_empty_row(self):
-        rows = [
-            ["Knife", "Knife"] + [""] * (len(WORDBOOK_HEADERS) - 2),
-            [""] * len(WORDBOOK_HEADERS),
-        ]
+    def test_rows_for_save_ignores_empty_rows(self):
+        filled = ["Knife", "Knife"] + [""] * (len(WORDBOOK_HEADERS) - 2)
+        empty = [""] * len(WORDBOOK_HEADERS)
+        rows = [empty, filled, empty, empty]
 
-        self.assertEqual(wordbook_rows_for_save(rows), [rows[0]])
+        self.assertEqual(wordbook_rows_for_save(rows), [filled])
 
 
 if __name__ == "__main__":

@@ -38,6 +38,21 @@ LANGUAGE_CODES = {
     "portuguese": "pt",
 }
 
+# original 列直接复制 english 列，chinese 列直接复制 chinesesimp 列，不走 AI 翻译
+COPY_COLUMN_SOURCES = {
+    "original": "english",
+    "chinese": "chinesesimp",
+}
+
+
+def copy_source_for_header(header):
+    """返回该列应从哪一列复制内容，如果不是复制列则返回 None。"""
+    return COPY_COLUMN_SOURCES.get((header or "").strip().lower())
+
+
+def is_copy_only_column(header):
+    return (header or "").strip().lower() in COPY_COLUMN_SOURCES
+
 
 def load_dayz_csv(path):
     path = Path(path)
@@ -54,10 +69,20 @@ def load_dayz_csv(path):
 
 def write_dayz_csv(path, headers, rows):
     path = Path(path)
+    header_row = headers if headers else DAYZ_HEADERS
     with path.open("w", newline="", encoding="utf-8") as handle:
-        handle.write(_format_dayz_csv_row(DAYZ_HEADERS))
-        for row in rows:
-            handle.write(_format_dayz_csv_row(_normalize_row(row)))
+        handle.write(_format_dayz_csv_row(header_row))
+        for row in dayz_rows_for_save(rows):
+            handle.write(_format_dayz_csv_row(row))
+
+
+def dayz_rows_for_save(rows):
+    # ponytail: drop all-empty rows on save; keep partial translation rows
+    return [row for row in (_normalize_row(r) for r in rows) if not _is_empty_row(row)]
+
+
+def _is_empty_row(row):
+    return not any((cell or "").strip() for cell in row)
 
 
 def language_code_for_header(header):
@@ -131,7 +156,7 @@ def _is_translatable_target(headers, source_index, index):
         return False
     if index == 0:
         return False
-    if (headers[index] or "").strip().lower() == "original":
+    if is_copy_only_column(headers[index]):
         return False
     return bool(language_code_for_header(headers[index]))
 
@@ -150,18 +175,25 @@ def _normalize_row(row):
 
 
 def _build_header_map(headers):
-    fixed_indexes = {header: index for index, header in enumerate(DAYZ_HEADERS)}
+    # 归一化 key 为小写，与 header_index/language_code_for_header 等函数保持一致，
+    # 避免大写列头（如 "English"）被误判为未知列而跳过。
+    fixed_indexes = {
+        (header or "").strip().lower(): index
+        for index, header in enumerate(DAYZ_HEADERS)
+    }
     column_map = []
     warnings = []
     known_count = 0
+    last_index = max(0, len(headers) - 1) if headers else -1
 
     for source_index, header in enumerate(headers or []):
-        if header == "" and source_index == len(headers) - 1:
-            # Trailing empty DayZ column is optional; alone it does not validate a file.
+        normalized = (header or "").strip().lower()
+        # 仅末尾的空列头映射到 DayZ 末尾空列（index 15）；中间空列头视为未知。
+        if normalized == "" and source_index == last_index:
             column_map.append((source_index, len(DAYZ_HEADERS) - 1))
             continue
-        if header in fixed_indexes:
-            column_map.append((source_index, fixed_indexes[header]))
+        if normalized in fixed_indexes:
+            column_map.append((source_index, fixed_indexes[normalized]))
             known_count += 1
             continue
         warnings.append(f'Skipped unsupported DayZ language column "{header}".')
