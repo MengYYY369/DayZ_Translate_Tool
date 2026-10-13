@@ -1364,6 +1364,42 @@ class FakeApiKeyDialog:
         return FakeApiKeyDialog.next_value
 
 
+class FakeTestWorker(QObject):
+    """测试按钮的假 worker：只需要能被取消、能发结果信号。"""
+
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class FakeTestThread(QObject):
+    """假线程：只记录 quit / wait 被调了几次。"""
+
+    finished = Signal()
+
+    def __init__(self, running=True):
+        super().__init__()
+        self._running = running
+        self.quit_calls = 0
+        self.wait_calls = []
+
+    def isRunning(self):
+        return self._running
+
+    def quit(self):
+        self.quit_calls += 1
+
+    def wait(self, ms):
+        self.wait_calls.append(ms)
+        return False
+
+
 class TranslationSourceListDialogTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.NamedTemporaryFile(suffix=".ini", delete=False)
@@ -1561,31 +1597,9 @@ class TranslationSourceListDialogTests(unittest.TestCase):
         self.assertEqual(dialog.source_rows["volcano"].test_button.toolTip(), self.window.tr("source_test"))
 
     def test_starting_another_test_cancels_the_running_one(self):
-        class FakeWorker(QObject):
-            finished = Signal(object)
-            failed = Signal(str)
-
-            def __init__(self):
-                super().__init__()
-                self.cancelled = False
-
-            def cancel(self):
-                self.cancelled = True
-
-        class FakeThread(QObject):
-            def __init__(self):
-                super().__init__()
-                self.quit_calls = 0
-
-            def isRunning(self):
-                return True
-
-            def quit(self):
-                self.quit_calls += 1
-
         dialog = self.dialog()
-        worker = FakeWorker()
-        thread = FakeThread()
+        worker = FakeTestWorker()
+        thread = FakeTestThread()
         dialog._test_worker = worker
         dialog._test_thread = thread
         dialog._cancel_test_thread()
@@ -1593,18 +1607,30 @@ class TranslationSourceListDialogTests(unittest.TestCase):
         self.assertEqual(thread.quit_calls, 1)
         self.assertIsNone(dialog._test_worker)
         self.assertIsNone(dialog._test_thread)
+        # 线程还在跑，引用得留在主窗口上，直到它自己结束
+        self.assertEqual(self.window._test_threads, [(worker, thread)])
+        thread.finished.emit()
+        self.assertEqual(self.window._test_threads, [])
+
+    def test_closing_the_dialog_does_not_block_on_the_test(self):
+        dialog = self.dialog()
+        thread = FakeTestThread()
+        dialog._test_worker = FakeTestWorker()
+        dialog._test_thread = thread
+        dialog.done(0)
+        self.assertEqual(thread.wait_calls, [])
+        self.assertEqual(thread.quit_calls, 1)
+
+    def test_test_jobs_use_provider_language_codes(self):
+        jobs = self.dialog()._current_test_jobs()
+        self.assertEqual(jobs[0].source_code, "en")
+        self.assertEqual([job.target_code for job in jobs], ["zh-CN", "ru", "ja", "de"])
 
     def test_a_cancelled_test_no_longer_reports(self):
-        class FakeWorker(QObject):
-            finished = Signal(object)
-            failed = Signal(str)
-
-            def cancel(self):
-                pass
-
         dialog = self.dialog()
-        worker = FakeWorker()
+        worker = FakeTestWorker()
         dialog._test_worker = worker
+        dialog._test_thread = FakeTestThread(running=False)
         dialog._cancel_test_thread()
         with (
             patch("main.QMessageBox.information") as information,

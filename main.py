@@ -985,27 +985,34 @@ class TranslationSettingsDialog(QDialog):
             key = "test_translation_running" if row_source_id == source_id else "source_test"
             row.test_button.setToolTip(self.window.tr(key))
 
-    def _cancel_test_thread(self, wait_ms=0):
+    def _cancel_test_thread(self):
         """放弃正在跑的测试：断开结果回调、置取消位（请求返回后线程自然退出）。"""
         worker = getattr(self, "_test_worker", None)
         thread = getattr(self, "_test_thread", None)
-        if worker is not None:
-            for signal, slot in ((worker.finished, self._on_test_finished), (worker.failed, self._on_test_failed)):
-                try:
-                    signal.disconnect(slot)
-                except (RuntimeError, TypeError):
-                    pass
-            worker.cancel()
-        if thread is not None and thread.isRunning():
-            thread.quit()
-            if wait_ms:
-                thread.wait(wait_ms)
         self._test_worker = None
         self._test_thread = None
+        if worker is None or thread is None:
+            return
+        for signal, slot in ((worker.finished, self._on_test_finished), (worker.failed, self._on_test_failed)):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        worker.cancel()
+        if not thread.isRunning():
+            return
+        thread.quit()
+        # 线程可能还卡在网络请求里：它真正结束前不能丢掉引用，
+        # 否则 worker 会在另一个线程正在执行时被销毁（QThread 在运行中被析构会崩）。
+        self.window._test_threads.append((worker, thread))
+        thread.finished.connect(lambda w=worker, t=thread: self._release_test_thread(w, t))
+
+    def _release_test_thread(self, worker, thread):
+        self.window._test_threads = [pair for pair in self.window._test_threads if pair[0] is not worker]
 
     def done(self, result):
-        # 关窗/确定时别把还在跑的测试线程丢在后台。
-        self._cancel_test_thread(wait_ms=3000)
+        # 关窗/确定时不阻塞等待：线程挂在主窗口下、引用也留着，它自己会结束。
+        self._cancel_test_thread()
         super().done(result)
 
     def _on_test_finished(self, results):
@@ -1059,9 +1066,17 @@ class TranslationSettingsDialog(QDialog):
 
     def _current_test_jobs(self):
         test_word = "Knife"
+        # 和正式翻译一样先把表头名转成接口认识的语言代码（english->en、chinese->zh-CN）：
+        # 免费源拿 "chinese" 当语言码会直接 400。
         target_languages = ["chinese", "russian", "japanese", "german"]
         return [
-            TranslationJob(row=0, column=index, text=test_word, source_code="english", target_code=lang)
+            TranslationJob(
+                row=0,
+                column=index,
+                text=test_word,
+                source_code=source_language_code_for_header(self.window.source_header),
+                target_code=language_code_for_header(lang),
+            )
             for index, lang in enumerate(target_languages)
         ]
 
@@ -1542,6 +1557,8 @@ class DayzTranslateTool(QMainWindow):
         self.current_file_label = QLabel("", self)
         self.translation_thread = None
         self.translation_worker = None
+        # 被放弃的测试线程（用户又点了别的源/关掉了设置窗）：等它真结束再放手
+        self._test_threads = []
         # 跨次翻译共享的缓存：相同 (引擎, 模型, 源/目标语言, 文本) 的结果只翻译一次。
         # 落盘在软件目录旁，重开软件仍能复用；写不进去则回退到用户数据目录。
         self.translation_cache_store = TranslationCacheStore()
@@ -2583,6 +2600,15 @@ class DayzTranslateTool(QMainWindow):
         self.translation_worker = None
         self.translation_thread = None
 
+    def _ensure_test_threads_stopped(self, wait_ms=500):
+        """退出前收尾被放弃的测试线程，理由同 _ensure_translation_stopped。"""
+        for worker, thread in list(self._test_threads):
+            worker.cancel()
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(wait_ms)
+        self._test_threads = []
+
     def create_translation_worker(self, jobs, configs):
         # 注入共享缓存：多次翻译运行复用相同内容的翻译结果
         return TranslationWorker(
@@ -2760,6 +2786,7 @@ class DayzTranslateTool(QMainWindow):
                 event.ignore()
                 return
             self._ensure_translation_stopped()
+        self._ensure_test_threads_stopped()
         if self.isVisible() and not self.confirm_unsaved_close():
             event.ignore()
             return
