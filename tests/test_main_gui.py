@@ -1400,6 +1400,13 @@ class FakeTestThread(QObject):
         return False
 
 
+class FakeDeletedTestThread(FakeTestThread):
+    """线程结束、C++ 对象已被 deleteLater 销毁后的样子：一碰就抛 RuntimeError。"""
+
+    def isRunning(self):
+        raise RuntimeError("Internal C++ object (PySide6.QtCore.QThread) already deleted.")
+
+
 class TranslationSourceListDialogTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.NamedTemporaryFile(suffix=".ini", delete=False)
@@ -1611,6 +1618,30 @@ class TranslationSourceListDialogTests(unittest.TestCase):
         self.assertEqual(self.window._test_threads, [(worker, thread)])
         thread.finished.emit()
         self.assertEqual(self.window._test_threads, [])
+
+    def test_a_deleted_test_thread_does_not_break_the_next_click(self):
+        """点完一个源的测试再点另一个：上一个线程已被 deleteLater 销毁，不能抛异常。
+
+        真机上再去碰已销毁的 QThread 会抛 RuntimeError，异常被 Qt 吞掉后
+        按钮看起来就像卡死（点十次也没反应）。
+        """
+        dialog = self.dialog()
+        dialog._test_worker = FakeTestWorker()
+        dialog._test_thread = FakeDeletedTestThread()
+        dialog._cancel_test_thread()
+        self.assertIsNone(dialog._test_worker)
+        self.assertIsNone(dialog._test_thread)
+        self.assertEqual(self.window._test_threads, [])
+
+    def test_finishing_a_test_drops_the_thread_reference(self):
+        """测试结束就丢掉线程引用，否则下一次点击会摸到已销毁的对象。"""
+        dialog = self.dialog()
+        dialog._test_worker = FakeTestWorker()
+        dialog._test_thread = FakeTestThread(running=False)
+        with patch("main.QMessageBox.warning"):
+            dialog._on_test_finished(TranslationResults(cell_results={(0, 0): "刀"}))
+        self.assertIsNone(dialog._test_thread)
+        self.assertIsNone(dialog._test_worker)
 
     def test_closing_the_dialog_does_not_block_on_the_test(self):
         dialog = self.dialog()

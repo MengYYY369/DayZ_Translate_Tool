@@ -998,14 +998,19 @@ class TranslationSettingsDialog(QDialog):
                 signal.disconnect(slot)
             except (RuntimeError, TypeError):
                 pass
-        worker.cancel()
-        if not thread.isRunning():
+        try:
+            worker.cancel()
+            if not thread.isRunning():
+                return
+            thread.quit()
+            # 线程可能还卡在网络请求里：它真正结束前不能丢掉引用，
+            # 否则 worker 会在另一个线程正在执行时被销毁（QThread 在运行中被析构会崩）。
+            self.window._test_threads.append((worker, thread))
+            thread.finished.connect(lambda w=worker, t=thread: self._release_test_thread(w, t))
+        except RuntimeError:
+            # 线程已经结束、对象已被 deleteLater 销毁：没什么可取消的。
+            # （点完一个源的测试再点另一个时就会走到这里，不接住会让按钮像卡死一样没反应。）
             return
-        thread.quit()
-        # 线程可能还卡在网络请求里：它真正结束前不能丢掉引用，
-        # 否则 worker 会在另一个线程正在执行时被销毁（QThread 在运行中被析构会崩）。
-        self.window._test_threads.append((worker, thread))
-        thread.finished.connect(lambda w=worker, t=thread: self._release_test_thread(w, t))
 
     def _release_test_thread(self, worker, thread):
         self.window._test_threads = [pair for pair in self.window._test_threads if pair[0] is not worker]
@@ -1060,6 +1065,10 @@ class TranslationSettingsDialog(QDialog):
         )
 
     def _reset_test_button(self):
+        # 测试已经结束（信号就是从它发出来的），引用可以丢掉：线程马上会被
+        # deleteLater 销毁，留着引用下次点测试就会摸到已删除的对象。
+        self._test_thread = None
+        self._test_worker = None
         for row in self.source_rows.values():
             row.test_button.setEnabled(True)
             row.test_button.setToolTip(self.window.tr("source_test"))
@@ -2603,10 +2612,14 @@ class DayzTranslateTool(QMainWindow):
     def _ensure_test_threads_stopped(self, wait_ms=500):
         """退出前收尾被放弃的测试线程，理由同 _ensure_translation_stopped。"""
         for worker, thread in list(self._test_threads):
-            worker.cancel()
-            if thread.isRunning():
-                thread.quit()
-                thread.wait(wait_ms)
+            try:
+                worker.cancel()
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(wait_ms)
+            except RuntimeError:
+                # 线程已经结束并被销毁：跳过，别让它挡住窗口关闭。
+                continue
         self._test_threads = []
 
     def create_translation_worker(self, jobs, configs):
