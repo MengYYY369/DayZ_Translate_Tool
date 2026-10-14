@@ -79,6 +79,42 @@ Some public endpoints speak the OpenAI chat-completions protocol and need no key
 
 That particular endpoint comes from the [Index-Translate](https://github.com/bilibili/Index-Translate) project; its availability and quota are entirely up to them, so treat it as a bonus source, not a promise.
 
+## Command line
+
+The whole tool also works without the window, which is what makes it convenient for scripts and for letting an AI agent work on a table on its own. It goes through exactly the same code and the same settings as the window, so the source list you configured in `Settings → Translation Settings...` is the one the command line uses.
+
+```bash
+python cli.py <command> [options]
+```
+
+| Command | What it does |
+|---|---|
+| `inspect <csv>` | List the columns, how many cells each language column holds, and which rows have no source text |
+| `translate <csv>` | Translate the table; `--mode empty` (default) / `all` / `columns` / `rows`, narrowed further with `--columns a,b`, `--rows 3,5-9`, `--only-empty`, `--source ID`, `--from-column english`, `--wordbook PATH` |
+| `edit set-cell <csv> --row N --column COL --text "..."` | Write a single cell |
+| `edit replace <csv> --column COL --find OLD --replace NEW [--regex] [--match-case] [--whole-word]` | Find and replace inside one column |
+| `edit add-row <csv> --key NAME [--after N]` | Insert a row |
+| `edit delete-row <csv> --row N` / `--key NAME` | Delete a row |
+| `keys <csv> --from <config.cpp or a folder>` | Import the keys that are missing from a mod's `config.cpp` |
+| `wordbook list` / `set --original X --language chinesesimp --text 刀` / `remove --original X` / `import <csv>` / `export <csv>` | Read and edit the glossary |
+| `sources list` / `test [--source ID]` / `add-ai ...` / `remove ID` / `move ID --up` / `--down` / `set-rule ID --rules all,empty` / `set-key ID --key ...` | Read and edit the source list |
+| `cache stats` / `clear` | Inspect or empty the translation cache |
+
+Every command accepts `--json` (the result as JSON on stdout, progress on stderr) and `--quiet`.
+
+**Nothing is written unless you ask for it.** `translate` and the `edit` commands only read the file and put the result in a preview file (`stringtable.preview.csv`, or whatever `--preview` points at). Add `--write` to actually replace the table; a `.bak` copy is saved first. The commands that only change settings (`sources`, `wordbook`, `cache`) take effect right away — if the window is open, reopen it to see them.
+
+Exit codes: `0` all good, `1` some cells failed but the rest were saved, `2` the command could not run at all.
+
+A few typical runs:
+
+```bash
+python cli.py inspect stringtable.csv
+python cli.py translate stringtable.csv --mode empty --json
+python cli.py translate stringtable.csv --write
+python cli.py sources test
+```
+
 ## Notes and limitations
 
 - **Free sources are unofficial.** They are the same public endpoints a browser talks to, so they can be rate-limited or changed without notice. In practice Google starts answering `HTTP 429` after a few dozen requests, and MyMemory caps you at ~5000 characters per day. The tool reports these errors instead of hiding them, and failover moves the remaining rows to the next source.

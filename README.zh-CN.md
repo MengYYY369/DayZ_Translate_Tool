@@ -79,6 +79,42 @@ python main.py
 
 这个接口来自 [Index-Translate](https://github.com/bilibili/Index-Translate) 项目，能不能用、有没有额度限制都是那边说了算，当成额外的福利源就好，别当成稳定的服务。
 
+## 命令行
+
+不打开窗口也能用整套功能，写脚本或者让 AI 自己动手改表都很方便。命令行走的是和界面完全一样的那套代码、同一份设置，所以你在 `设置 → 翻译源设置…` 里配好的翻译源，命令行用的就是它。
+
+```bash
+python cli.py <命令> [参数]
+```
+
+| 命令 | 干什么 |
+|---|---|
+| `inspect <csv>` | 列出有几列、每个语言列有多少格有内容、哪些行没有原文 |
+| `translate <csv>` | 翻译表格；`--mode empty`（默认）/ `all` / `columns` / `rows`，还能用 `--columns a,b`、`--rows 3,5-9`、`--only-empty`、`--source 源ID`、`--from-column english`、`--wordbook 路径` 再收窄 |
+| `edit set-cell <csv> --row N --column 列名 --text "..."` | 改一个格子 |
+| `edit replace <csv> --column 列名 --find 旧 --replace 新 [--regex] [--match-case] [--whole-word]` | 在一列里批量查找替换 |
+| `edit add-row <csv> --key 键名 [--after N]` | 加一行 |
+| `edit delete-row <csv> --row N` / `--key 键名` | 删一行 |
+| `keys <csv> --from <config.cpp 或文件夹>` | 把模组 `config.cpp` 里缺的键导进来 |
+| `wordbook list` / `set --original X --language chinesesimp --text 刀` / `remove --original X` / `import <csv>` / `export <csv>` | 读改术语表 |
+| `sources list` / `test [--source 源ID]` / `add-ai ...` / `remove 源ID` / `move 源ID --up` / `--down` / `set-rule 源ID --rules all,empty` / `set-key 源ID --key ...` | 读改翻译源列表 |
+| `cache stats` / `clear` | 看缓存或者清空缓存 |
+
+所有命令都支持 `--json`（结果以 JSON 打到屏幕、进度打到错误输出）和 `--quiet`。
+
+**不主动说写就不写。** `translate` 和 `edit` 只读原文件，结果写进预览文件（默认是 `stringtable.preview.csv`，可以用 `--preview` 指定）。要真改原文件就加 `--write`，这时会先存一份 `.bak` 备份。只动设置的命令（`sources`、`wordbook`、`cache`）立即生效——界面开着的话重开一下才看得到。
+
+退出码：`0` 全部成功、`1` 有格子失败但其余已保存、`2` 命令根本没跑起来。
+
+几个常用例子：
+
+```bash
+python cli.py inspect stringtable.csv
+python cli.py translate stringtable.csv --mode empty --json
+python cli.py translate stringtable.csv --write
+python cli.py sources test
+```
+
 ## 注意事项和已知限制
 
 - **免费源都是非官方接口。** 它们就是浏览器在用的那些公共地址，随时可能被限流或者改掉。实际使用中，谷歌翻几十条就开始返回 `HTTP 429`，MyMemory 每天大概只给你 5000 个字符。软件会把这些报错如实显示出来，不会假装成功，同时自动接力把剩下的交给下一个源。
