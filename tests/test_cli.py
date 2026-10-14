@@ -362,3 +362,135 @@ class EditTests(CliTestCase):
         code, _out, err = self.run_cli("edit", "delete-row", str(path), "--row", "1", "--key", "k2")
         self.assertEqual(code, 2)
         self.assertIn("not both", err)
+
+
+CONFIG_CPP = """
+class CfgVehicles
+{
+    class MyCar
+    {
+        displayName = "$STR_MyCar_Name";
+        descriptionShort = "$STR_MyCar_Desc";
+        attachments[] = {"$STR_MyCar_Wheel"};
+    };
+};
+"""
+
+
+class KeysTests(CliTestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.cpp = Path(self.folder.name) / "config.cpp"
+        self.cpp.write_text(CONFIG_CPP, encoding="utf-8")
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def test_adds_missing_keys(self):
+        # 提取器只认引号里带 $ / # 前缀的键（config_cpp.py:6）
+        path = write_csv()
+        code, payload = self.run_json("keys", str(path), "--from", str(self.cpp), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["data"]["added"], 3)
+        self.assertEqual(payload["data"]["keys_found"], 3)
+
+    def test_write_saves_back(self):
+        path = write_csv()
+        self.run_json("keys", str(path), "--from", str(self.cpp), "--write", "--json")
+        self.assertIn("STR_MyCar_Name", path.read_text(encoding="utf-8"))
+
+    def test_skipped_counts_existing(self):
+        path = write_csv("Language,original,english,chinesesimp\n"
+                         "STR_MyCar_Name,Car,Car,\n")
+        _code, payload = self.run_json("keys", str(path), "--from", str(self.cpp), "--json")
+        self.assertEqual(payload["data"]["added"], 2)
+        self.assertEqual(payload["data"]["skipped"], 1)
+
+    def test_folder_input(self):
+        path = write_csv()
+        code, payload = self.run_json("keys", str(path), "--from", self.folder.name, "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["data"]["added"], 3)
+
+    def test_missing_path_is_exit_2(self):
+        path = write_csv()
+        code, _out, _err = self.run_cli("keys", str(path), "--from", "no-such-path")
+        self.assertEqual(code, 2)
+
+
+WORDBOOK_TEXT = "original,english,chinesesimp\nKnife,Knife,刀\n"
+
+
+class WordbookTests(CliTestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.wordbook = Path(self.folder.name) / "wordbook.csv"
+        self.wordbook.write_text(WORDBOOK_TEXT, encoding="utf-8")
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def test_list(self):
+        code, payload = self.run_json("wordbook", "list", "--wordbook", str(self.wordbook), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["data"]["count"], 1)
+
+    def test_list_missing_file_is_empty(self):
+        missing = Path(self.folder.name) / "nope.csv"
+        code, payload = self.run_json("wordbook", "list", "--wordbook", str(missing), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["data"]["count"], 0)
+
+    def test_set_updates_existing_row(self):
+        code, payload = self.run_json("wordbook", "set", "--wordbook", str(self.wordbook),
+                                      "--original", "Knife", "--language", "chinesesimp",
+                                      "--text", "匕首", "--json")
+        self.assertEqual(code, 0)
+        self.assertIn("匕首", self.wordbook.read_text(encoding="utf-8"))
+        self.assertEqual(payload["data"]["created"], False)
+
+    def test_set_creates_new_row(self):
+        code, payload = self.run_json("wordbook", "set", "--wordbook", str(self.wordbook),
+                                      "--original", "Gun", "--language", "chinesesimp",
+                                      "--text", "枪", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["data"]["created"], True)
+        self.assertIn("Gun", self.wordbook.read_text(encoding="utf-8"))
+
+    def test_set_unknown_language_is_exit_2(self):
+        code, _out, _err = self.run_cli("wordbook", "set", "--wordbook", str(self.wordbook),
+                                        "--original", "Knife", "--language", "klingon", "--text", "x")
+        self.assertEqual(code, 2)
+
+    def test_remove(self):
+        _code, payload = self.run_json("wordbook", "remove", "--wordbook", str(self.wordbook),
+                                       "--original", "Knife", "--json")
+        self.assertEqual(payload["data"]["removed"], 1)
+        self.assertNotIn("Knife", self.wordbook.read_text(encoding="utf-8"))
+
+    def test_remove_unknown_is_exit_2(self):
+        code, _out, _err = self.run_cli("wordbook", "remove", "--wordbook", str(self.wordbook),
+                                        "--original", "Nope")
+        self.assertEqual(code, 2)
+
+    def test_import_merges(self):
+        extra = Path(self.folder.name) / "extra.csv"
+        extra.write_text("original,english,chinesesimp\nGun,Gun,枪\n", encoding="utf-8")
+        _code, payload = self.run_json("wordbook", "import", str(extra),
+                                       "--wordbook", str(self.wordbook), "--json")
+        self.assertEqual(payload["data"]["imported"], 1)
+        self.assertIn("Gun", self.wordbook.read_text(encoding="utf-8"))
+
+    def test_export(self):
+        target = Path(self.folder.name) / "export.csv"
+        _code, payload = self.run_json("wordbook", "export", str(target),
+                                       "--wordbook", str(self.wordbook), "--json")
+        self.assertEqual(payload["data"]["exported"], 1)
+        self.assertTrue(target.exists())
+
+    def test_export_creates_the_parent_folder(self):
+        target = Path(self.folder.name) / "nope" / "deep" / "export.csv"
+        _code, payload = self.run_json("wordbook", "export", str(target),
+                                       "--wordbook", str(self.wordbook), "--json")
+        self.assertEqual(payload["data"]["exported"], 1)
+        self.assertTrue(target.exists())

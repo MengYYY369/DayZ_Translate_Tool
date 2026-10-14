@@ -437,6 +437,151 @@ def _set_cell(row, column, text):
     row[column] = text
 
 
+# —— keys ——
+
+def cmd_keys(args, reporter):
+    from config_cpp import collect_config_cpp_files, extract_keys_from_paths, merge_language_keys
+
+    path = Path(args.file)
+    headers, rows, warnings = load_table(path)
+    # --from 可以给 config.cpp，也可以给文件夹（文件夹要自己展开，extract_keys_from_paths 不展开）
+    sources = []
+    for value in args.from_paths:
+        source = Path(value)
+        if not source.exists():
+            raise CliError(f"path not found: {source}")
+        if source.is_dir():
+            found = collect_config_cpp_files(source)
+            if not found:
+                raise CliError(f"no config.cpp found under: {source}")
+            sources.extend(found)
+        else:
+            sources.append(source)
+    keys, file_warnings = extract_keys_from_paths(sources)
+    merged, added, skipped = merge_language_keys(rows, keys)
+    data = {"keys_found": len(keys), "added": added, "skipped": skipped}
+    apply_changes(args, reporter, path, headers, merged, data)
+    reporter.emit(envelope("keys", path, data, warnings + file_warnings),
+                  f"added {added} key(s), skipped {skipped}")
+    return EXIT_OK
+
+
+# —— wordbook ——
+
+def _wordbook_path(args):
+    value = getattr(args, "wordbook", None)
+    return Path(value) if value else flow.config_dir() / "wordbook.csv"
+
+
+def cmd_wordbook_list(args, reporter):
+    from wordbook_csv import load_wordbook_csv
+
+    path = _wordbook_path(args)
+    if path.exists():
+        headers, rows = load_wordbook_csv(path)
+    else:
+        headers, rows = [], []
+    data = {"wordbook": str(path), "headers": list(headers), "count": len(rows), "rows": rows}
+    lines = [f"wordbook: {path}", f"entries: {len(rows)}"]
+    for row in rows:
+        lines.append("  " + " | ".join(row))
+    reporter.emit(envelope("wordbook list", path, data), "\n".join(lines))
+    return EXIT_OK
+
+
+def cmd_wordbook_set(args, reporter):
+    from wordbook_csv import WORDBOOK_HEADERS, load_wordbook_csv, write_wordbook_csv
+
+    path = _wordbook_path(args)
+    if args.language not in WORDBOOK_HEADERS:
+        raise CliError(f"unknown language column: {args.language}")
+    column = WORDBOOK_HEADERS.index(args.language)
+    _headers, rows = load_wordbook_csv(path) if path.exists() else (list(WORDBOOK_HEADERS), [])
+    created = True
+    for row in rows:
+        if (row[0] or "").strip() == args.original:
+            created = False
+            _set_cell(row, column, args.text)
+            break
+    if created:
+        new_row = [""] * len(WORDBOOK_HEADERS)
+        new_row[0] = args.original
+        new_row[column] = args.text
+        rows.append(new_row)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_wordbook_csv(path, rows)
+    data = {"wordbook": str(path), "created": created, "original": args.original,
+            "language": args.language, "text": args.text, "count": len(rows)}
+    reporter.emit(envelope("wordbook set", path, data),
+                  f"{'added' if created else 'updated'} {args.original} -> {args.text}")
+    return EXIT_OK
+
+
+def cmd_wordbook_remove(args, reporter):
+    from wordbook_csv import load_wordbook_csv, write_wordbook_csv
+
+    path = _wordbook_path(args)
+    if not path.exists():
+        raise CliError(f"wordbook not found: {path}")
+    _headers, rows = load_wordbook_csv(path)
+    kept = [row for row in rows if (row[0] or "").strip() != args.original]
+    removed = len(rows) - len(kept)
+    if not removed:
+        raise CliError(f"no wordbook entry for: {args.original}")
+    write_wordbook_csv(path, kept)
+    data = {"wordbook": str(path), "removed": removed, "count": len(kept)}
+    reporter.emit(envelope("wordbook remove", path, data), f"removed {removed} entry")
+    return EXIT_OK
+
+
+def cmd_wordbook_import(args, reporter):
+    from wordbook_csv import WORDBOOK_HEADERS, load_wordbook_csv, write_wordbook_csv
+
+    path = _wordbook_path(args)
+    source = Path(args.file)
+    if not source.exists():
+        raise CliError(f"file not found: {source}")
+    _headers, incoming = load_wordbook_csv(source)
+    _headers, rows = load_wordbook_csv(path) if path.exists() else (list(WORDBOOK_HEADERS), [])
+    known = {(row[0] or "").strip(): row for row in rows}
+    imported = 0
+    for row in incoming:
+        original = (row[0] or "").strip()
+        if not original:
+            continue
+        target = known.get(original)
+        if target is None:
+            target = [""] * len(WORDBOOK_HEADERS)
+            target[0] = original
+            rows.append(target)
+            known[original] = target
+        for column in range(1, min(len(row), len(WORDBOOK_HEADERS))):
+            value = (row[column] or "").strip()
+            if value:
+                _set_cell(target, column, value)
+        imported += 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_wordbook_csv(path, rows)
+    data = {"wordbook": str(path), "imported": imported, "count": len(rows)}
+    reporter.emit(envelope("wordbook import", path, data), f"imported {imported} entr(ies)")
+    return EXIT_OK
+
+
+def cmd_wordbook_export(args, reporter):
+    from wordbook_csv import load_wordbook_csv, write_wordbook_csv
+
+    path = _wordbook_path(args)
+    if not path.exists():
+        raise CliError(f"wordbook not found: {path}")
+    _headers, rows = load_wordbook_csv(path)
+    target = Path(args.file)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write_wordbook_csv(target, rows)
+    data = {"wordbook": str(path), "exported": len(rows), "target": str(target)}
+    reporter.emit(envelope("wordbook export", target, data), f"exported {len(rows)} entr(ies) to {target}")
+    return EXIT_OK
+
+
 # —— 命令行装配 ——
 
 def build_parser():
@@ -497,6 +642,47 @@ def build_parser():
     delete_row.add_argument("--key")
     _add_write_flags(delete_row)
     delete_row.set_defaults(handler=cmd_edit_delete_row)
+
+    keys_parser = subparsers.add_parser("keys", help="import missing keys from config.cpp")
+    keys_parser.add_argument("file")
+    keys_parser.add_argument("--from", dest="from_paths", action="append", required=True,
+                             help="a config.cpp file or a folder (repeatable)")
+    _add_write_flags(keys_parser)
+    keys_parser.set_defaults(handler=cmd_keys)
+
+    wordbook_parser = subparsers.add_parser("wordbook", help="read and write the glossary wordbook")
+    wordbook_sub = wordbook_parser.add_subparsers(dest="wordbook_command", required=True)
+
+    wb_list = wordbook_sub.add_parser("list")
+    wb_list.add_argument("--wordbook")
+    _add_json(wb_list)
+    wb_list.set_defaults(handler=cmd_wordbook_list)
+
+    wb_set = wordbook_sub.add_parser("set")
+    wb_set.add_argument("--original", required=True)
+    wb_set.add_argument("--language", required=True)
+    wb_set.add_argument("--text", required=True)
+    wb_set.add_argument("--wordbook")
+    _add_json(wb_set)
+    wb_set.set_defaults(handler=cmd_wordbook_set)
+
+    wb_remove = wordbook_sub.add_parser("remove")
+    wb_remove.add_argument("--original", required=True)
+    wb_remove.add_argument("--wordbook")
+    _add_json(wb_remove)
+    wb_remove.set_defaults(handler=cmd_wordbook_remove)
+
+    wb_import = wordbook_sub.add_parser("import")
+    wb_import.add_argument("file")
+    wb_import.add_argument("--wordbook")
+    _add_json(wb_import)
+    wb_import.set_defaults(handler=cmd_wordbook_import)
+
+    wb_export = wordbook_sub.add_parser("export")
+    wb_export.add_argument("file")
+    wb_export.add_argument("--wordbook")
+    _add_json(wb_export)
+    wb_export.set_defaults(handler=cmd_wordbook_export)
     return parser
 
 
