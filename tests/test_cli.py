@@ -255,3 +255,110 @@ class TranslateTests(CliTestCase):
         code, _out, _err = self.run_cli("translate", str(path), "--preview", str(same))
         self.assertEqual(code, 2)
         self.assertIn("Knife", path.read_text(encoding="utf-8"))
+
+
+class EditTests(CliTestCase):
+    def test_set_cell_writes_after_write_flag(self):
+        path = write_csv()
+        code, payload = self.run_json("edit", "set-cell", str(path), "--row", "2",
+                                      "--column", "chinesesimp", "--text", "枪炮", "--write", "--json")
+        self.assertEqual(code, 0)
+        self.assertIn("枪炮", path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["data"]["changes"][0]["row"], 2)
+
+    def test_set_cell_without_write_only_previews(self):
+        path = write_csv()
+        _code, payload = self.run_json("edit", "set-cell", str(path), "--row", "2",
+                                       "--column", "chinesesimp", "--text", "枪炮", "--json")
+        self.assertNotIn("枪炮", path.read_text(encoding="utf-8"))
+        self.assertIn("枪炮", Path(payload["data"]["preview"]).read_text(encoding="utf-8"))
+
+    def test_set_cell_bad_row_is_exit_2(self):
+        path = write_csv()
+        code, _out, _err = self.run_cli("edit", "set-cell", str(path), "--row", "99",
+                                        "--column", "chinesesimp", "--text", "x")
+        self.assertEqual(code, 2)
+
+    def test_replace_all_matches_in_column(self):
+        path = write_csv()
+        self.run_json("edit", "replace", str(path), "--column", "english",
+                      "--find", "Gun", "--replace", "Rifle", "--write", "--json")
+        headers, rows, _warnings = load_dayz_csv(path)
+        english, original = headers.index("english"), headers.index("original")
+        self.assertEqual(rows[1][english], "Rifle")
+        self.assertEqual(rows[1][original], "Gun")       # 只动了 english 列
+
+    def test_replace_regex(self):
+        path = write_csv()
+        _code, payload = self.run_json("edit", "replace", str(path), "--column", "english",
+                                       "--find", "Kni.e", "--replace", "Blade", "--regex", "--json")
+        self.assertEqual(payload["data"]["changes"][0]["before"], "Knife")
+
+    def test_replace_ignore_case(self):
+        path = write_csv()
+        _code, payload = self.run_json("edit", "replace", str(path), "--column", "english",
+                                       "--find", "gun", "--replace", "Rifle",
+                                       "--ignore-case", "--json")
+        self.assertEqual(len(payload["data"]["changes"]), 1)
+
+    def test_replace_case_sensitive_by_default(self):
+        path = write_csv()
+        _code, payload = self.run_json("edit", "replace", str(path), "--column", "english",
+                                       "--find", "gun", "--replace", "Rifle", "--json")
+        self.assertEqual(payload["data"]["changes"], [])
+
+    def test_replace_whole_word(self):
+        path = write_csv("Language,original,english,chinesesimp\nk1,Gun,Gun,\nk2,Gunpowder,Gunpowder,\n")
+        _code, payload = self.run_json("edit", "replace", str(path), "--column", "english",
+                                       "--find", "Gun", "--replace", "Rifle",
+                                       "--whole-word", "--json")
+        self.assertEqual(len(payload["data"]["changes"]), 1)
+
+    def test_add_row_appends_with_key(self):
+        path = write_csv()
+        _code, payload = self.run_json("edit", "add-row", str(path), "--key", "k9", "--write", "--json")
+        self.assertEqual(payload["data"]["added_row"], 4)
+        self.assertIn("k9", path.read_text(encoding="utf-8"))
+
+    def test_add_row_after_position(self):
+        path = write_csv()
+        _code, payload = self.run_json("edit", "add-row", str(path), "--key", "k9",
+                                       "--after", "1", "--json")
+        self.assertEqual(payload["data"]["added_row"], 2)
+
+    def test_delete_row_by_number(self):
+        path = write_csv()
+        _code, payload = self.run_json("edit", "delete-row", str(path), "--row", "2", "--write", "--json")
+        self.assertEqual(payload["data"]["deleted"], ["k2"])
+        self.assertNotIn("k2", path.read_text(encoding="utf-8"))
+
+    def test_delete_row_by_key(self):
+        path = write_csv()
+        _code, payload = self.run_json("edit", "delete-row", str(path), "--key", "k2", "--json")
+        self.assertEqual(payload["data"]["deleted"], ["k2"])
+
+    def test_delete_unknown_key_is_exit_2(self):
+        path = write_csv()
+        code, _out, _err = self.run_cli("edit", "delete-row", str(path), "--key", "nope")
+        self.assertEqual(code, 2)
+
+    def test_set_cell_with_several_columns_is_exit_2(self):
+        path = write_csv()
+        code, _out, err = self.run_cli("edit", "set-cell", str(path), "--row", "2",
+                                       "--column", "english,chinesesimp", "--text", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("one column", err)
+
+    def test_add_row_without_key_is_exit_2(self):
+        path = write_csv()
+        code, _out, err = self.run_cli("edit", "add-row", str(path), "--write")
+        self.assertEqual(code, 2)
+        self.assertIn("--key", err)
+        _headers, rows, _warnings = load_dayz_csv(path)
+        self.assertEqual(len(rows), 3)          # 盘上没多出一行来
+
+    def test_delete_row_with_both_row_and_key_is_exit_2(self):
+        path = write_csv()
+        code, _out, err = self.run_cli("edit", "delete-row", str(path), "--row", "1", "--key", "k2")
+        self.assertEqual(code, 2)
+        self.assertIn("not both", err)

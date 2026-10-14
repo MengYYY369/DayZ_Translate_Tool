@@ -335,6 +335,108 @@ def _load_wordbook_rows(path=None):
     return rows
 
 
+# —— edit ——
+
+def cmd_edit_set_cell(args, reporter):
+    path = Path(args.file)
+    headers, rows, warnings = load_table(path)
+    if args.row < 1 or args.row > len(rows):
+        raise CliError(f"row out of range: {args.row} (file has {len(rows)} data rows)")
+    column = _single_column(headers, args.column)
+    row_index = args.row - 1
+    before = _cell(rows[row_index], column)
+    _set_cell(rows[row_index], column, args.text)
+    data = {"changes": [{"row": args.row, "column": column, "header": headers[column],
+                         "before": before, "after": args.text}]}
+    apply_changes(args, reporter, path, headers, rows, data)
+    reporter.emit(envelope("edit set-cell", path, data, warnings),
+                  f"row {args.row} {headers[column]}: {before!r} -> {args.text!r}")
+    return EXIT_OK
+
+
+def cmd_edit_replace(args, reporter):
+    path = Path(args.file)
+    headers, rows, warnings = load_table(path)
+    column = _single_column(headers, args.column)
+    flags = re.IGNORECASE if args.ignore_case else 0
+    pattern = args.find if args.regex else re.escape(args.find)
+    if args.whole_word:
+        pattern = rf"\b{pattern}\b"
+    try:
+        regex = re.compile(pattern, flags)
+    except re.error as exc:
+        raise CliError(f"bad pattern: {exc}")
+    changes = []
+    for row_index, row in enumerate(rows):
+        before = _cell(row, column)
+        if not before:
+            continue
+        after = regex.sub(args.replace, before)
+        if after == before:
+            continue
+        _set_cell(row, column, after)
+        changes.append({"row": row_index + 1, "column": column, "header": headers[column],
+                        "before": before, "after": after})
+    data = {"changes": changes, "count": len(changes)}
+    apply_changes(args, reporter, path, headers, rows, data)
+    reporter.emit(envelope("edit replace", path, data, warnings), f"replaced {len(changes)} cell(s)")
+    return EXIT_OK
+
+
+def cmd_edit_add_row(args, reporter):
+    path = Path(args.file)
+    headers, rows, warnings = load_table(path)
+    if not args.key:
+        # 整行全空的行保存时会被 dayz_rows_for_save 丢掉，不给键名就加不出东西来 ——
+        # 与其报一个盘上不存在的 added_row，不如直接报错。
+        raise CliError("edit add-row needs --key")
+    new_row = [""] * len(headers)
+    _set_cell(new_row, 0, args.key)
+    if args.after is None:
+        rows.append(new_row)
+        position = len(rows)
+    else:
+        if args.after < 0 or args.after > len(rows):
+            raise CliError(f"--after out of range: {args.after}")
+        rows.insert(args.after, new_row)
+        position = args.after + 1
+    data = {"added_row": position, "key": args.key or ""}
+    apply_changes(args, reporter, path, headers, rows, data)
+    reporter.emit(envelope("edit add-row", path, data, warnings), f"added row {position}")
+    return EXIT_OK
+
+
+def cmd_edit_delete_row(args, reporter):
+    path = Path(args.file)
+    headers, rows, warnings = load_table(path)
+    if args.row is not None and args.key is not None:
+        raise CliError("edit delete-row takes --row or --key, not both")
+    if args.row is not None:
+        if args.row < 1 or args.row > len(rows):
+            raise CliError(f"row out of range: {args.row} (file has {len(rows)} data rows)")
+        indexes = [args.row - 1]
+    elif args.key is not None:
+        indexes = [index for index, row in enumerate(rows) if _cell(row, 0) == args.key]
+        if not indexes:
+            raise CliError(f"no row with key: {args.key}")
+    else:
+        raise CliError("edit delete-row needs --row or --key")
+    deleted = [{"row": index + 1, "key": _cell(rows[index], 0)} for index in indexes]
+    for index in sorted(indexes, reverse=True):
+        del rows[index]
+    data = {"deleted": [item["key"] for item in deleted], "rows": deleted}
+    apply_changes(args, reporter, path, headers, rows, data)
+    reporter.emit(envelope("edit delete-row", path, data, warnings),
+                  f"deleted {len(deleted)} row(s)")
+    return EXIT_OK
+
+
+def _set_cell(row, column, text):
+    while len(row) <= column:
+        row.append("")
+    row[column] = text
+
+
 # —— 命令行装配 ——
 
 def build_parser():
@@ -359,7 +461,49 @@ def build_parser():
     translate_parser.add_argument("--write", action="store_true", help="save back to the original file")
     _add_json(translate_parser)
     translate_parser.set_defaults(handler=cmd_translate)
+
+    edit_parser = subparsers.add_parser("edit", help="change cells, rows and text in a csv")
+    edit_sub = edit_parser.add_subparsers(dest="edit_command", required=True)
+
+    set_cell = edit_sub.add_parser("set-cell")
+    set_cell.add_argument("file")
+    set_cell.add_argument("--row", type=int, required=True)
+    set_cell.add_argument("--column", required=True)
+    set_cell.add_argument("--text", required=True)
+    _add_write_flags(set_cell)
+    set_cell.set_defaults(handler=cmd_edit_set_cell)
+
+    replace = edit_sub.add_parser("replace")
+    replace.add_argument("file")
+    replace.add_argument("--column", required=True)
+    replace.add_argument("--find", required=True)
+    replace.add_argument("--replace", required=True)
+    replace.add_argument("--regex", action="store_true")
+    replace.add_argument("--ignore-case", action="store_true")
+    replace.add_argument("--whole-word", action="store_true")
+    _add_write_flags(replace)
+    replace.set_defaults(handler=cmd_edit_replace)
+
+    add_row = edit_sub.add_parser("add-row")
+    add_row.add_argument("file")
+    add_row.add_argument("--key")
+    add_row.add_argument("--after", type=int)
+    _add_write_flags(add_row)
+    add_row.set_defaults(handler=cmd_edit_add_row)
+
+    delete_row = edit_sub.add_parser("delete-row")
+    delete_row.add_argument("file")
+    delete_row.add_argument("--row", type=int)
+    delete_row.add_argument("--key")
+    _add_write_flags(delete_row)
+    delete_row.set_defaults(handler=cmd_edit_delete_row)
     return parser
+
+
+def _add_write_flags(parser):
+    parser.add_argument("--preview", help="where to write the preview file")
+    parser.add_argument("--write", action="store_true", help="save back to the original file")
+    _add_json(parser)
 
 
 def _add_json(parser):
