@@ -582,6 +582,177 @@ def cmd_wordbook_export(args, reporter):
     return EXIT_OK
 
 
+# —— sources ——
+
+def _source_entries(sources):
+    items = []
+    for position, entry in enumerate(sources.entries, start=1):
+        spec = flow.FREE_SOURCE_SPECS.get(entry.source_id, {}) if not entry.is_ai else {}
+        items.append({
+            "order": position,
+            "id": entry.source_id,
+            "kind": entry.kind,
+            "name": entry.name or entry.source_id,
+            "api_type": entry.api_type,
+            "rules": list(entry.rules),
+            "has_key": bool(entry.api_key),
+            "needs_key": bool(spec.get("needs_key")),
+            "concurrency": entry.concurrency,
+            "interval": entry.interval,
+        })
+    return items
+
+
+def cmd_sources_list(args, reporter):
+    settings = flow.load_app_settings()
+    items = _source_entries(settings.sources)
+    data = {"count": len(items), "sources": items}
+    lines = ["id            kind  rules                 name"]
+    for item in items:
+        lines.append(f"{item['id']:<13} {item['kind']:<5} {','.join(item['rules']):<21} {item['name']}")
+    reporter.emit(envelope("sources list", None, data), "\n".join(lines))
+    return EXIT_OK
+
+
+def cmd_sources_test(args, reporter):
+    settings = flow.load_app_settings()
+    entries = settings.sources.entries
+    if args.source:
+        entry = settings.sources.find(args.source)
+        if entry is None:
+            raise CliError(f"unknown source id: {args.source}")
+        entries = [entry]
+    if not entries:
+        raise CliError("no translation source configured")
+    source_header = settings.source_header
+    jobs = flow.build_test_jobs(source_header)
+    glossary = flow.build_glossary(_load_wordbook_rows(args.wordbook))
+    results = []
+    for entry in entries:
+        config = flow.build_source_config(entry, char_budget=settings.char_budget,
+                                          timeout=settings.timeout, label=entry.name or entry.source_id,
+                                          glossary=glossary, glossary_source_key=source_header)
+        reporter.info(f"testing {entry.source_id} ...")
+        outcome = flow.run_translation(jobs, [config], source_header, retry_policy=flow.TEST_RETRY_POLICY)
+        translated = len(outcome.cell_results)
+        results.append({
+            "id": entry.source_id,
+            "name": entry.name or entry.source_id,
+            "translated": translated,
+            "total": len(jobs),
+            "ok": translated > 0,
+            "errors": outcome.errors[:3],
+        })
+    data = {"source_header": source_header, "results": results}
+    lines = [f"{item['id']}: {item['translated']}/{item['total']} "
+             f"{'ok' if item['ok'] else 'FAILED'}" for item in results]
+    for item in results:
+        for message in item["errors"]:
+            lines.append(f"  {item['id']}: {message}")
+    reporter.emit(envelope("sources test", None, data), "\n".join(lines))
+    return EXIT_OK if all(item["ok"] for item in results) else EXIT_PARTIAL
+
+
+def cmd_sources_add_ai(args, reporter):
+    if args.type not in flow.AI_TYPE_KEYS:
+        raise CliError(f"unknown api type: {args.type} (choose from {', '.join(flow.AI_TYPE_KEYS)})")
+    if not args.name.strip():
+        raise CliError("--name is required")
+    rules = parse_rules(args.rules)
+    settings = flow.load_app_settings()
+    entry = SourceEntry(kind="ai", name=args.name.strip(), api_type=args.type, rules=rules,
+                        api_key=args.key or "", base_url=args.base_url or "",
+                        model=args.model or "", concurrency=max(1, args.concurrency),
+                        interval=max(0.0, args.interval))
+    settings.sources.add_ai(entry)
+    flow.save_sources(settings.sources)
+    data = _restart_required({"id": entry.source_id, "name": entry.name, "rules": rules})
+    reporter.emit(envelope("sources add-ai", None, data),
+                  f"added {entry.source_id} ({entry.name})" + RESTART_HINT)
+    return EXIT_OK
+
+
+def cmd_sources_remove(args, reporter):
+    settings = flow.load_app_settings()
+    entry = settings.sources.find(args.id)
+    if entry is None:
+        raise CliError(f"unknown source id: {args.id}")
+    settings.sources.remove(args.id)
+    flow.save_sources(settings.sources)
+    data = _restart_required({"id": args.id, "count": len(settings.sources.entries)})
+    reporter.emit(envelope("sources remove", None, data), f"removed {args.id}" + RESTART_HINT)
+    return EXIT_OK
+
+
+def cmd_sources_move(args, reporter):
+    if args.up == args.down:
+        raise CliError("pass exactly one of --up / --down")
+    settings = flow.load_app_settings()
+    if settings.sources.find(args.id) is None:
+        raise CliError(f"unknown source id: {args.id}")
+    if args.up:
+        settings.sources.move_up(args.id)
+    else:
+        settings.sources.move_down(args.id)
+    flow.save_sources(settings.sources)
+    order = [entry.source_id for entry in settings.sources.entries]
+    data = _restart_required({"id": args.id, "order": order})
+    reporter.emit(envelope("sources move", None, data),
+                  "order: " + ", ".join(order) + RESTART_HINT)
+    return EXIT_OK
+
+
+def cmd_sources_set_rule(args, reporter):
+    rules = parse_rules(args.rules)
+    settings = flow.load_app_settings()
+    if settings.sources.find(args.id) is None:
+        raise CliError(f"unknown source id: {args.id}")
+    for rule in ALL_RULES:
+        settings.sources.set_rule(args.id, rule, rule in rules)
+    flow.save_sources(settings.sources)
+    entry = settings.sources.find(args.id)
+    data = _restart_required({"id": args.id, "rules": list(entry.rules)})
+    reporter.emit(envelope("sources set-rule", None, data),
+                  f"{args.id}: {', '.join(entry.rules) or '(none)'}" + RESTART_HINT)
+    return EXIT_OK
+
+
+def cmd_sources_set_key(args, reporter):
+    settings = flow.load_app_settings()
+    entry = settings.sources.find(args.id)
+    if entry is None:
+        raise CliError(f"unknown source id: {args.id}")
+    entry.api_key = args.key or ""
+    flow.save_sources(settings.sources)
+    data = _restart_required({"id": args.id, "has_key": bool(entry.api_key)})
+    reporter.emit(envelope("sources set-key", None, data),
+                  f"{args.id}: key {'set' if entry.api_key else 'cleared'}" + RESTART_HINT)
+    return EXIT_OK
+
+
+# —— cache ——
+
+def cmd_cache_stats(args, reporter):
+    store = make_cache_store()
+    cache = store.load()
+    data = {"path": str(store.path), "entries": len(cache), "writable": store.is_writable()}
+    reporter.emit(envelope("cache stats", None, data),
+                  f"cache: {store.path}\nentries: {len(cache)}")
+    return EXIT_OK
+
+
+def cmd_cache_clear(args, reporter):
+    store = make_cache_store()
+    before = len(store.load())
+    store.clear()
+    # TranslationCacheStore.clear() 删不掉时也会静默返回，所以看文件还在不在，别谎报成功
+    if store.path.exists():
+        raise CliError(f"could not delete the cache file: {store.path}")
+    data = {"path": str(store.path), "removed": before, "cleared": True}
+    reporter.emit(envelope("cache clear", None, data), f"cleared {before} cached translation(s)")
+    return EXIT_OK
+
+
 # —— 命令行装配 ——
 
 def build_parser():
@@ -683,6 +854,66 @@ def build_parser():
     wb_export.add_argument("--wordbook")
     _add_json(wb_export)
     wb_export.set_defaults(handler=cmd_wordbook_export)
+
+    sources_parser = subparsers.add_parser("sources", help="read and edit the translation source list")
+    sources_sub = sources_parser.add_subparsers(dest="sources_command", required=True)
+
+    src_list = sources_sub.add_parser("list")
+    _add_json(src_list)
+    src_list.set_defaults(handler=cmd_sources_list)
+
+    src_test = sources_sub.add_parser("test")
+    src_test.add_argument("--source")
+    src_test.add_argument("--wordbook")
+    _add_json(src_test)
+    src_test.set_defaults(handler=cmd_sources_test)
+
+    src_add = sources_sub.add_parser("add-ai")
+    src_add.add_argument("--name", required=True)
+    src_add.add_argument("--type", required=True)
+    src_add.add_argument("--base-url")
+    src_add.add_argument("--model")
+    src_add.add_argument("--key")
+    src_add.add_argument("--concurrency", type=int, default=1)
+    src_add.add_argument("--interval", type=float, default=0.0)
+    src_add.add_argument("--rules")
+    _add_json(src_add)
+    src_add.set_defaults(handler=cmd_sources_add_ai)
+
+    src_remove = sources_sub.add_parser("remove")
+    src_remove.add_argument("id")
+    _add_json(src_remove)
+    src_remove.set_defaults(handler=cmd_sources_remove)
+
+    src_move = sources_sub.add_parser("move")
+    src_move.add_argument("id")
+    src_move.add_argument("--up", action="store_true")
+    src_move.add_argument("--down", action="store_true")
+    _add_json(src_move)
+    src_move.set_defaults(handler=cmd_sources_move)
+
+    src_rule = sources_sub.add_parser("set-rule")
+    src_rule.add_argument("id")
+    src_rule.add_argument("--rules", required=True)
+    _add_json(src_rule)
+    src_rule.set_defaults(handler=cmd_sources_set_rule)
+
+    src_key = sources_sub.add_parser("set-key")
+    src_key.add_argument("id")
+    src_key.add_argument("--key", required=True)
+    _add_json(src_key)
+    src_key.set_defaults(handler=cmd_sources_set_key)
+
+    cache_parser = subparsers.add_parser("cache", help="inspect or clear the translation cache")
+    cache_sub = cache_parser.add_subparsers(dest="cache_command", required=True)
+
+    cache_stats = cache_sub.add_parser("stats")
+    _add_json(cache_stats)
+    cache_stats.set_defaults(handler=cmd_cache_stats)
+
+    cache_clear = cache_sub.add_parser("clear")
+    _add_json(cache_clear)
+    cache_clear.set_defaults(handler=cmd_cache_clear)
     return parser
 
 

@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import cli
 from dayz_csv import DAYZ_HEADERS, load_dayz_csv
+from translation_sources import RULE_ALL, RULE_EMPTY, RULE_SELECTION, SourceEntry, SourceList
 
 CSV_TEXT = (
     "Language,original,english,chinesesimp\n"
@@ -494,3 +495,166 @@ class WordbookTests(CliTestCase):
                                        "--wordbook", str(self.wordbook), "--json")
         self.assertEqual(payload["data"]["exported"], 1)
         self.assertTrue(target.exists())
+
+
+class FakeSourceSettings:
+    """顶替 QSettings：只记 sources 一个键。"""
+
+    def __init__(self, sources=None):
+        self.sources = sources or SourceList()
+        self.values = {}
+
+    def value(self, key, default=None):
+        if key == "translation_sources_json":
+            return self.sources.to_json()
+        return default
+
+    def setValue(self, key, value):
+        self.values[key] = value
+        if key == "translation_sources_json":
+            self.sources = SourceList.from_json(value)
+
+    def sync(self):
+        pass
+
+
+def _settings_from(fake):
+    settings = cli.flow.AppSettings()
+    settings.sources = fake.sources
+    return settings
+
+
+class SourcesTests(CliTestCase):
+    def setUp(self):
+        self.settings = FakeSourceSettings(SourceList([
+            SourceEntry(source_id="google", kind="free", rules=[RULE_ALL]),
+            SourceEntry(source_id="lara", kind="free", rules=[RULE_SELECTION]),
+        ]))
+        self._original = cli.flow.load_app_settings
+        self._original_save = cli.flow.save_sources
+        cli.flow.load_app_settings = lambda settings=None: _settings_from(self.settings)
+        cli.flow.save_sources = lambda sources, settings=None: self.settings.setValue(
+            "translation_sources_json", sources.to_json())
+
+    def tearDown(self):
+        cli.flow.load_app_settings = self._original
+        cli.flow.save_sources = self._original_save
+
+    def test_list(self):
+        code, payload = self.run_json("sources", "list", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual([item["id"] for item in payload["data"]["sources"]], ["google", "lara"])
+
+    def test_add_ai_gets_selection_rule_by_default(self):
+        code, payload = self.run_json("sources", "add-ai", "--name", "MyAI",
+                                      "--type", "openai", "--key", "k", "--json")
+        self.assertEqual(code, 0)
+        entry = self.settings.sources.find(payload["data"]["id"])
+        self.assertEqual(entry.rules, [RULE_SELECTION])
+        self.assertEqual(entry.api_key, "k")
+
+    def test_add_ai_with_rules(self):
+        _code, payload = self.run_json("sources", "add-ai", "--name", "MyAI", "--type", "openai",
+                                       "--rules", "all,empty", "--json")
+        entry = self.settings.sources.find(payload["data"]["id"])
+        self.assertEqual(entry.rules, [RULE_ALL, RULE_EMPTY])
+
+    def test_add_ai_bad_type_is_exit_2(self):
+        code, _out, _err = self.run_cli("sources", "add-ai", "--name", "X", "--type", "nope")
+        self.assertEqual(code, 2)
+
+    def test_remove(self):
+        code, payload = self.run_json("sources", "remove", "lara", "--json")
+        self.assertEqual(code, 0)
+        self.assertIsNone(self.settings.sources.find("lara"))
+
+    def test_remove_reports_restart_required(self):
+        # --json 模式下看不到 RESTART_HINT 那段文字，得靠这个字段让 AI 知道要提醒用户重开界面
+        _code, payload = self.run_json("sources", "remove", "lara", "--json")
+        self.assertTrue(payload["data"]["restart_required"])
+
+    def test_remove_unknown_is_exit_2(self):
+        code, _out, _err = self.run_cli("sources", "remove", "nope")
+        self.assertEqual(code, 2)
+
+    def test_move_up(self):
+        self.run_json("sources", "move", "lara", "--up", "--json")
+        self.assertEqual([e.source_id for e in self.settings.sources.entries], ["lara", "google"])
+
+    def test_move_down(self):
+        self.run_json("sources", "move", "google", "--down", "--json")
+        self.assertEqual([e.source_id for e in self.settings.sources.entries], ["lara", "google"])
+
+    def test_move_both_flags_is_exit_2(self):
+        code, _out, _err = self.run_cli("sources", "move", "google", "--up", "--down")
+        self.assertEqual(code, 2)
+
+    def test_set_rule_replaces_rules(self):
+        self.run_json("sources", "set-rule", "google", "--rules", "empty", "--json")
+        self.assertEqual(self.settings.sources.find("google").rules, [RULE_EMPTY])
+
+    def test_set_rule_unknown_rule_is_exit_2(self):
+        code, _out, _err = self.run_cli("sources", "set-rule", "google", "--rules", "nope")
+        self.assertEqual(code, 2)
+
+    def test_set_key(self):
+        self.run_json("sources", "set-key", "lara", "--key", "secret", "--json")
+        self.assertEqual(self.settings.sources.find("lara").api_key, "secret")
+
+    def test_test_command_uses_the_entry(self):
+        calls = []
+
+        def fake_run(raw_jobs, configs, source_header, **kwargs):
+            from translator_service import TranslationResults
+
+            calls.append((list(raw_jobs), configs, source_header))
+            results = TranslationResults()
+            results.cell_results[(0, 0)] = "刀"
+            results.translated = 1
+            return results
+
+        original = cli.flow.run_translation
+        cli.flow.run_translation = fake_run
+        try:
+            code, payload = self.run_json("sources", "test", "--source", "google", "--json")
+        finally:
+            cli.flow.run_translation = original
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["data"]["results"][0]["id"], "google")
+        self.assertEqual(payload["data"]["results"][0]["translated"], 1)
+        self.assertEqual(len(calls[0][0]), 4)          # 四种语言
+
+
+class CacheTests(CliTestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.path = Path(self.folder.name) / "translation_cache.json"
+        self.path.write_text(json.dumps({"version": 1, "entries": {}}), encoding="utf-8")
+        self._original = cli.make_cache_store
+        cli.make_cache_store = lambda: _FakeStore(self.path)
+
+    def tearDown(self):
+        cli.make_cache_store = self._original
+        self.folder.cleanup()
+
+    def test_stats_reports_the_path(self):
+        code, payload = self.run_json("cache", "stats", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["data"]["path"], str(self.path))
+        self.assertEqual(payload["data"]["entries"], 0)
+
+    def test_clear_removes_the_file(self):
+        code, payload = self.run_json("cache", "clear", "--json")
+        self.assertEqual(code, 0)
+        self.assertFalse(self.path.exists())
+        self.assertTrue(payload["data"]["cleared"])
+
+    def test_clear_that_does_not_delete_is_exit_2(self):
+        class StubbornStore(_FakeStore):
+            def clear(self):
+                pass                      # 删不掉，模拟 TranslationCacheStore 吞掉 OSError 的行为
+
+        cli.make_cache_store = lambda: StubbornStore(self.path)
+        code, _out, err = self.run_cli("cache", "clear")
+        self.assertEqual(code, 2)
+        self.assertIn("could not delete", err)
