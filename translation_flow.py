@@ -116,11 +116,16 @@ def rule_for_mode(mode):
 
 
 def build_test_jobs(source_header):
-    """「测试这个源」用的固定样本：一个单词 × 四种语言。"""
+    """「测试这个源」用的固定样本：一个单词 × 四种语言。
+
+    跟源列同语言的样本要跳过 —— 有的接口（MyMemory）直接拒绝「翻成同一种语言」，
+    一条失败就把整个好用的源误判成坏的。
+    """
+    source_code = source_language_code_for_header(source_header)
     jobs = []
     for column, language in enumerate(TEST_LANGUAGES):
         code = language_code_for_header(language)
-        if code:
+        if code and code != source_code:
             jobs.append((0, column, TEST_TEXT, code))
     return jobs
 

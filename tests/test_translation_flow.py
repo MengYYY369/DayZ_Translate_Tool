@@ -185,6 +185,20 @@ class SourceConfigTests(unittest.TestCase):
         self.assertEqual(config.glossary_source_key, "english")
 
 
+class TestJobTests(unittest.TestCase):
+    def test_sample_covers_four_languages_from_english(self):
+        jobs = flow.build_test_jobs("english")
+        self.assertEqual([job[3] for job in jobs], ["zh-CN", "ru", "ja", "de"])
+        self.assertEqual([job[2] for job in jobs], [flow.TEST_TEXT] * 4)
+
+    def test_sample_skips_the_source_language(self):
+        # 源列是 chinesesimp（zh-CN）时不能拿 chinese（也是 zh-CN）当样本：
+        # MyMemory 会直接拒「翻成同一种语言」，一失败就把整个好用的源判死
+        jobs = flow.build_test_jobs("chinesesimp")
+        self.assertNotIn("zh-CN", [job[3] for job in jobs])
+        self.assertEqual([job[3] for job in jobs], ["ru", "ja", "de"])
+
+
 class GlossaryTests(unittest.TestCase):
     def test_rows_need_two_columns(self):
         # 词表列序是 WORDBOOK_HEADERS：第 3 列（下标 2）是 czech，不是 chinesesimp
