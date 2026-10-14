@@ -92,7 +92,7 @@ python cli.py <命令> [参数]
 | `inspect <csv>` | 列出有几列、每个语言列有多少格有内容、哪些行没有原文 |
 | `translate <csv>` | 翻译表格；`--mode empty`（默认）/ `all` / `columns` / `rows`，还能用 `--columns a,b`、`--rows 3,5-9`、`--only-empty`、`--source 源ID`、`--from-column english`、`--wordbook 路径` 再收窄 |
 | `edit set-cell <csv> --row N --column 列名 --text "..."` | 改一个格子 |
-| `edit replace <csv> --column 列名 --find 旧 --replace 新 [--regex] [--match-case] [--whole-word]` | 在一列里批量查找替换 |
+| `edit replace <csv> --column 列名 --find 旧 --replace 新 [--regex] [--ignore-case] [--whole-word]` | 在一列里批量查找替换 |
 | `edit add-row <csv> --key 键名 [--after N]` | 加一行 |
 | `edit delete-row <csv> --row N` / `--key 键名` | 删一行 |
 | `keys <csv> --from <config.cpp 或文件夹>` | 把模组 `config.cpp` 里缺的键导进来 |
@@ -102,9 +102,9 @@ python cli.py <命令> [参数]
 
 所有命令都支持 `--json`（结果以 JSON 打到屏幕、进度打到错误输出）和 `--quiet`。
 
-**不主动说写就不写。** `translate` 和 `edit` 只读原文件，结果写进预览文件（默认是 `stringtable.preview.csv`，可以用 `--preview` 指定）。要真改原文件就加 `--write`，这时会先存一份 `.bak` 备份。只动设置的命令（`sources`、`wordbook`、`cache`）立即生效——界面开着的话重开一下才看得到。
+**不主动说写就不写。** `translate`、`edit` 和 `keys` 只读原文件，结果写进预览文件（默认是 `stringtable.preview.csv`，可以用 `--preview` 指定）。要真改原文件就加 `--write`，这时会先存一份 `.bak` 备份。只动设置的命令（`sources`、`wordbook`、`cache`）立即生效——界面开着的话重开一下才看得到。
 
-退出码：`0` 全部成功、`1` 有格子失败但其余已保存、`2` 命令根本没跑起来。
+退出码：`0` 全部成功、`1` 跑完了但有失败（有格子没翻成，或者 `sources test` 没测通）、`2` 命令根本没跑起来。
 
 几个常用例子：
 
@@ -146,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File build_exe.ps1 -PythonPath "C:\Python313
 ## 开发
 
 ```bash
-python -m unittest discover -s tests     # 362 个测试，不需要联网
+python -m unittest discover -s tests     # 475 个测试，不需要联网
 ```
 
 | 文件 | 负责什么 |

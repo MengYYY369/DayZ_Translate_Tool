@@ -92,7 +92,7 @@ python cli.py <command> [options]
 | `inspect <csv>` | List the columns, how many cells each language column holds, and which rows have no source text |
 | `translate <csv>` | Translate the table; `--mode empty` (default) / `all` / `columns` / `rows`, narrowed further with `--columns a,b`, `--rows 3,5-9`, `--only-empty`, `--source ID`, `--from-column english`, `--wordbook PATH` |
 | `edit set-cell <csv> --row N --column COL --text "..."` | Write a single cell |
-| `edit replace <csv> --column COL --find OLD --replace NEW [--regex] [--match-case] [--whole-word]` | Find and replace inside one column |
+| `edit replace <csv> --column COL --find OLD --replace NEW [--regex] [--ignore-case] [--whole-word]` | Find and replace inside one column |
 | `edit add-row <csv> --key NAME [--after N]` | Insert a row |
 | `edit delete-row <csv> --row N` / `--key NAME` | Delete a row |
 | `keys <csv> --from <config.cpp or a folder>` | Import the keys that are missing from a mod's `config.cpp` |
@@ -102,9 +102,9 @@ python cli.py <command> [options]
 
 Every command accepts `--json` (the result as JSON on stdout, progress on stderr) and `--quiet`.
 
-**Nothing is written unless you ask for it.** `translate` and the `edit` commands only read the file and put the result in a preview file (`stringtable.preview.csv`, or whatever `--preview` points at). Add `--write` to actually replace the table; a `.bak` copy is saved first. The commands that only change settings (`sources`, `wordbook`, `cache`) take effect right away — if the window is open, reopen it to see them.
+**Nothing is written unless you ask for it.** `translate`, `edit` and `keys` only read the file and put the result in a preview file (`stringtable.preview.csv`, or whatever `--preview` points at). Add `--write` to actually replace the table; a `.bak` copy is saved first. The commands that only change settings (`sources`, `wordbook`, `cache`) take effect right away — if the window is open, reopen it to see them.
 
-Exit codes: `0` all good, `1` some cells failed but the rest were saved, `2` the command could not run at all.
+Exit codes: `0` all good, `1` the command ran but something failed (cells that could not be translated, or a source that did not pass `sources test`), `2` the command could not run at all.
 
 A few typical runs:
 
@@ -146,7 +146,7 @@ The script installs/uses PyInstaller, builds into `dist\DayZ_Translate_Tool\`, a
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 362 tests, no network access needed
+python -m unittest discover -s tests     # 475 tests, no network access needed
 ```
 
 | Module | Responsibility |
