@@ -232,6 +232,11 @@ class AppSettingsTests(unittest.TestCase):
         # 测试里又是最后才跑，一跑就是红的。等 Task 2 Step 3 把 main.py 接过来之后，
         # 那条断言（test_config_dir_is_the_same_folder_the_gui_uses）才加得进来。
 
+    def test_config_dir_is_the_same_folder_the_gui_uses(self):
+        # 两边算出不同目录的话，命令行会去读界面永远不看的那份词表。
+        import main
+        self.assertEqual(flow.config_dir() / "wordbook.csv", main.DEFAULT_WORDBOOK_PATH)
+
 
 class ApplyResultsTests(unittest.TestCase):
     def test_writes_cells_back(self):

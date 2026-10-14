@@ -2,7 +2,7 @@ import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QLibraryInfo, QObject, QSettings, QSize, QStandardPaths, QThread, Qt, QItemSelectionModel, QTimer, QTranslator, Signal
+from PySide6.QtCore import QEvent, QLibraryInfo, QObject, QSettings, QSize, QThread, Qt, QItemSelectionModel, QTimer, QTranslator, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -38,9 +38,6 @@ from PySide6.QtWidgets import (
 from config_cpp import collect_config_cpp_files, extract_keys_from_paths, merge_language_keys
 from dayz_csv import (
     DAYZ_HEADERS,
-    build_column_translation_jobs,
-    build_row_translation_jobs,
-    copy_source_for_header,
     is_copy_only_column,
     language_code_for_header,
     load_dayz_csv,
@@ -48,6 +45,7 @@ from dayz_csv import (
     write_dayz_csv,
 )
 from translation_cache import TranslationCacheStore
+import translation_flow
 from translation_worker import TranslationWorker
 from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, RetryPolicy, TranslationJob, TranslationService, TranslatorConfig, validate_translator_config
 from free_translators import FREE_SOURCE_SPECS
@@ -66,7 +64,7 @@ from table_history import TableHistory, snapshot_table, restore_table
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 DEFAULT_CSV_PATH = APP_DIR / "stringtable.csv"
 # 单词本放在用户配置文件夹，避免打包后写入应用目录失败
-CONFIG_DIR = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)) or APP_DIR
+CONFIG_DIR = translation_flow.config_dir() or APP_DIR
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_WORDBOOK_PATH = CONFIG_DIR / "wordbook.csv"
 LANGUAGE_COLUMN_WIDTH = 150
@@ -74,7 +72,7 @@ DEFAULT_COLUMN_WIDTH = 90
 SEARCH_MATCH_COLOR = QColor("#9adbe8")
 SEARCH_ACTIVE_COLOR = QColor("#ffc857")
 TABLE_GRIDLINE_COLOR = "#8c8c8c"
-AI_TYPE_KEYS = ("openai", "claude", "codex")
+AI_TYPE_KEYS = translation_flow.AI_TYPE_KEYS
 AI_TYPE_LABEL_KEYS = {
     "openai": "ai_type_openai",
     "claude": "ai_type_claude",
@@ -2009,32 +2007,13 @@ class DayzTranslateTool(QMainWindow):
         return " → ".join(labels) if labels else self.tr("no_source_selected")
 
     def build_source_config(self, entry, char_budget=None, timeout=None):
-        """把一个源条目变成 TranslatorConfig。免费源的并发/间隔内置，AI 源用自己存的。"""
-        if entry.is_ai:
-            return TranslatorConfig(
-                provider=entry.api_type or "openai",
-                label=self.source_label(entry),
-                char_budget=char_budget if char_budget is not None else self.translation_char_budget,
-                parallel_batches=max(1, int(entry.concurrency or 1)),
-                min_interval=max(0.0, float(entry.interval or 0.0)),
-                auto_concurrency=self.translation_auto_concurrency,
-                timeout=timeout if timeout is not None else self.translation_timeout,
-                api_key=entry.api_key,
-                model=entry.model,
-                base_url=entry.base_url,
-                glossary=self.wordbook_glossary(),
-                glossary_source_key=(self.source_header or "").strip().lower(),
-            )
-        spec = FREE_SOURCE_SPECS.get(entry.source_id, {})
-        return TranslatorConfig(
-            provider=entry.source_id,
+        return translation_flow.build_source_config(
+            entry,
+            char_budget=self.translation_char_budget if char_budget is None else char_budget,
+            timeout=self.translation_timeout if timeout is None else timeout,
             label=self.source_label(entry),
-            char_budget=char_budget if char_budget is not None else self.translation_char_budget,
-            parallel_batches=max(1, int(spec.get("concurrency", 1))),
-            min_interval=max(0.0, float(spec.get("interval", 0.0))),
-            auto_concurrency=self.translation_auto_concurrency,
-            timeout=timeout if timeout is not None else self.translation_timeout,
-            api_key=entry.api_key,
+            glossary=self.wordbook_glossary(),
+            glossary_source_key=self.source_header,
         )
 
     def build_translation_configs(self, rule):
@@ -2392,7 +2371,9 @@ class DayzTranslateTool(QMainWindow):
             current_row = self.table.currentRow()
             rows = {current_row} if current_row >= 0 else set()
         try:
-            jobs = build_row_translation_jobs(self.headers, self.table_rows(), self.source_header, rows)
+            jobs = translation_flow.collect_jobs(
+                self.headers, self.table_rows(), self.source_header,
+                mode=translation_flow.MODE_ROWS, row_indexes=rows)
         except Exception as exc:
             QMessageBox.warning(self, self.tr("translate_rows"), str(exc))
             return
@@ -2406,7 +2387,9 @@ class DayzTranslateTool(QMainWindow):
             current_column = self.table.currentColumn()
             columns = {current_column} if current_column >= 0 else set()
         try:
-            jobs = build_column_translation_jobs(self.headers, self.table_rows(), self.source_header, columns)
+            jobs = translation_flow.collect_jobs(
+                self.headers, self.table_rows(), self.source_header,
+                mode=translation_flow.MODE_COLUMNS, columns=columns)
         except Exception as exc:
             QMessageBox.warning(self, self.tr("translate_columns"), str(exc))
             return
@@ -2415,31 +2398,19 @@ class DayzTranslateTool(QMainWindow):
         self.run_translation_jobs(jobs, rule=RULE_SELECTION)
 
     def translate_all_cells(self):
-        try:
-            source_column = self.headers.index(self.source_header)
-        except ValueError:
+        if self.source_header not in self.headers:
             QMessageBox.warning(self, self.tr("translate_cells"), self.tr("source_column_missing", header=self.source_header))
             return
         rows = self.table_rows()
         # 复制列（original<-english, chinese<-chinesesimp）直接填充，不走 AI 翻译
         self._fill_copy_columns(rows, overwrite=True)
-        jobs = []
-        for row_index, row in enumerate(rows):
-            source_text = row[source_column].strip() if source_column < len(row) else ""
-            if not source_text:
-                continue
-            for col_index in range(len(self.headers)):
-                if col_index == source_column or not self.is_translatable_column(col_index):
-                    continue
-                target_code = language_code_for_header(self.headers[col_index])
-                if target_code:
-                    jobs.append((row_index, col_index, source_text, target_code))
+        # 任务从「填复制列之前」的快照里挑：源列本身是复制列时不会凭空多出任务
+        jobs = translation_flow.collect_jobs(
+            self.headers, rows, self.source_header, mode=translation_flow.MODE_ALL)
         self.run_translation_jobs(jobs, rule=RULE_ALL)
 
     def translate_empty_cells(self):
-        try:
-            source_column = self.headers.index(self.source_header)
-        except ValueError:
+        if self.source_header not in self.headers:
             QMessageBox.warning(self, self.tr("translate_cells"), self.tr("source_column_missing", header=self.source_header))
             return
         rows = self.table_rows()
@@ -2447,20 +2418,8 @@ class DayzTranslateTool(QMainWindow):
         self._fill_copy_columns(rows, overwrite=False)
         # 重新读取已更新的行数据，使后续空白判断反映复制结果
         rows = self.table_rows()
-        jobs = []
-        for row_index, row in enumerate(rows):
-            source_text = row[source_column].strip() if source_column < len(row) else ""
-            if not source_text:
-                continue
-            for col_index in range(len(self.headers)):
-                if col_index == source_column or not self.is_translatable_column(col_index):
-                    continue
-                target_code = language_code_for_header(self.headers[col_index])
-                if not target_code:
-                    continue
-                target_text = row[col_index].strip() if col_index < len(row) else ""
-                if not target_text:
-                    jobs.append((row_index, col_index, source_text, target_code))
+        jobs = translation_flow.collect_jobs(
+            self.headers, rows, self.source_header, mode=translation_flow.MODE_EMPTY)
         self.run_translation_jobs(jobs, copy_overwrite=False, rule=RULE_EMPTY)
 
     def _fill_copy_columns(self, rows, overwrite=False, row_indexes=None):
@@ -2470,39 +2429,24 @@ class DayzTranslateTool(QMainWindow):
         overwrite=False 时仅填充空白单元格（用于"翻译空白单元格"）。
         row_indexes 指定只处理的行（用于选中单元格/行/列翻译），None 表示全部行。
         """
-        changed = False
-        target_rows = range(len(rows)) if row_indexes is None else sorted(row_indexes)
+        filled, changed = translation_flow.fill_copy_columns(
+            self.headers, rows, overwrite=overwrite, row_indexes=row_indexes)
+        if not changed:
+            return
         # 批量写入时屏蔽 itemChanged，避免每个单元格都推一条历史快照
         # （否则翻译前的状态会被挤出撤销栈，且 undo 需要按 N 次）。
         self.table.blockSignals(True)
         try:
-            for col_index, header in enumerate(self.headers):
-                source_header = copy_source_for_header(header)
-                if not source_header:
-                    continue
-                try:
-                    source_col = self.headers.index(source_header)
-                except ValueError:
-                    continue
-                for row_index in target_rows:
-                    if row_index < 0 or row_index >= len(rows):
+            for row_index, row in enumerate(filled):
+                original = rows[row_index]
+                for column_index, value in enumerate(row):
+                    if column_index < len(original) and value == original[column_index]:
                         continue
-                    row = rows[row_index]
-                    source_text = row[source_col].strip() if source_col < len(row) else ""
-                    if not source_text:
-                        continue
-                    existing = row[col_index].strip() if col_index < len(row) else ""
-                    if existing and not overwrite:
-                        continue
-                    if existing == source_text and overwrite:
-                        continue
-                    self.set_cell_text(row_index, col_index, source_text)
-                    changed = True
+                    self.set_cell_text(row_index, column_index, value)
         finally:
             self.table.blockSignals(False)
-        if changed:
-            self._record_history()
-            self.set_dirty(True)
+        self._record_history()
+        self.set_dirty(True)
 
     def selected_rows_and_columns(self):
         rows = set()
@@ -2638,16 +2582,7 @@ class DayzTranslateTool(QMainWindow):
     def wordbook_glossary(self):
         if self.wordbook_window is None:
             return []
-        glossary = []
-        for row in self.wordbook_window.glossary_rows():
-            item = {}
-            for column_index, value in enumerate(row):
-                value = (value or "").strip()
-                if value:
-                    item[WORDBOOK_HEADERS[column_index]] = value
-            if len(item) >= 2:
-                glossary.append(item)
-        return glossary
+        return translation_flow.build_glossary(self.wordbook_window.glossary_rows())
 
     def update_translation_progress(self, results):
         self._stop_retry_countdown()
