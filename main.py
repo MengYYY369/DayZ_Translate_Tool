@@ -47,7 +47,7 @@ from dayz_csv import (
 from translation_cache import TranslationCacheStore
 import translation_flow
 from translation_worker import TranslationWorker
-from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, RetryPolicy, TranslationJob, TranslationService, TranslatorConfig, validate_translator_config
+from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, RetryPolicy, TranslationJob, TranslationService, validate_translator_config
 from free_translators import FREE_SOURCE_SPECS
 from translation_sources import (
     ALL_RULES,
