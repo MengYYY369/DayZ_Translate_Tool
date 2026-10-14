@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -116,12 +117,13 @@ class _FakeStore:
 
     def __init__(self, path):
         self.path = Path(path)
+        self.saved = 0
 
     def load(self):
         return {}
 
     def save(self, cache):
-        pass
+        self.saved += 1
 
     def clear(self):
         Path(self.path).unlink(missing_ok=True)
@@ -164,7 +166,8 @@ class TranslateTests(CliTestCase):
         # 别让单测去读写用户本机的真缓存
         self._cache_folder = tempfile.TemporaryDirectory()
         self._original_store = cli.make_cache_store
-        cli.make_cache_store = lambda: _FakeStore(Path(self._cache_folder.name) / "cache.json")
+        self._store = _FakeStore(Path(self._cache_folder.name) / "cache.json")
+        cli.make_cache_store = lambda: self._store
 
     def tearDown(self):
         cli.flow.run_translation = self._original
@@ -264,6 +267,29 @@ class TranslateTests(CliTestCase):
         code, _out, _err = self.run_cli("translate", str(path), "--preview", str(same))
         self.assertEqual(code, 2)
         self.assertIn("Knife", path.read_text(encoding="utf-8"))
+
+    def test_preview_target_is_checked_before_translating(self):
+        path = write_csv()
+        code, _out, _err = self.run_cli("translate", str(path), "--preview", str(path))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.calls, [])            # 一次都没联网
+        self.assertEqual(self._store.saved, 0)      # 缓存也没写
+
+    def test_source_id_that_is_not_enabled_names_the_source(self):
+        path = write_csv()
+        cli.flow.build_translation_configs = lambda *a, **k: []
+        code, _out, err = self.run_cli("translate", str(path), "--source", "volcano")
+        self.assertEqual(code, 2)
+        self.assertIn("volcano", err)              # 说清楚是哪个源不匹配
+        self.assertNotIn("pass --source", err)     # 别人已经给了，别再让他给一次
+
+    def test_naming_a_copy_only_column_warns(self):
+        path = write_csv()
+        code, payload = self.run_json("translate", str(path), "--mode", "columns",
+                                      "--columns", "chinese", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["data"]["jobs"], 0)
+        self.assertIn("filled automatically", " ".join(payload["warnings"]))
 
 
 class EditTests(CliTestCase):
@@ -666,3 +692,41 @@ class CacheTests(CliTestCase):
         code, _out, err = self.run_cli("cache", "clear")
         self.assertEqual(code, 2)
         self.assertIn("could not delete", err)
+
+
+class _GbkStream:
+    """模拟 Windows 中文控制台：装不下的字符会抛 UnicodeEncodeError。"""
+
+    def __init__(self):
+        self.errors = "strict"
+
+    def reconfigure(self, errors=None):
+        self.errors = errors
+
+    def write(self, text):
+        if self.errors == "strict":
+            text.encode("gbk")            # 装不下就抛，跟真控制台一样
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+class EncodingTests(CliTestCase):
+    def test_json_output_is_ascii_only(self):
+        path = write_csv()
+        code, out, _err = self.run_cli("edit", "set-cell", str(path), "--row", "1",
+                                       "--column", "chinesesimp", "--text", "🔫枪", "--json")
+        self.assertEqual(code, 0)
+        # 结果必须全是 ASCII：不然 GBK 控制台写不出来，AI 按标准方式读也读不出来
+        self.assertTrue(out.isascii())
+        self.assertEqual(json.loads(out)["data"]["changes"][0]["after"], "🔫枪")
+
+    def test_text_output_survives_a_console_that_cannot_encode_it(self):
+        path = write_csv()
+        stream = _GbkStream()
+        with patch("sys.stdout", stream), redirect_stderr(io.StringIO()):
+            code = cli.main(["edit", "set-cell", str(path), "--row", "1",
+                             "--column", "chinesesimp", "--text", "🔫"])
+        self.assertEqual(code, 0)                  # 不崩，结果照样拿得到
+        self.assertEqual(stream.errors, "replace")

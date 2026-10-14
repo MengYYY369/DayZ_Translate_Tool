@@ -13,7 +13,13 @@ import sys
 from pathlib import Path
 
 import translation_flow as flow
-from dayz_csv import header_index, language_code_for_header, load_dayz_csv, write_dayz_csv
+from dayz_csv import (
+    header_index,
+    is_copy_only_column,
+    language_code_for_header,
+    load_dayz_csv,
+    write_dayz_csv,
+)
 from translation_sources import ALL_RULES, SourceEntry, SourceList
 
 EXIT_OK = 0
@@ -50,7 +56,9 @@ class Reporter:
 
     def emit(self, payload, text):
         if self.json_mode:
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            # ensure_ascii=True：结果必须是纯 ASCII。Windows 控制台默认 GBK，
+            # 直接把非 ASCII 写进 stdout 会按 GBK 编码，AI 按 UTF-8 读就废了。
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
         else:
             print(text)
 
@@ -165,8 +173,20 @@ def default_preview_path(path):
     return path.with_name(f"{path.stem}.preview{path.suffix}")
 
 
+def _check_preview_target(args, path):
+    """不加 `--write` 时原文件必须一字不动，预览路径指回原文件就是无备份覆盖。
+
+    翻译命令要在联网之前先调一次：不然会先翻完、写完缓存，最后才报错，白跑一趟。
+    """
+    if getattr(args, "write", False) or not getattr(args, "preview", None):
+        return
+    if Path(args.preview).resolve() == Path(path).resolve():
+        raise CliError("--preview must not point at the source file; pass --write to overwrite it")
+
+
 def apply_changes(args, reporter, path, headers, rows, data):
     """统一出口：`--write` 就备份后写回，否则只写预览文件。"""
+    _check_preview_target(args, path)
     if getattr(args, "write", False):
         backup = Path(f"{path}.bak")
         shutil.copy2(path, backup)
@@ -175,9 +195,6 @@ def apply_changes(args, reporter, path, headers, rows, data):
         data.update({"written": True, "backup": str(backup), "preview": None})
     else:
         preview = Path(args.preview) if getattr(args, "preview", None) else default_preview_path(path)
-        if Path(preview).resolve() == Path(path).resolve():
-            # 不加 --write 就承诺原文件一字不动；预览路径指回原文件会静默覆盖且不留备份
-            raise CliError("--preview must not point at the source file; pass --write to overwrite it")
         write_dayz_csv(preview, headers, rows)
         reporter.info(f"preview: {preview} (original file untouched; pass --write to save)")
         data.update({"written": False, "backup": None, "preview": str(preview)})
@@ -250,6 +267,7 @@ def make_cache_store():
 
 def cmd_translate(args, reporter):
     path = Path(args.file)
+    _check_preview_target(args, path)
     headers, rows, warnings = load_table(path)
     settings = flow.load_app_settings()
     source_header = args.from_column or settings.source_header
@@ -263,6 +281,12 @@ def cmd_translate(args, reporter):
     rows, _changed = flow.fill_copy_columns(
         headers, rows, overwrite=args.mode == flow.MODE_ALL)
     columns = resolve_columns(headers, args.columns) if args.columns else None
+    if columns:
+        for index in columns:
+            if is_copy_only_column(headers[index]):
+                # 点名一个自动复制列（original / chinese）会挑出 0 条任务，说清楚免得当成功
+                warnings.append(f"column {headers[index]} is filled automatically, "
+                                "it is never translated")
     row_indexes = None
     if args.rows:
         row_indexes = []
@@ -282,6 +306,9 @@ def cmd_translate(args, reporter):
     except ValueError as exc:
         raise CliError(str(exc))
     if not configs:
+        if args.source:
+            raise CliError(f"source {args.source} is not enabled for mode {args.mode} "
+                           "(check its rules with: sources list)")
         raise CliError("no translation source is enabled for this mode "
                        "(check the rules in Settings, or pass --source)")
     data = {"rows": len(rows), "jobs": len(jobs)}
@@ -931,7 +958,21 @@ def _add_json(parser):
     parser.add_argument("--quiet", action="store_true", help="do not print progress logs")
 
 
+def _make_streams_safe():
+    """Windows 控制台默认 GBK，碰到 emoji 之类的字符会抛 UnicodeEncodeError 把命令搞崩。
+
+    只把装不下的字符换成 `?`，结果照样拿得到。（单测里 stdout 被换成 StringIO，
+    没有 reconfigure，忽略即可。）
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv=None):
+    _make_streams_safe()
     parser = build_parser()
     args = parser.parse_args(argv)
     reporter = Reporter(json_mode=getattr(args, "json", False), quiet=getattr(args, "quiet", False))
