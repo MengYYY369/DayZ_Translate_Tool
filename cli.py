@@ -316,8 +316,11 @@ def cmd_translate(args, reporter):
         "errors": results.errors[:5],
     })
     apply_changes(args, reporter, path, headers, rows, data)
-    text = (f"translated {results.translated}, failed {len(failed)}, "
-            f"preview {data['preview'] or data['backup']}")
+    if data["written"]:
+        where = f"wrote {path} (backup: {data['backup']})"
+    else:
+        where = f"preview {data['preview']}"
+    text = f"translated {results.translated}, failed {len(failed)}, {where}"
     # 有翻不出来的格子就算部分失败，信封里也要能看出来（只看 ok 的 AI 不会误判成功）
     errors = [f"{len(failed)} cell(s) failed"] if failed else []
     reporter.emit(envelope("translate", path, data, warnings, errors=errors), text)

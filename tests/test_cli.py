@@ -193,6 +193,14 @@ class TranslateTests(CliTestCase):
         self.assertTrue(Path(payload["data"]["backup"]).exists())
         self.assertIn("[Knife]", path.read_text(encoding="utf-8"))
 
+    def test_write_text_says_wrote_not_preview(self):
+        # 写回时不该再打 "preview <路径>"，否则看文本输出的 AI 会以为结果在那个文件里
+        path = write_csv()
+        code, out, _err = self.run_cli("translate", str(path), "--mode", "all", "--write")
+        self.assertEqual(code, 1)
+        self.assertIn("wrote", out)
+        self.assertNotIn("preview", out)
+
     def test_custom_preview_path(self):
         path = write_csv()
         target = path.with_name("custom.csv")
