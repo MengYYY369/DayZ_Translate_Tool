@@ -976,6 +976,32 @@ class MainGuiTests(unittest.TestCase):
 
         self.assertEqual(self.window.table.item(0, 1).text(), "EngNew")
 
+    def test_translate_selected_columns_copies_english_to_original(self):
+        self.window.source_header = "english"
+        self.window.set_cell_text(0, 2, "EngNew")
+        self.window.set_cell_text(0, 1, "OldOrig")
+        self.window.table.clearSelection()
+        self.window.table.selectColumn(14)
+        self.window.run_translation_jobs = lambda jobs, **kwargs: None
+
+        self.window.translate_selected_columns()
+
+        self.assertEqual(self.window.table.item(0, 1).text(), "EngNew")
+
+    def test_translate_selected_columns_only_takes_that_column(self):
+        captured_jobs = []
+        self.window.source_header = "english"
+        self.window.set_cell_text(0, 2, "Knife")
+        self.window.set_cell_text(1, 2, "Rifle")
+        self.window.table.clearSelection()
+        self.window.table.selectColumn(14)
+        self.window.run_translation_jobs = lambda jobs, **kwargs: captured_jobs.extend(jobs)
+
+        self.window.translate_selected_columns()
+
+        self.assertEqual({job[1] for job in captured_jobs}, {14})
+        self.assertEqual({job[0] for job in captured_jobs}, {0, 1})
+
     def test_translate_selected_cells_copies_copy_columns_for_row(self):
         self.window.source_header = "english"
         self.window.set_cell_text(0, 2, "Knife")
