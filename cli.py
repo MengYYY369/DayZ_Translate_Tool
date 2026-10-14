@@ -240,6 +240,101 @@ def _join(values):
     return ", ".join(str(value) for value in values) if values else "(none)"
 
 
+# —— translate ——
+
+def make_cache_store():
+    """单测会把 cli.make_cache_store 换掉，避免碰到用户本机的真缓存。"""
+    from translation_cache import TranslationCacheStore
+    return TranslationCacheStore()
+
+
+def cmd_translate(args, reporter):
+    path = Path(args.file)
+    headers, rows, warnings = load_table(path)
+    settings = flow.load_app_settings()
+    source_header = args.from_column or settings.source_header
+    try:
+        header_index(headers, source_header)
+    except ValueError:
+        raise CliError(f"source column not found in file: {source_header}")
+    # 复制列（original←english、chinese←chinesesimp）先填再挑任务 —— 跟界面那四个入口
+    # 不一样（界面是拿填之前的快照挑任务）。这样 `--from-column original` 时 original
+    # 原本空着也能翻；界面在同样情况下会挑出 0 条。这是有意为之，别「对齐」成快照。
+    rows, _changed = flow.fill_copy_columns(
+        headers, rows, overwrite=args.mode == flow.MODE_ALL)
+    columns = resolve_columns(headers, args.columns) if args.columns else None
+    row_indexes = None
+    if args.rows:
+        row_indexes = []
+        for value in parse_rows(args.rows):
+            if value > len(rows):
+                raise CliError(f"row out of range: {value} (file has {len(rows)} data rows)")
+            row_indexes.append(value - 1)
+    jobs = flow.collect_jobs(headers, rows, source_header, mode=args.mode,
+                             columns=columns, row_indexes=row_indexes, only_empty=args.only_empty)
+    reporter.info(f"jobs: {len(jobs)}")
+    glossary = flow.build_glossary(_load_wordbook_rows(args.wordbook))
+    try:
+        configs = flow.build_translation_configs(
+            settings.sources, flow.rule_for_mode(args.mode),
+            char_budget=settings.char_budget, timeout=settings.timeout,
+            glossary=glossary, glossary_source_key=source_header, source_id=args.source)
+    except ValueError as exc:
+        raise CliError(str(exc))
+    if not configs:
+        raise CliError("no translation source is enabled for this mode "
+                       "(check the rules in Settings, or pass --source)")
+    data = {"rows": len(rows), "jobs": len(jobs)}
+    if not jobs:
+        # 没有任务时原文件不可能变，所以不写预览文件；字段和正常分支保持同一套
+        data.update({"translated": 0, "failed": 0, "cache_hits": 0, "failed_cells": [],
+                     "errors": [], "written": False, "backup": None, "preview": None})
+        reporter.emit(envelope("translate", path, data, warnings), "nothing to translate")
+        return EXIT_OK
+
+    cache_store = make_cache_store()
+    cache = cache_store.load()
+    results = flow.run_translation(
+        jobs, configs, source_header, cache=cache,
+        progress_callback=lambda results: reporter.info(
+            f"translated {results.translated}, failed {results.failed}, cache hits {results.cache_hits}"),
+        on_fallback=lambda previous, current: reporter.info(f"fallback: {previous} -> {current}"),
+    )
+    cache_store.save(cache)
+    rows = flow.apply_results(headers, rows, results)
+    failed = flow.failed_cells(jobs, results)
+    failed_set = set(failed)
+    data.update({
+        "translated": results.translated,
+        "failed": len(failed),
+        "cache_hits": results.cache_hits,
+        "failed_cells": [
+            {"row": row + 1, "column": column, "header": headers[column] if column < len(headers) else "",
+             "text": text}
+            for row, column, text, _target in jobs if (row, column) in failed_set
+        ],
+        "errors": results.errors[:5],
+    })
+    apply_changes(args, reporter, path, headers, rows, data)
+    text = (f"translated {results.translated}, failed {len(failed)}, "
+            f"preview {data['preview'] or data['backup']}")
+    # 有翻不出来的格子就算部分失败，信封里也要能看出来（只看 ok 的 AI 不会误判成功）
+    errors = [f"{len(failed)} cell(s) failed"] if failed else []
+    reporter.emit(envelope("translate", path, data, warnings, errors=errors), text)
+    return EXIT_PARTIAL if failed else EXIT_OK
+
+
+def _load_wordbook_rows(path=None):
+    """词表存在就拿来当术语表；不存在就是空的，不算错误。"""
+    from wordbook_csv import load_wordbook_csv
+
+    wordbook = Path(path) if path else flow.config_dir() / "wordbook.csv"
+    if not wordbook.exists():
+        return []
+    _headers, rows = load_wordbook_csv(wordbook)
+    return rows
+
+
 # —— 命令行装配 ——
 
 def build_parser():
@@ -250,6 +345,20 @@ def build_parser():
     inspect_parser.add_argument("file")
     _add_json(inspect_parser)
     inspect_parser.set_defaults(handler=cmd_inspect)
+
+    translate_parser = subparsers.add_parser("translate", help="translate a stringtable csv")
+    translate_parser.add_argument("file")
+    translate_parser.add_argument("--mode", choices=list(flow.ALL_MODES), default=flow.MODE_EMPTY)
+    translate_parser.add_argument("--columns", help="comma separated column names or language codes")
+    translate_parser.add_argument("--rows", help="comma separated row numbers, ranges allowed (1 based)")
+    translate_parser.add_argument("--only-empty", action="store_true", help="only fill empty target cells")
+    translate_parser.add_argument("--source", help="use only this source id for this run")
+    translate_parser.add_argument("--from-column", help="override the source column for this run")
+    translate_parser.add_argument("--wordbook", help="path to a wordbook csv (default: the app data one)")
+    translate_parser.add_argument("--preview", help="where to write the preview file")
+    translate_parser.add_argument("--write", action="store_true", help="save back to the original file")
+    _add_json(translate_parser)
+    translate_parser.set_defaults(handler=cmd_translate)
     return parser
 
 

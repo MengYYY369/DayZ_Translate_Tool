@@ -108,3 +108,150 @@ class ParseHelperTests(unittest.TestCase):
         # load_dayz_csv 会把表头归一化成 16 列，chinesesimp 在下标 14
         self.assertEqual(cli.resolve_columns(DAYZ_HEADERS, "chinesesimp"), [14])
         self.assertEqual(cli.resolve_columns(DAYZ_HEADERS, "english"), [2])
+
+
+class _FakeStore:
+    """顶替翻译缓存：只碰给定的那个临时文件。"""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def load(self):
+        return {}
+
+    def save(self, cache):
+        pass
+
+    def clear(self):
+        Path(self.path).unlink(missing_ok=True)
+
+    def is_writable(self):
+        return True
+
+
+class FakeConfig:
+    def __init__(self, label="fake"):
+        self.label = label
+        self.provider = "fake"
+
+
+class TranslateTests(CliTestCase):
+    def setUp(self):
+        self.calls = []
+
+        def fake_run(raw_jobs, configs, source_header, **kwargs):
+            from translator_service import TranslationResults
+
+            self.calls.append({"jobs": list(raw_jobs), "configs": configs, "source": source_header})
+            results = TranslationResults()
+            for row, column, text, _target in raw_jobs:
+                if text == "Gun":
+                    continue                      # 故意留一条失败
+                results.cell_results[(row, column)] = f"[{text}]"
+                results.translated += 1
+            results.failed = len(raw_jobs) - len(results.cell_results)
+            results.errors.append("boom")
+            return results
+
+        self._original = cli.flow.run_translation
+        cli.flow.run_translation = fake_run
+        self._original_configs = cli.flow.build_translation_configs
+        cli.flow.build_translation_configs = lambda *a, **k: [FakeConfig()]
+        # 本类有自己的 setUp（没调 super()），所以配置打桩也要自己来一遍
+        self._original_load_settings = cli.flow.load_app_settings
+        cli.flow.load_app_settings = lambda *args, **kwargs: cli.flow.AppSettings()
+        # 别让单测去读写用户本机的真缓存
+        self._cache_folder = tempfile.TemporaryDirectory()
+        self._original_store = cli.make_cache_store
+        cli.make_cache_store = lambda: _FakeStore(Path(self._cache_folder.name) / "cache.json")
+
+    def tearDown(self):
+        cli.flow.run_translation = self._original
+        cli.flow.build_translation_configs = self._original_configs
+        cli.flow.load_app_settings = self._original_load_settings
+        cli.make_cache_store = self._original_store
+        self._cache_folder.cleanup()
+
+    def test_preview_is_written_without_write(self):
+        path = write_csv()
+        code, payload = self.run_json("translate", str(path), "--mode", "all", "--json")
+        self.assertEqual(code, 1)                                   # 有一条翻失败了
+        self.assertFalse(payload["ok"])                              # 信封里也不能写 ok
+        preview = Path(payload["data"]["preview"])
+        self.assertTrue(preview.exists())
+        self.assertIn("[Knife]", preview.read_text(encoding="utf-8"))
+        self.assertNotIn("[Knife]", path.read_text(encoding="utf-8"))  # 原文件没动
+        self.assertEqual(payload["data"]["failed_cells"][0]["row"], 2)
+        self.assertEqual(payload["data"]["failed_cells"][0]["header"], "czech")
+
+    def test_write_backs_up_and_saves(self):
+        path = write_csv()
+        code, payload = self.run_json("translate", str(path), "--mode", "all", "--write", "--json")
+        self.assertEqual(code, 1)
+        self.assertTrue(payload["data"]["written"])
+        self.assertTrue(Path(payload["data"]["backup"]).exists())
+        self.assertIn("[Knife]", path.read_text(encoding="utf-8"))
+
+    def test_custom_preview_path(self):
+        path = write_csv()
+        target = path.with_name("custom.csv")
+        _code, payload = self.run_json("translate", str(path), "--preview", str(target), "--json")
+        self.assertEqual(payload["data"]["preview"], str(target))
+
+    def test_mode_all_ignores_existing_translation(self):
+        path = write_csv()
+        self.run_json("translate", str(path), "--mode", "all", "--json")
+        # load_dayz_csv 把表头归一化成 16 列，chinesesimp 是下标 14
+        self.assertIn((1, 14, "Gun", "zh-CN"), self.calls[0]["jobs"])
+
+    def test_mode_empty_skips_existing_translation(self):
+        path = write_csv()
+        self.run_json("translate", str(path), "--json")
+        jobs = self.calls[0]["jobs"]
+        self.assertIn((0, 14, "Knife", "zh-CN"), jobs)        # 空格要翻
+        self.assertNotIn((1, 14, "Gun", "zh-CN"), jobs)       # 已有译文不翻
+
+    def test_from_column_override(self):
+        path = write_csv()
+        self.run_json("translate", str(path), "--from-column", "chinesesimp", "--json")
+        self.assertEqual(self.calls[0]["source"], "chinesesimp")
+
+    def test_unknown_from_column_is_exit_2(self):
+        path = write_csv()
+        code, _out, err = self.run_cli("translate", str(path), "--from-column", "klingon")
+        self.assertEqual(code, 2)
+
+    def test_no_source_configured_is_exit_2(self):
+        path = write_csv()
+        cli.flow.build_translation_configs = lambda *a, **k: []
+        code, _out, err = self.run_cli("translate", str(path))
+        self.assertEqual(code, 2)
+        self.assertIn("source", err)
+
+    def test_no_jobs_is_exit_0(self):
+        path = write_csv("Language,original,english,chinesesimp\n")
+        code, payload = self.run_json("translate", str(path), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["data"]["jobs"], 0)
+
+    def test_rows_out_of_range_is_exit_2(self):
+        path = write_csv()
+        code, _out, err = self.run_cli("translate", str(path), "--rows", "99")
+        self.assertEqual(code, 2)
+        self.assertIn("row out of range", err)
+        # 区间里只越界一半也要报错，不能静默只翻前面那几行
+        code, _out, err = self.run_cli("translate", str(path), "--rows", "2-99")
+        self.assertEqual(code, 2)
+        self.assertIn("row out of range", err)
+
+    def test_preview_must_not_point_at_the_source_file(self):
+        path = write_csv()
+        code, _out, err = self.run_cli("translate", str(path), "--preview", str(path))
+        self.assertEqual(code, 2)
+        self.assertIn("--preview", err)
+        self.assertIn("Knife", path.read_text(encoding="utf-8"))    # 原文件一字未动
+        # 换个写法指回同一个文件也得拦住
+        same = path.parent / "." / path.name
+        code, _out, _err = self.run_cli("translate", str(path), "--preview", str(same))
+        self.assertEqual(code, 2)
+        self.assertIn("Knife", path.read_text(encoding="utf-8"))
