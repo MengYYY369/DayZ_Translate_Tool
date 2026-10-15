@@ -6,7 +6,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from translator_service import DEFAULT_CHAR_BUDGET, DEFAULT_OUTPUT_CHAR_CAP, AdaptiveGate, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, assign_batch_ids, matching_glossary_entries, parse_numbered_translations, parse_retry_after, retry_call, salvage_truncated_object, validate_translator_config
+from translator_service import DEFAULT_CHAR_BUDGET, DEFAULT_OUTPUT_CHAR_CAP, AdaptiveGate, OpenAICompatibleTranslator, RETRY_MAX_ATTEMPTS, RateLimiter, RetryPolicy, TranslationCancelled, TranslationJob, TranslationRequestError, TranslationService, TranslatorConfig, TranslationResults, assign_batch_ids, estimate_row_prompt_chars, matching_glossary_entries, parse_numbered_translations, parse_retry_after, retry_call, salvage_truncated_object, validate_translator_config
 
 
 class FakeBatchTranslator:
@@ -1043,6 +1043,44 @@ class RowBatchingTests(unittest.TestCase):
 
         self.assertEqual(len(batches), 20)
 
+    def test_request_cap_cuts_batch_by_prompt_size(self):
+        """AI 源按整个请求的体积封批：源文很短也要算上每行的 JSON 骨架。"""
+        targets = ["de", "ru", "fr"]
+        jobs = [
+            TranslationJob(row, 3 + index, "ACE", "en", target)
+            for row in range(6)
+            for index, target in enumerate(targets)
+        ]
+        service = TranslationService()
+
+        # 一行估 3 + 8×3 + 60 = 87 字符，预算 300 只装得下 3 行
+        batches = list(service.iter_row_batches(jobs, 1000, DEFAULT_OUTPUT_CHAR_CAP,
+                                                request_char_cap=300))
+
+        self.assertEqual([len({job.row for job in batch}) for batch in batches], [3, 3])
+
+    def test_request_cap_off_by_default(self):
+        """不传 request_char_cap 时维持老行为（免费源只按源文字数封批）。"""
+        jobs = [TranslationJob(row, 3, "ACE", "en", "de") for row in range(20)]
+
+        self.assertEqual(len(self._batches(jobs, 1000)), 1)
+
+    def test_request_cap_estimate_matches_real_prompt(self):
+        """估算值要贴着 build_merged_prompt 的真实体积，不然封批形同虚设。"""
+        jobs = [
+            TranslationJob(0, 3, "ACE", "en", "de"),
+            TranslationJob(0, 4, "ACE", "en", "zh-CN"),
+            TranslationJob(0, 5, "ACE", "en", "pt-BR"),
+        ]
+        item = json.dumps([{"id": 1, "source_language": "en",
+                            "targets": ["de", "zh-CN", "pt-BR"], "text": "ACE"}],
+                          ensure_ascii=False)[1:-1]
+
+        estimate = estimate_row_prompt_chars(jobs)
+
+        self.assertGreaterEqual(estimate, len(item) * 0.8)
+        self.assertLessEqual(estimate, len(item) * 1.2)
+
     def test_all_jobs_preserved(self):
         jobs = [
             TranslationJob(row, 3 + index, "w" * (row + 1), "en", target)
@@ -1260,6 +1298,93 @@ class MissingRecoveryTests(unittest.TestCase):
 
         self.assertEqual(results.failed, 1)
         self.assertEqual(results.cell_results, {(0, 0): "A", (2, 2): "C"})
+
+
+class OversizedRequestRecoveryTests(unittest.TestCase):
+    """网关嫌请求太大时按行劈开重发，而不是把整批几百上千个格子一次记成失败。"""
+
+    TOO_LARGE = ('OpenAI HTTP 400: {"detail":"请求 Token 超出最大限制 '
+                 '(当前约 18025 tokens, 最大 16384)"}')
+
+    @staticmethod
+    def _service(max_rows, calls, message=None):
+        class SplittingTranslator:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def translate_job_batch(self, jobs, assigned=None):
+                calls.append(len({job.row for job in jobs}))
+                if len({job.row for job in jobs}) > max_rows:
+                    raise TranslationRequestError(
+                        message or OversizedRequestRecoveryTests.TOO_LARGE, status=400)
+                assigned = assigned or assign_batch_ids(jobs)
+                return {
+                    item_id: {job.target_code: f"{job.target_code}:{job.text}" for job in row_jobs}
+                    for item_id, row_jobs in assigned.items()
+                }
+
+        service = TranslationService()
+        service.openai_translator_class = SplittingTranslator
+        return service
+
+    @staticmethod
+    def _jobs(count, targets=("de", "ru")):
+        return [
+            TranslationJob(row, 3 + index, f"text{row}", "en", target)
+            for row in range(count)
+            for index, target in enumerate(targets)
+        ]
+
+    @staticmethod
+    def _config():
+        # 预算开得很大，逼着初始只封一批，把劈批逻辑单独逼出来
+        return TranslatorConfig(provider="openai", api_key="k", model="m", char_budget=100000)
+
+    def test_too_large_request_is_split_until_it_fits(self):
+        calls = []
+        service = self._service(2, calls)
+        jobs = self._jobs(8)
+
+        results = service.translate_jobs(jobs, self._config())
+
+        # 深度优先：8 行先劈成 4/4，前半再劈成 2/2 成功后才回头处理后半
+        self.assertEqual(sorted(calls), [2, 2, 2, 2, 4, 4, 8])
+        self.assertEqual(results.failed, 0)
+        self.assertEqual(results.translated, len(jobs))
+        self.assertEqual(results.cell_results[(7, 3)], "de:text7")
+
+    def test_single_row_that_still_too_large_counts_failed(self):
+        calls = []
+        service = self._service(0, calls)
+        jobs = self._jobs(2)
+
+        results = service.translate_jobs(jobs, self._config())
+
+        self.assertEqual(calls, [2, 1, 1])       # 劈到单行就不再劈，不会无限递归
+        self.assertEqual(results.failed, 4)
+        self.assertEqual(results.translated, 0)
+
+    def test_other_400_is_not_split(self):
+        calls = []
+        service = self._service(2, calls, message="OpenAI HTTP 400: invalid api key")
+        jobs = self._jobs(4)
+
+        results = service.translate_jobs(jobs, self._config())
+
+        self.assertEqual(calls, [4])
+        self.assertEqual(results.failed, len(jobs))
+
+    def test_english_context_overflow_is_split(self):
+        calls = []
+        service = self._service(
+            1, calls,
+            message="OpenAI HTTP 400: This model's maximum context length is 16385 tokens")
+        jobs = self._jobs(4)
+
+        results = service.translate_jobs(jobs, self._config())
+
+        self.assertEqual(sorted(calls), [1, 1, 1, 1, 2, 2, 4])
+        self.assertEqual(results.failed, 0)
 
 
 def _openai_translator(**kwargs):

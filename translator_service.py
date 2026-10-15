@@ -477,7 +477,8 @@ class TranslationService:
         if not jobs:
             return results
         translator = self._create_provider("auto", "multi", config)
-        batches = list(self.iter_row_batches(jobs, config.char_budget, DEFAULT_OUTPUT_CHAR_CAP))
+        batches = list(self.iter_row_batches(jobs, config.char_budget, DEFAULT_OUTPUT_CHAR_CAP,
+                                             request_char_cap=config.char_budget))
         if not batches:
             return results
         max_workers = max(1, int(config.parallel_batches or 1))
@@ -535,18 +536,23 @@ class TranslationService:
         return grouped
 
     def iter_row_batches(self, jobs, char_budget=DEFAULT_CHAR_BUDGET,
-                         output_char_cap=DEFAULT_OUTPUT_CHAR_CAP):
+                         output_char_cap=DEFAULT_OUTPUT_CHAR_CAP, request_char_cap=None):
         """按行累积、按字数预算封批。行永不被劈开。
 
         形状参照 bilingual_book_maker 的 _assign_batch_indexes
         （book_maker/loader/epub_loader.py:3143-3160）：累到预算就封批，
         超长条目单独成批，不拖累下一条。
+
+        char_budget 管源文，output_char_cap 管预估产出，都只跟内容有关；
+        request_char_cap 管整个请求的预估体积，只有 AI 源才传 —— 它把一行的多个
+        目标语言合并进一条 JSON，每行都带一遍骨架，只按内容封批会发出远超预算的请求。
         """
         if not jobs:
             return
         # 只防零，不做下限钳制 —— 下限钳制会让「传 10」变成 200，测试与实现互相矛盾。
         budget = max(1, int(char_budget or DEFAULT_CHAR_BUDGET))
         cap = max(1, int(output_char_cap or DEFAULT_OUTPUT_CHAR_CAP))
+        request_cap = None if request_char_cap is None else max(1, int(request_char_cap))
 
         by_row = {}
         for job in jobs:
@@ -555,6 +561,7 @@ class TranslationService:
         batch = []
         batch_chars = 0
         batch_cost = 0
+        batch_prompt = 0
         for row in sorted(by_row):
             row_jobs = by_row[row]
             # 同一行共享同一句原文，源文字数按最长的那条算
@@ -562,18 +569,21 @@ class TranslationService:
             # 预估产出量：源文字数 × 目标语言数（同一目标语言只算一次）
             targets = {(job.source_code, job.target_code) for job in row_jobs}
             row_cost = row_chars * max(1, len(targets))
+            row_prompt = estimate_row_prompt_chars(row_jobs) if request_cap else 0
 
-            if batch and (batch_chars + row_chars > budget or batch_cost + row_cost > cap):
+            if batch and (batch_chars + row_chars > budget or batch_cost + row_cost > cap
+                          or (request_cap is not None and batch_prompt + row_prompt > request_cap)):
                 yield batch
-                batch, batch_chars, batch_cost = [], 0, 0
+                batch, batch_chars, batch_cost, batch_prompt = [], 0, 0, 0
 
             batch.extend(row_jobs)
             batch_chars += row_chars
             batch_cost += row_cost
+            batch_prompt += row_prompt
 
-            if row_chars > budget or row_cost > cap:
+            if row_chars > budget or row_cost > cap or (request_cap is not None and row_prompt > request_cap):
                 yield batch
-                batch, batch_chars, batch_cost = [], 0, 0
+                batch, batch_chars, batch_cost, batch_prompt = [], 0, 0, 0
 
         if batch:
             yield batch
@@ -659,8 +669,23 @@ class TranslationService:
         except TranslationCancelled:
             raise
         except TranslationRequestError as exc:
-            self._record_failed_jobs(batch, results, exc)
-            raise                    # 保留 Task 3 的异常契约：让闸门看到限速信号
+            halves = split_batch_at_row(batch) if is_request_too_large(exc) else None
+            if halves is None:
+                self._record_failed_jobs(batch, results, exc)
+                raise                # 保留 Task 3 的异常契约：让闸门看到限速信号
+            # 网关嫌请求太大：按行劈成两半重发，父批不算失败 ——
+            # 一整批几百上千个格子不该因为一次「请求太大」全军覆没。
+            pending = None
+            for half in halves:
+                try:
+                    self._translate_one_openai_batch(translator, half, results, provider)
+                except TranslationCancelled:
+                    raise
+                except TranslationRequestError as half_exc:
+                    pending = half_exc      # 子批已自己记失败，记下信号最后再回传
+            if pending is not None:
+                raise pending
+            return
         except Exception as exc:
             self._record_failed_jobs(batch, results, exc)
             return                   # 非限速类错误：本批记失败，不打断其它批次
@@ -794,6 +819,24 @@ def matching_glossary_entries(glossary, texts, source_key="", max_entries=GLOSSA
     return matched
 
 
+# 一行在合并提示词里的固定骨架：{"id": 1, "source_language": "en", "targets": [], "text": ""},
+AI_ROW_PROMPT_OVERHEAD = 60
+# 每个目标语言在 "targets" 里的开销："zh-CN",
+AI_TARGET_PROMPT_CHARS = 8
+
+
+def estimate_row_prompt_chars(row_jobs):
+    """估一行在 AI 合并提示词里占多少字符（形状见 build_merged_prompt 的 items）。
+
+    源文往往只有几个字符，而每行都要带一遍键名、语言码与引号，骨架比原文大得多：
+    只按源文字数封批会发出远超预算的请求（实测 3000 字预算发出 24000 字，网关直接拒绝）。
+    这里只做粗估，不要求精确，真实提示词还会多出系统提示与术语表。
+    """
+    targets = {job.target_code for job in row_jobs}
+    text_chars = max((len(job.text) for job in row_jobs), default=0)
+    return text_chars + AI_TARGET_PROMPT_CHARS * len(targets) + AI_ROW_PROMPT_OVERHEAD
+
+
 def assign_batch_ids(jobs):
     """给一批 job 分配稳定 id：同一行的所有 job 共享一个 id。
 
@@ -804,6 +847,44 @@ def assign_batch_ids(jobs):
     for job in jobs:
         by_row.setdefault(job.row, []).append(job)
     return {index: by_row[row] for index, row in enumerate(sorted(by_row), start=1)}
+
+
+# 网关/模型嫌请求太大时的报错特征：413，或 400 正文里的英文短语、
+# 或中文网关的「Token + 上限词」（实测 Index-Translate 两条文案都命中）。
+TOO_LARGE_HINTS = (
+    "too many tokens", "maximum context", "context length", "context_length_exceeded",
+    "token limit", "tokens limit", "too large", "payload too large", "prompt is too long",
+)
+TOO_LARGE_LIMIT_WORDS = ("超出", "超过", "上限", "最大限制", "上下文")
+
+
+def is_request_too_large(exc):
+    """这个失败是不是「请求体积超出网关/模型上限」？命中就值得劈开重发。"""
+    if not isinstance(exc, TranslationRequestError):
+        return False
+    if exc.status == 413:
+        return True
+    if exc.status != 400:
+        return False
+    text = str(exc).lower()
+    if any(hint in text for hint in TOO_LARGE_HINTS):
+        return True
+    return "token" in text and any(word in text for word in TOO_LARGE_LIMIT_WORDS)
+
+
+def split_batch_at_row(batch):
+    """把一批按行对半劈开，行永不被拆散。只有一行时返回 None（没得劈）。"""
+    by_row = {}
+    for job in batch:
+        by_row.setdefault(job.row, []).append(job)
+    rows = sorted(by_row)
+    if len(rows) < 2:
+        return None
+    middle = len(rows) // 2
+    return (
+        [job for row in rows[:middle] for job in by_row[row]],
+        [job for row in rows[middle:] for job in by_row[row]],
+    )
 
 
 def salvage_truncated_object(text):

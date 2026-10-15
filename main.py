@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStyle,
     QTableWidget,
@@ -47,6 +48,8 @@ from dayz_csv import (
 from translation_cache import TranslationCacheStore
 import translation_flow
 from translation_worker import TranslationWorker
+from quality_check import RULE_GROUPS, QualityCheckConfig, all_rules, target_columns
+from quality_check_worker import QualityCheckWorker
 from translator_service import DEFAULT_CHAR_BUDGET, MAX_AUTO_CONCURRENCY, MAX_CHAR_BUDGET, MIN_CHAR_BUDGET, RetryPolicy, TranslationJob, TranslationService, validate_translator_config
 from free_translators import FREE_SOURCE_SPECS
 from translation_sources import (
@@ -71,6 +74,8 @@ LANGUAGE_COLUMN_WIDTH = 150
 DEFAULT_COLUMN_WIDTH = 90
 SEARCH_MATCH_COLOR = QColor("#9adbe8")
 SEARCH_ACTIVE_COLOR = QColor("#ffc857")
+# 质检标记色：自动查出来的和右键手动标的都用这一种（用户决定不区分）
+QC_PROBLEM_COLOR = QColor("#ffb3b3")
 TABLE_GRIDLINE_COLOR = "#8c8c8c"
 AI_TYPE_KEYS = translation_flow.AI_TYPE_KEYS
 AI_TYPE_LABEL_KEYS = {
@@ -222,6 +227,59 @@ UI_TEXT = {
         "import_no_new_keys": "No new keys to import. Skipped duplicates: {skipped}. Files: {files}.",
         "import_result": "Imported {added} keys, skipped {skipped} duplicates, files: {files}.",
         "import_failed": "Import failed",
+        "check_errors": "Check for Errors",
+        "translate_error_cells": "Translate Error Cells",
+        "quality_check_settings": "Check Settings...",
+        "quality_only": "Problems only",
+        "mark_error": "Mark as error",
+        "unmark_error": "Clear error mark",
+        "mark_row_error": "Mark whole row as error",
+        "unmark_row_error": "Clear error marks on this row",
+        "quality_check_progress": "Checking... {done}/{total}",
+        "quality_check_done": "Checked {cells} cells, found {count} problems.",
+        "quality_check_clean": "Checked {cells} cells, no problems found.",
+        "quality_check_cancelled": "Check cancelled",
+        "quality_check_running": "A check is already running. Cancel it or wait for it to finish.",
+        "quality_check_failed": "Check failed",
+        "quality_check_no_csv": "Open a DayZ stringtable.csv before checking.",
+        "quality_check_no_cells": "No error cells to translate.",
+        "cancelling_check": "Cancelling check...",
+        "similarity_threshold": "Similarity threshold",
+        "qc_select_all": "All",
+        "qc_select_none": "None",
+        "qc_restore_defaults": "Restore defaults",
+        "qc_group_format": "Format",
+        "qc_group_language": "Language",
+        "qc_group_similarity": "Similarity and consistency",
+        "qc_group_model": "Model output",
+        "qc_group_glossary": "Wordbook",
+        "quality_rule_placeholder_missing": "Placeholder missing or changed",
+        "quality_rule_placeholder_extra": "Extra placeholder",
+        "quality_rule_placeholder_order": "Placeholder order changed",
+        "quality_rule_line_breaks": "Line break or tab mismatch",
+        "quality_rule_rich_tags": "Rich text tag lost",
+        "quality_rule_color_markup": "Color markup lost",
+        "quality_rule_numbers": "Numbers do not match",
+        "quality_rule_brackets": "Brackets or quotes unpaired",
+        "quality_rule_spaces": "Space at the edge or doubled",
+        "quality_rule_invisible_chars": "Invisible characters",
+        "quality_rule_csv_unsafe": "Would break the CSV",
+        "quality_rule_empty_translation": "Empty translation",
+        "quality_rule_script_missing": "Missing expected writing system",
+        "quality_rule_script_unexpected": "Unexpected writing system",
+        "quality_rule_copied_source": "Copied the source text",
+        "quality_rule_punctuation": "Punctuation not localized",
+        "quality_rule_fullwidth": "Full-width and half-width mixed",
+        "quality_rule_row_similarity": "Too similar to another language in the same row",
+        "quality_rule_column_duplicate": "Two columns are almost the same",
+        "quality_rule_inconsistent_target": "Same source, different translation",
+        "quality_rule_duplicate_target": "Same translation for different sources",
+        "quality_rule_prompt_leak": "Model talk or prompt residue",
+        "quality_rule_length_ratio": "Length looks wrong",
+        "quality_rule_untranslated_sentence": "Whole sentence still in the source language",
+        "quality_rule_garbage": "Garbled text or links",
+        "quality_rule_parenthetical_notes": "Added a note in brackets",
+        "quality_rule_glossary_missing": "Wordbook term missing",
     },
     "zh": {
         "file": "文件",
@@ -360,6 +418,59 @@ UI_TEXT = {
         "import_no_new_keys": "没有可导入的新键。跳过重复 {skipped}，文件数 {files}。",
         "import_result": "新增 {added} 个键，跳过重复 {skipped}，文件数 {files}。",
         "import_failed": "导入失败",
+        "check_errors": "检查错误",
+        "translate_error_cells": "翻译错误文本",
+        "quality_check_settings": "检查设置...",
+        "quality_only": "只看问题格",
+        "mark_error": "标记为错误",
+        "unmark_error": "取消错误标记",
+        "mark_row_error": "标记整行为错误",
+        "unmark_row_error": "取消整行的错误标记",
+        "quality_check_progress": "正在检查… {done}/{total}",
+        "quality_check_done": "已检查 {cells} 个单元格，发现 {count} 处问题。",
+        "quality_check_clean": "已检查 {cells} 个单元格，没有发现问题。",
+        "quality_check_cancelled": "检查已取消",
+        "quality_check_running": "检查正在进行中，请先取消或等待完成。",
+        "quality_check_failed": "检查失败",
+        "quality_check_no_csv": "请先打开 DayZ stringtable.csv。",
+        "quality_check_no_cells": "没有被标记错误的单元格可以重译。",
+        "cancelling_check": "正在取消检查...",
+        "similarity_threshold": "相似率门槛",
+        "qc_select_all": "全选",
+        "qc_select_none": "全不选",
+        "qc_restore_defaults": "恢复默认",
+        "qc_group_format": "格式",
+        "qc_group_language": "语言",
+        "qc_group_similarity": "相似度与一致性",
+        "qc_group_model": "模型输出",
+        "qc_group_glossary": "术语表",
+        "quality_rule_placeholder_missing": "占位符少了或变了",
+        "quality_rule_placeholder_extra": "多出了占位符",
+        "quality_rule_placeholder_order": "占位符顺序变了",
+        "quality_rule_line_breaks": "换行或制表符对不上",
+        "quality_rule_rich_tags": "富文本标签丢了",
+        "quality_rule_color_markup": "颜色标记丢了",
+        "quality_rule_numbers": "数字对不上",
+        "quality_rule_brackets": "括号或引号不配对",
+        "quality_rule_spaces": "首尾空格或连续空格",
+        "quality_rule_invisible_chars": "有看不见的字符",
+        "quality_rule_csv_unsafe": "会撑坏 CSV",
+        "quality_rule_empty_translation": "译文是空的",
+        "quality_rule_script_missing": "缺少应有的文字",
+        "quality_rule_script_unexpected": "混进了别的文字",
+        "quality_rule_copied_source": "照抄了原文",
+        "quality_rule_punctuation": "标点没有本地化",
+        "quality_rule_fullwidth": "全角半角混用",
+        "quality_rule_row_similarity": "同一行不同语言太像",
+        "quality_rule_column_duplicate": "两列内容几乎一样",
+        "quality_rule_inconsistent_target": "同一句原文译得不一样",
+        "quality_rule_duplicate_target": "同一句译文用在不同原文上",
+        "quality_rule_prompt_leak": "模型废话或提示词残留",
+        "quality_rule_length_ratio": "长度明显异常",
+        "quality_rule_untranslated_sentence": "整句还是原文语言",
+        "quality_rule_garbage": "乱码或链接残留",
+        "quality_rule_parenthetical_notes": "括号里多了注释",
+        "quality_rule_glossary_missing": "单词本里的词没出现",
     },
 }
 class _NoToolTipFilter(QObject):
@@ -407,6 +518,9 @@ class SearchDialog(QDialog):
         self.match_case_checkbox = QCheckBox(window.tr("match_case"), self)
         self.match_case_checkbox.toggled.connect(self._schedule_refresh)
 
+        self.quality_only_checkbox = QCheckBox(window.tr("quality_only"), self)
+        self.quality_only_checkbox.toggled.connect(self._schedule_refresh)
+
         self.next_button = QPushButton(window.tr("next"), self)
         self.next_button.setMaximumWidth(96)
         self.next_button.clicked.connect(self.next_match)
@@ -418,6 +532,7 @@ class SearchDialog(QDialog):
         options_layout = QHBoxLayout()
         options_layout.addWidget(self.match_whole_word_checkbox)
         options_layout.addWidget(self.match_case_checkbox)
+        options_layout.addWidget(self.quality_only_checkbox)
         options_layout.addStretch(1)
 
         button_layout = QHBoxLayout()
@@ -430,7 +545,7 @@ class SearchDialog(QDialog):
         layout.addLayout(options_layout)
         layout.addWidget(self.count_label)
         layout.addLayout(button_layout)
-        self.resize(360, 160)
+        self.resize(400, 200)
 
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
@@ -446,13 +561,29 @@ class SearchDialog(QDialog):
     def _schedule_refresh(self):
         self._debounce_timer.start(self.SEARCH_DEBOUNCE_MS)
 
+    def refresh_later(self):
+        """外部改了格子底色（标记/检查结果变化）时延后重刷，避免在信号回调里递归。"""
+        self._schedule_refresh()
+
     def refresh_matches(self):
         self._clear_highlight()
-        self.matches = self.window.find_matches(
-            self.search_input.text(),
-            whole_word=self.match_whole_word_checkbox.isChecked(),
-            match_case=self.match_case_checkbox.isChecked(),
-        )
+        text = self.search_input.text()
+        if self.quality_only_checkbox.isChecked():
+            # 只看问题格：搜索框留空就列全部问题格，填了就在问题格里再按文字筛
+            self.matches = sorted(self.window.quality_problem_cells())
+            if text.strip():
+                found = set(self.window.find_matches(
+                    text,
+                    whole_word=self.match_whole_word_checkbox.isChecked(),
+                    match_case=self.match_case_checkbox.isChecked(),
+                ))
+                self.matches = [cell for cell in self.matches if cell in found]
+        else:
+            self.matches = self.window.find_matches(
+                text,
+                whole_word=self.match_whole_word_checkbox.isChecked(),
+                match_case=self.match_case_checkbox.isChecked(),
+            )
         for row_index, column_index in self.matches:
             item = self.window.table.item(row_index, column_index)
             if item:
@@ -465,9 +596,8 @@ class SearchDialog(QDialog):
 
     def _clear_highlight(self):
         for row_index, column_index in self._highlighted_cells:
-            item = self.window.table.item(row_index, column_index)
-            if item:
-                item.setBackground(QColor())
+            # 恢复该格本来的底色：问题格的错误标记色不能被搜索高亮清掉
+            self.window.restore_cell_background(row_index, column_index)
         self._highlighted_cells.clear()
 
     def next_match(self):
@@ -1101,6 +1231,89 @@ class TranslationSettingsDialog(QDialog):
         self.window.clear_translation_cache()
 
 
+class QualityCheckSettingsDialog(QDialog):
+    """检查设置：逐条勾选检查项 + 相似率门槛。"""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self.setWindowTitle(window.tr("quality_check_settings").rstrip("."))
+
+        self.similarity_input = QDoubleSpinBox(self)
+        self.similarity_input.setRange(0.5, 1.0)
+        self.similarity_input.setSingleStep(0.01)
+        self.similarity_input.setDecimals(2)
+        self.similarity_input.setValue(window.quality_config.similarity)
+
+        form = QFormLayout()
+        form.addRow(QLabel(window.tr("similarity_threshold"), self), self.similarity_input)
+
+        self.checkboxes = {}
+        groups_layout = QVBoxLayout()
+        for group_key, rules in RULE_GROUPS:
+            group_box = QGroupBox(window.tr(group_key), self)
+            group_layout = QVBoxLayout(group_box)
+            select_all_button = QPushButton(window.tr("qc_select_all"), group_box)
+            select_all_button.clicked.connect(lambda _checked=False, rules=rules: self.set_group(rules, True))
+            select_none_button = QPushButton(window.tr("qc_select_none"), group_box)
+            select_none_button.clicked.connect(lambda _checked=False, rules=rules: self.set_group(rules, False))
+            button_row = QHBoxLayout()
+            button_row.addWidget(select_all_button)
+            button_row.addWidget(select_none_button)
+            button_row.addStretch(1)
+            group_layout.addLayout(button_row)
+            for rule in rules:
+                checkbox = QCheckBox(window.tr(f"quality_rule_{rule}"), group_box)
+                checkbox.setChecked(window.quality_config.is_enabled(rule))
+                group_layout.addWidget(checkbox)
+                self.checkboxes[rule] = checkbox
+            groups_layout.addWidget(group_box)
+
+        container = QWidget(self)
+        container.setLayout(groups_layout)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(container)
+
+        restore_button = QPushButton(window.tr("qc_restore_defaults"), self)
+        restore_button.clicked.connect(self.restore_defaults)
+        save_button = QPushButton(window.tr("save"), self)
+        save_button.clicked.connect(self.apply_settings)
+        cancel_button = QPushButton(window.tr("cancel"), self)
+        cancel_button.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addWidget(restore_button)
+        buttons.addStretch(1)
+        buttons.addWidget(save_button)
+        buttons.addWidget(cancel_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(scroll, 1)
+        layout.addLayout(buttons)
+        self.resize(520, 620)
+
+    def set_group(self, rules, checked):
+        for rule in rules:
+            self.checkboxes[rule].setChecked(checked)
+
+    def restore_defaults(self):
+        defaults = QualityCheckConfig()
+        for rule, checkbox in self.checkboxes.items():
+            checkbox.setChecked(defaults.is_enabled(rule))
+        self.similarity_input.setValue(defaults.similarity)
+
+    def values(self):
+        return QualityCheckConfig(
+            enabled=[rule for rule, checkbox in self.checkboxes.items() if checkbox.isChecked()],
+            similarity=self.similarity_input.value(),
+        )
+
+    def apply_settings(self):
+        self.window.save_quality_config(self.values())
+        self.accept()
+
+
 class LanguageSettingsDialog(QDialog):
     def __init__(self, window):
         super().__init__(window)
@@ -1575,6 +1788,14 @@ class DayzTranslateTool(QMainWindow):
         self._translation_job_cells = set()
         self._translation_failed_cells = set()
         self._translation_copy_overwrite = True
+        # 质检：自动查出来的问题格 + 右键手动标的格子，只存在内存里，不写进 csv
+        self.quality_config = QualityCheckConfig.from_json(self.settings.value("quality_check_config", ""))
+        self.quality_issues = {}
+        self.manual_issue_cells = set()
+        self._quality_painted = set()
+        self._quality_check_cancelled = False
+        self.quality_check_thread = None
+        self.quality_check_worker = None
         self.create_menus()
         self.create_edit_actions()
         self.create_translation_status_widgets()
@@ -1620,6 +1841,14 @@ class DayzTranslateTool(QMainWindow):
         self.action_translate_empty.triggered.connect(self.translate_empty_cells)
         self.menu_file.addAction(self.action_translate_empty)
 
+        self.menu_file.addSeparator()
+        self.action_check_errors = QAction("Check for Errors", self)
+        self.action_check_errors.triggered.connect(self.check_errors)
+        self.menu_file.addAction(self.action_check_errors)
+        self.action_translate_errors = QAction("Translate Error Cells", self)
+        self.action_translate_errors.triggered.connect(self.translate_error_cells)
+        self.menu_file.addAction(self.action_translate_errors)
+
         self.menu_search = self.menuBar().addMenu("Search")
         self.search_action = QAction("Search", self)
         self.search_action.setShortcut(QKeySequence.Find)
@@ -1633,6 +1862,9 @@ class DayzTranslateTool(QMainWindow):
         self.action_translation_settings = QAction("Translation Settings...", self)
         self.action_translation_settings.triggered.connect(self.open_translation_settings)
         self.menu_settings.addAction(self.action_translation_settings)
+        self.action_quality_check_settings = QAction("Check Settings...", self)
+        self.action_quality_check_settings.triggered.connect(self.open_quality_check_settings)
+        self.menu_settings.addAction(self.action_quality_check_settings)
         self.action_language_settings = QAction("Interface Language...", self)
         self.action_language_settings.triggered.connect(self.open_language_settings)
         self.menu_settings.addAction(self.action_language_settings)
@@ -1679,11 +1911,14 @@ class DayzTranslateTool(QMainWindow):
         self.action_import_config_folder.setText(texts["import_config_cpp_folder"])
         self.action_translate_all.setText(texts["translate_all_cells"])
         self.action_translate_empty.setText(texts["translate_empty_cells"])
+        self.action_check_errors.setText(texts["check_errors"])
+        self.action_translate_errors.setText(texts["translate_error_cells"])
         self.menu_search.setTitle(texts["search"])
         self.search_action.setText(texts["search"])
         self.menu_settings.setTitle(texts["settings"])
         self.action_source_language.setText(texts["source_language"])
         self.action_translation_settings.setText(texts["translation_settings"])
+        self.action_quality_check_settings.setText(texts["quality_check_settings"])
         self.action_language_settings.setText(texts["language_settings"])
         self.menu_wordbook.setTitle(texts["wordbook"])
         self.action_open_wordbook.setText(texts["wordbook"])
@@ -1819,6 +2054,7 @@ class DayzTranslateTool(QMainWindow):
         self.table.blockSignals(False)
         self.loading = False
         self.apply_column_widths()
+        self.reset_quality_marks()
         self.set_dirty(bool(dirty))
         self.history.clear()
         self.history.record(snapshot_table(self.table))
@@ -1933,6 +2169,12 @@ class DayzTranslateTool(QMainWindow):
     def handle_item_changed(self, item):
         if self.loading:
             return
+        # 手动改过的格子：原来的错误标记已经过期，直接去掉（不然标记会一直挂着）
+        cell_key = (item.row(), item.column())
+        if cell_key in self.quality_issues or cell_key in self.manual_issue_cells:
+            self.quality_issues.pop(cell_key, None)
+            self.manual_issue_cells.discard(cell_key)
+            self.paint_quality_cells()
         self._record_history()
         self.set_dirty(True)
 
@@ -1948,6 +2190,9 @@ class DayzTranslateTool(QMainWindow):
         restore_table(self.table, snapshot, block_signal_widget=self.table)
         self.history.suppress(False)
         self.set_dirty(True)
+        # 重建单元格会抹掉所有底色，撤销后要把问题格重新刷上
+        self._quality_painted = set()
+        self.paint_quality_cells()
 
     def redo(self):
         snapshot = self.history.redo()
@@ -1957,6 +2202,8 @@ class DayzTranslateTool(QMainWindow):
         restore_table(self.table, snapshot, block_signal_widget=self.table)
         self.history.suppress(False)
         self.set_dirty(True)
+        self._quality_painted = set()
+        self.paint_quality_cells()
 
     def table_rows(self):
         rows = []
@@ -1989,6 +2236,15 @@ class DayzTranslateTool(QMainWindow):
     def open_language_settings(self):
         dialog = LanguageSettingsDialog(self)
         dialog.exec()
+
+    def open_quality_check_settings(self):
+        dialog = QualityCheckSettingsDialog(self)
+        dialog.exec()
+
+    def save_quality_config(self, config):
+        self.quality_config = config
+        self.settings.setValue("quality_check_config", config.to_json())
+        self.settings.sync()
 
     def open_wordbook_window(self):
         if self.wordbook_window is None:
@@ -2115,6 +2371,10 @@ class DayzTranslateTool(QMainWindow):
             "translate_selected_cells": self.translate_selected_cells,
             "translate_selected_rows": self.translate_selected_rows,
             "translate_selected_columns": self.translate_selected_columns,
+            "mark_error": lambda: self.mark_context_as_errors(context, row, column),
+            "unmark_error": lambda: self.unmark_context_errors(context, row, column),
+            "mark_row_error": lambda: self.mark_context_as_errors(context, row, column),
+            "unmark_row_error": lambda: self.unmark_context_errors(context, row, column),
         }
         for name in self.context_action_names(context, row, column):
             if name == "-":
@@ -2148,6 +2408,10 @@ class DayzTranslateTool(QMainWindow):
                 translate_actions = ["translate_selected_cells"]
             elif rows and any(index > 0 for index in columns):
                 translate_actions = []
+        mark_actions = self.context_mark_action_names(context, row, column)
+        if mark_actions:
+            actions.append("-")
+            actions.extend(mark_actions)
         if translate_actions:
             actions.append("-")
             actions.extend(translate_actions)
@@ -2167,6 +2431,15 @@ class DayzTranslateTool(QMainWindow):
         if is_copy_only_column(self.headers[column]):
             return False
         return bool(language_code_for_header(self.headers[column]))
+
+    def is_quality_target_column(self, column):
+        """质检和「翻译错误文本」的目标列：语言列，且不是源语言列。"""
+        if not self.is_translatable_column(column):
+            return False
+        try:
+            return column != self.headers.index(self.source_header)
+        except ValueError:
+            return True
 
     def copy_selection(self):
         text = self.selection_as_text()
@@ -2631,6 +2904,14 @@ class DayzTranslateTool(QMainWindow):
             self.table.blockSignals(False)
             self._record_history()
             self.set_dirty(True)
+        # 重译成功的格子自动取消错误标记，失败的保留（用户决定）
+        if results.cell_results and (self.quality_issues or self.manual_issue_cells):
+            done_cells = self.quality_problem_cells() & set(results.cell_results)
+            if done_cells:
+                for cell_key in done_cells:
+                    self.quality_issues.pop(cell_key, None)
+                    self.manual_issue_cells.discard(cell_key)
+                self.paint_quality_cells()
         # 按翻译后的最终状态回填复制列：源语言为 chinesesimp 时 english 本身是翻译目标，
         # 只有翻译写入完成后才能复制到 original（chinese<-chinesesimp 同理兜底）。
         if self._translation_job_rows:
@@ -2691,6 +2972,219 @@ class DayzTranslateTool(QMainWindow):
             jobs.append((row_index, column_index, source_text, target_code))
         self.run_translation_jobs(jobs, copy_overwrite=False, rule=self._translation_rule)
 
+    # —— 翻译质检 ——
+
+    def quality_problem_cells(self):
+        """所有被标记为错误的格子：自动查出来的 + 右键手动标的。"""
+        return set(self.quality_issues) | self.manual_issue_cells
+
+    def cell_has_quality_problem(self, row_index, column_index):
+        cell_key = (row_index, column_index)
+        return cell_key in self.quality_issues or cell_key in self.manual_issue_cells
+
+    def restore_cell_background(self, row_index, column_index):
+        """恢复单元格本来的底色：问题格用错误色，其余用默认底色。"""
+        item = self.table.item(row_index, column_index)
+        if item is None:
+            return
+        item.setBackground(QC_PROBLEM_COLOR if self.cell_has_quality_problem(row_index, column_index) else QColor())
+
+    def paint_quality_cells(self):
+        """把问题格刷成错误色，同时把不再有问题的格子恢复底色。"""
+        problems = self.quality_problem_cells()
+        self.table.blockSignals(True)
+        try:
+            for cell_key in self._quality_painted - problems:
+                self.restore_cell_background(*cell_key)
+            for cell_key in problems:
+                item = self.table.item(*cell_key)
+                if item is not None:
+                    item.setBackground(QC_PROBLEM_COLOR)
+            self._quality_painted = set(problems)
+        finally:
+            self.table.blockSignals(False)
+        self.refresh_search_highlight()
+
+    def refresh_search_highlight(self):
+        """搜索窗口开着时重刷高亮，让问题格的标记色及时生效。"""
+        if self.search_dialog is not None and self.search_dialog.isVisible():
+            self.search_dialog.refresh_later()
+
+    def reset_quality_marks(self):
+        """换表/导入新数据时清空标记（标记不写盘，不跨表保留）。"""
+        self.quality_issues = {}
+        self.manual_issue_cells = set()
+        self._quality_painted = set()
+        self.refresh_search_highlight()
+
+    def mark_cells_as_errors(self, cells):
+        added = False
+        for cell_key in cells:
+            if cell_key not in self.manual_issue_cells:
+                self.manual_issue_cells.add(cell_key)
+                added = True
+        if added:
+            self.paint_quality_cells()
+
+    def unmark_cells(self, cells):
+        removed = False
+        for cell_key in cells:
+            if cell_key in self.manual_issue_cells:
+                self.manual_issue_cells.discard(cell_key)
+                removed = True
+            if cell_key in self.quality_issues:
+                del self.quality_issues[cell_key]
+                removed = True
+        if removed:
+            self.paint_quality_cells()
+
+    def context_mark_targets(self, context, row, column):
+        """右键要标记的格子：单元格是选中的格子，行头是该行所有可翻译格。"""
+        if context == "row_header":
+            if row < 0:
+                return []
+            return [(row, index) for index in range(self.table.columnCount()) if self.is_quality_target_column(index)]
+        if context == "cell":
+            items = self.selected_cell_items()
+            if not items and row >= 0 and column >= 0:
+                return [(row, column)] if self.is_quality_target_column(column) else []
+            return [(item.row(), item.column()) for item in items if self.is_quality_target_column(item.column())]
+        return []
+
+    def context_mark_action_names(self, context, row, column):
+        """右键里的「标记为错误 / 取消错误标记」：没格子可操作时不出菜单项。"""
+        targets = self.context_mark_targets(context, row, column)
+        if not targets:
+            return []
+        marked = all(self.cell_has_quality_problem(*cell_key) for cell_key in targets)
+        if context == "row_header":
+            return ["unmark_row_error"] if marked else ["mark_row_error"]
+        return ["unmark_error"] if marked else ["mark_error"]
+
+    def mark_context_as_errors(self, context, row, column):
+        self.mark_cells_as_errors(self.context_mark_targets(context, row, column))
+
+    def unmark_context_errors(self, context, row, column):
+        self.unmark_cells(self.context_mark_targets(context, row, column))
+
+    def check_errors(self):
+        self.start_quality_check()
+
+    def start_quality_check(self, run_immediately=False):
+        if self._is_translation_running() or self._is_quality_check_running():
+            QMessageBox.warning(self, self.tr("check_errors"), self.tr("quality_check_running"))
+            return
+        if not self.headers:
+            QMessageBox.warning(self, self.tr("check_errors"), self.tr("quality_check_no_csv"))
+            return
+
+        self._quality_check_cancelled = False
+        self.quality_check_worker = QualityCheckWorker(
+            self.visible_headers(),
+            self.table_rows(),
+            self.source_header,
+            config=self.quality_config,
+            glossary=self.wordbook_glossary(),
+        )
+        self.quality_check_worker.progress.connect(self.update_quality_progress)
+        self.quality_check_worker.finished.connect(self.finish_quality_check)
+        self.quality_check_worker.failed.connect(self.fail_quality_check)
+
+        self.show_translation_progress(len(all_rules()))
+        if run_immediately:
+            self.quality_check_worker.run()
+            return
+
+        self.quality_check_thread = QThread(self)
+        self.quality_check_worker.moveToThread(self.quality_check_thread)
+        self.quality_check_thread.started.connect(self.quality_check_worker.run)
+        self.quality_check_worker.finished.connect(self.quality_check_thread.quit)
+        self.quality_check_worker.failed.connect(self.quality_check_thread.quit)
+        # 线程结束后释放并清空引用，理由同翻译线程（旧引用调 isRunning() 会抛 RuntimeError）。
+        self.quality_check_thread.finished.connect(self.quality_check_worker.deleteLater)
+        self.quality_check_thread.finished.connect(self.quality_check_thread.deleteLater)
+        self.quality_check_thread.finished.connect(self._clear_quality_check_thread)
+        self.quality_check_thread.start()
+
+    def update_quality_progress(self, done, total):
+        done = min(done, total)
+        self.translation_progress_bar.setRange(0, total)
+        self.translation_progress_bar.setValue(done)
+        self.translation_progress_label.setText(self.tr("quality_check_progress", done=done, total=total))
+
+    def quality_check_cell_count(self):
+        """本次检查覆盖的格子数：有原文的行 × 要检查的语言列。"""
+        columns = target_columns(self.visible_headers(), self.source_header)
+        try:
+            source_column = self.headers.index(self.source_header)
+        except ValueError:
+            return 0
+        rows = self.table_rows()
+        return sum(1 for row in rows if source_column < len(row) and row[source_column].strip()) * len(columns)
+
+    def finish_quality_check(self, issues):
+        self.hide_translation_progress()
+        self.translation_cancel_button.setEnabled(True)
+        # 每点一次检查就是重算：上一轮的自动标记全部作废，手动标记保留
+        self.quality_issues = dict(issues)
+        self.paint_quality_cells()
+        if self._quality_check_cancelled:
+            self.statusBar().showMessage(self.tr("quality_check_cancelled"), 5000)
+            return
+        cells = self.quality_check_cell_count()
+        if self.quality_issues:
+            self.statusBar().showMessage(self.tr("quality_check_done", cells=cells, count=len(self.quality_issues)), 8000)
+        else:
+            self.statusBar().showMessage(self.tr("quality_check_clean", cells=cells), 8000)
+
+    def fail_quality_check(self, message):
+        self.hide_translation_progress()
+        self.translation_cancel_button.setEnabled(True)
+        QMessageBox.critical(self, self.tr("quality_check_failed"), message)
+
+    def _clear_quality_check_thread(self):
+        self.quality_check_worker = None
+        self.quality_check_thread = None
+
+    def _is_quality_check_running(self):
+        return self.quality_check_thread is not None and self.quality_check_thread.isRunning()
+
+    def _ensure_quality_check_stopped(self):
+        """关窗时收尾检查线程，理由同 _ensure_translation_stopped。"""
+        if self.quality_check_worker is not None:
+            self.quality_check_worker.cancel()
+        thread = self.quality_check_thread
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            thread.wait(3000)
+        self.quality_check_worker = None
+        self.quality_check_thread = None
+
+    def translate_error_cells(self):
+        cells = sorted(self.quality_problem_cells())
+        if not cells:
+            QMessageBox.information(self, self.tr("translate_error_cells"), self.tr("quality_check_no_cells"))
+            return
+        try:
+            source_column = self.headers.index(self.source_header)
+        except ValueError:
+            QMessageBox.warning(self, self.tr("translate_error_cells"), self.tr("source_column_missing", header=self.source_header))
+            return
+        rows = self.table_rows()
+        jobs = []
+        for row_index, column_index in cells:
+            if row_index >= len(rows) or not self.is_quality_target_column(column_index):
+                continue
+            row = rows[row_index]
+            source_text = row[source_column].strip() if source_column < len(row) else ""
+            target_code = language_code_for_header(self.headers[column_index])
+            if source_text and target_code:
+                jobs.append((row_index, column_index, source_text, target_code))
+        if not jobs:
+            QMessageBox.information(self, self.tr("translate_error_cells"), self.tr("quality_check_no_cells"))
+            return
+        self.run_translation_jobs(jobs, copy_overwrite=False, rule=RULE_SELECTION)
+
     def fail_translation(self, message):
         self._stop_retry_countdown()
         self.hide_translation_progress()
@@ -2699,6 +3193,13 @@ class DayzTranslateTool(QMainWindow):
         QMessageBox.critical(self, self.tr("translate_failed"), message)
 
     def cancel_translation(self):
+        # 同一个取消按钮兼管翻译和检查（两者不会同时跑）
+        if self.quality_check_worker is not None:
+            self.quality_check_worker.cancel()
+            self._quality_check_cancelled = True
+            self.statusBar().showMessage(self.tr("cancelling_check"), 3000)
+            self.translation_cancel_button.setEnabled(False)
+            return
         if self.translation_worker:
             self.translation_worker.cancel()
         self.statusBar().showMessage(self.tr("cancelling_translation"), 3000)
@@ -2734,6 +3235,7 @@ class DayzTranslateTool(QMainWindow):
                 event.ignore()
                 return
             self._ensure_translation_stopped()
+        self._ensure_quality_check_stopped()
         self._ensure_test_threads_stopped()
         if self.isVisible() and not self.confirm_unsaved_close():
             event.ignore()
@@ -2781,9 +3283,8 @@ class DayzTranslateTool(QMainWindow):
     def clear_search_highlight(self):
         for row_index in range(self.table.rowCount()):
             for column_index in range(self.table.columnCount()):
-                item = self.table.item(row_index, column_index)
-                if item:
-                    item.setBackground(QColor())
+                # 恢复该格本来的底色：问题格的错误标记色不能被清掉
+                self.restore_cell_background(row_index, column_index)
 
 
 def main():
