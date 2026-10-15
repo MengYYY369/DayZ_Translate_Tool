@@ -62,6 +62,7 @@ from translation_sources import (
 )
 from wordbook_csv import WORDBOOK_HEADERS, load_wordbook_csv, wordbook_rows_for_save, write_wordbook_csv
 from table_history import TableHistory, snapshot_table, restore_table
+from word_split import split_stuck_words
 
 
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
@@ -173,6 +174,9 @@ UI_TEXT = {
         "cut": "Cut",
         "delete_cell": "Delete Cell",
         "delete_selected_cells": "Delete Selected Cells",
+        "split_stuck_words": "Split Stuck Words",
+        "split_stuck_words_done": "Split {count} cells.",
+        "split_stuck_words_none": "No stuck words to split in the selected cells.",
         "delete_row": "Delete Row",
         "delete_column": "Delete Column",
         "reset_column_order": "Reset Column Order",
@@ -364,6 +368,9 @@ UI_TEXT = {
         "cut": "剪切",
         "delete_cell": "删除单元格",
         "delete_selected_cells": "删除选中单元格",
+        "split_stuck_words": "自动分词",
+        "split_stuck_words_done": "已拆分 {count} 个单元格。",
+        "split_stuck_words_none": "选中的单元格里没有需要拆分的词。",
         "delete_row": "删除行",
         "delete_column": "删除列",
         "reset_column_order": "重置列顺序",
@@ -2362,6 +2369,7 @@ class DayzTranslateTool(QMainWindow):
             "cut": self.cut_selection,
             "delete_cell": self.delete_cell_text,
             "delete_selected_cells": self.delete_selected_cells,
+            "split_stuck_words": self.split_selected_words,
             "delete_row": self.delete_rows,
             "delete_column": self.delete_column_cells,
             "reset_column_order": self.reset_column_order,
@@ -2415,6 +2423,10 @@ class DayzTranslateTool(QMainWindow):
         if translate_actions:
             actions.append("-")
             actions.extend(translate_actions)
+        # 右键落在具体行或列上就说明有选中内容，源语言列的格子可以就地拆词
+        if row >= 0 or column >= 0:
+            actions.append("-")
+            actions.append("split_stuck_words")
         return actions
 
     def selection_or_current(self, row, column):
@@ -2499,6 +2511,31 @@ class DayzTranslateTool(QMainWindow):
         self.table.blockSignals(False)
         self._record_history()
         self.set_dirty(True)
+
+    def split_selected_words(self):
+        try:
+            source_column = self.headers.index(self.source_header)
+        except ValueError:
+            QMessageBox.warning(self, self.tr("split_stuck_words"), self.tr("source_column_missing", header=self.source_header))
+            return
+        changed = 0
+        self.table.blockSignals(True)
+        for item in self.selected_cell_items():
+            if item.column() != source_column:
+                continue
+            text = item.text()
+            split_text = split_stuck_words(text)
+            if split_text == text:
+                continue
+            self.set_cell_text(item.row(), item.column(), split_text)
+            changed += 1
+        self.table.blockSignals(False)
+        if not changed:
+            self.statusBar().showMessage(self.tr("split_stuck_words_none"), 8000)
+            return
+        self._record_history()
+        self.set_dirty(True)
+        self.statusBar().showMessage(self.tr("split_stuck_words_done", count=changed), 8000)
 
     def delete_rows(self):
         rows, columns = self.selected_rows_and_columns()

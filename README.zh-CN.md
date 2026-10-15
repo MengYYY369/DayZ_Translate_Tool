@@ -20,10 +20,12 @@
 | **每个源都有测试按钮** | 点一下就用 4 种语言试翻一遍，直接把结果或者真实报错显示出来。 |
 | **重试与限速** | 失败会按指数退避重试，并尊重服务端给的 `Retry-After`；每个源的并发数和间隔单独设，不容易被限流限死。 |
 | **只重试失败的** | 一轮翻完以后，可以只重试失败的那些格子，不用整表重来。 |
+| **质量检查** | 27 条本地规则把译文扫一遍，把可疑的格子标出来：占位符丢了、数字对不上、标点用了全角、直接抄了原文、术语表里的词没用上…… 只标不改、不联网，可以只看问题格，也可以只重翻问题格。 |
 | **翻译缓存** | 翻过的内容会按源、原文、语言缓存下来，关掉软件再开也还在。 |
 | **术语表 / 单词本** | 你自己维护的 `wordbook.csv`，命中的词条会作为术语交给 AI 源，专有名词前后一致。 |
 | **从 `config.cpp` 导入键名** | 可以选一个或多个 `config.cpp`，也可以直接选文件夹，把表里还缺的键名批量找出来。 |
 | **表格编辑** | 撤销/重做、插入删除行列、清空格子、用一格填满整行、重置列顺序，还有支持全词匹配和区分大小写的查找。 |
+| **自动分词** | 源语言列里粘成一坨的英文（`AsaraShotGun`、`VirusHealerAngelBP`），选中后右键 → `自动分词`，就拆成 `Asara Shot Gun`、`Virus Healer Angel BP`。只有整格都是粘连词的才拆，`AK74`、`M4A1` 这种带数字的枪名原样不动。 |
 | **界面语言** | 中文和英文。 |
 
 ## 界面截图
@@ -146,7 +148,7 @@ powershell -ExecutionPolicy Bypass -File build_exe.ps1 -PythonPath "C:\Python313
 ## 开发
 
 ```bash
-python -m unittest discover -s tests     # 475 个测试，不需要联网
+python -m unittest discover -s tests     # 570 个测试，不需要联网
 ```
 
 | 文件 | 负责什么 |
@@ -161,6 +163,9 @@ python -m unittest discover -s tests     # 475 个测试，不需要联网
 | `translation_worker.py` | 在后台线程里跑翻译 |
 | `table_history.py` | 撤销/重做的快照 |
 | `translation_cache.py` | 缓存写盘 |
+| `quality_check.py` | 本地质量规则，把可疑的译文找出来 |
+| `quality_check_worker.py` | 在后台线程里跑质量检查 |
+| `word_split.py` | 把粘在一起的英文拆开 |
 
 `smoke_free_sources.py` 是个小脚本，可以在命令行里把六个免费源各戳一下，用来判断一个 `429` 到底是你的网络问题还是对方限流。
 

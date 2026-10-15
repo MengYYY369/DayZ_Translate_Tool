@@ -20,10 +20,12 @@ A desktop tool for translating DayZ mod localization. It opens a mod's `stringta
 | **Test button per source** | Fires a 4-language smoke test at that source and shows the results (or the real error) right away. |
 | **Retry & rate limits** | Failed requests are retried with exponential backoff, honouring `Retry-After`; each source has its own concurrency/interval so you don't get rate-limited into oblivion. |
 | **Retry failed only** | After a run, retry just the cells that failed instead of translating everything again. |
+| **Quality check** | 27 local rules scan the translations and flag the suspicious cells: a lost placeholder, a number that no longer matches, full-width punctuation, a cell that just copied the source, a glossary term that never made it in... It only flags, it never edits and never goes online. Filter the table down to the flagged cells and retranslate just those. |
 | **Translation cache** | Results are cached (by source, text and language) and survive restarts. |
 | **Glossary / wordbook** | A `wordbook.csv` you maintain yourself; matching entries are fed to the AI sources as terminology, so names stay consistent. |
 | **Import keys from `config.cpp`** | Point it at one or many `config.cpp` files (or a whole folder) and it pulls out the string keys your CSV is still missing. |
 | **Table editing** | Undo/redo, insert or delete rows/columns, delete cells, fill a whole row with one cell, reset column order, search with whole-word/case matching. |
+| **Word splitting** | English glued into one word in the source column (`AsaraShotGun`, `VirusHealerAngelBP`) can be split with right-click → `Split Stuck Words` into `Asara Shot Gun`, `Virus Healer Angel BP`. Only cells that are entirely glued words are touched; names carrying digits like `AK74` or `M4A1` are left alone. |
 | **Interface language** | English and 简体中文. |
 
 ## Screenshots
@@ -146,7 +148,7 @@ The script installs/uses PyInstaller, builds into `dist\DayZ_Translate_Tool\`, a
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 475 tests, no network access needed
+python -m unittest discover -s tests     # 570 tests, no network access needed
 ```
 
 | Module | Responsibility |
@@ -161,6 +163,9 @@ python -m unittest discover -s tests     # 475 tests, no network access needed
 | `translation_worker.py` | runs a translation in a background thread |
 | `table_history.py` | undo/redo snapshots |
 | `translation_cache.py` | on-disk cache |
+| `quality_check.py` | the local quality rules that flag suspicious translations |
+| `quality_check_worker.py` | runs a quality check in a background thread |
+| `word_split.py` | splitting glued-together English |
 
 `smoke_free_sources.py` is a small script that pings every free source once from the command line — handy to check whether a `429` is your network or the provider.
 

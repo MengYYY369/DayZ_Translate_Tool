@@ -409,6 +409,53 @@ class MainGuiTests(unittest.TestCase):
 
         self.assertIn("删除选中单元格", labels)
 
+    def test_context_menu_includes_split_stuck_words_for_all_contexts(self):
+        for context, row, column in [("cell", 0, 2), ("row_header", 0, -1), ("column_header", -1, 2)]:
+            with self.subTest(context=context):
+                actions = self.window.context_action_names(context=context, row=row, column=column)
+                self.assertIn("split_stuck_words", actions)
+
+    def test_split_selected_words_splits_source_column_only(self):
+        table = self.window.table
+        self.window.source_header = "english"
+        self.window.set_cell_text(0, 2, "AsaraShotGun")
+        self.window.set_cell_text(0, 3, "KaiHelmet")
+        self.window.set_cell_text(1, 2, "You found AlexPortrait")
+        table.clearSelection()
+        table.setRangeSelected(QTableWidgetSelectionRange(0, 2, 1, 3), True)
+        self.window.set_dirty(False)
+
+        self.window.split_selected_words()
+
+        self.assertEqual(table.item(0, 2).text(), "Asara Shot Gun")
+        self.assertEqual(table.item(0, 3).text(), "KaiHelmet")
+        self.assertEqual(table.item(1, 2).text(), "You found AlexPortrait")
+        self.assertTrue(self.window.is_dirty)
+
+    def test_split_selected_words_keeps_untouched_cells_clean(self):
+        table = self.window.table
+        self.window.set_cell_text(0, 2, "Bandage")
+        self.window.set_cell_text(1, 2, "Bandage")
+        table.clearSelection()
+        table.setRangeSelected(QTableWidgetSelectionRange(0, 2, 1, 2), True)
+        self.window.set_dirty(False)
+
+        with patch.object(self.window.statusBar(), "showMessage") as show_message:
+            self.window.split_selected_words()
+
+        show_message.assert_called()
+        self.assertEqual(table.item(0, 2).text(), "Bandage")
+        self.assertEqual(table.item(1, 2).text(), "Bandage")
+        self.assertFalse(self.window.is_dirty)
+
+    def test_split_stuck_words_chinese_label(self):
+        self.window.ui_language = "zh"
+        self.window.apply_ui_language()
+
+        labels = self.window.context_action_labels(context="cell", row=0, column=2)
+
+        self.assertIn("自动分词", labels)
+
     def test_fill_row_with_cell_fills_empty_cells_after_first_column(self):
         table = self.window.table
         self.window.set_cell_text(0, 0, "STR_KEY")
