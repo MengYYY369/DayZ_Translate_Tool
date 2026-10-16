@@ -1,5 +1,6 @@
 # DayZ Translate Tool
 
+[![release](https://img.shields.io/github/v/release/MengYYY369/DayZ_Translate_Tool?label=release&color=4c1)](https://github.com/MengYYY369/DayZ_Translate_Tool/releases)
 ![license](https://img.shields.io/badge/license-GPL--3.0-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-0078d4)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab)
