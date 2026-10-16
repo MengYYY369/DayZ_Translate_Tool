@@ -15,9 +15,14 @@ $Requirements = Join-Path $ProjectRoot "requirements.txt"
 $DistRoot = Join-Path $ProjectRoot "dist"
 $BuildRoot = Join-Path $ProjectRoot "build"
 $ExePath = Join-Path (Join-Path $DistRoot $AppName) "$AppName.exe"
+$AppIcon = Join-Path $ProjectRoot "assets\app.ico"
 
 if (-not (Test-Path -LiteralPath $EntryPoint)) {
     throw "Entry point not found: $EntryPoint"
+}
+
+if (-not (Test-Path -LiteralPath $AppIcon)) {
+    throw "Application icon not found: $AppIcon"
 }
 
 if (-not $PythonPath) {
@@ -52,6 +57,7 @@ $pyInstallerArgs = @(
     "--clean",
     "--windowed",
     "--name", $AppName,
+    "--icon", $AppIcon,
     "--distpath", $DistRoot,
     "--workpath", $BuildRoot,
     "--specpath", $BuildRoot,
