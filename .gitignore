@@ -17,6 +17,10 @@ translation_cache.json
 TODO.txt
 .trae/
 
+# 开发过程文档与本地工具索引（仅本地保留，不进公开仓库）
+docs/superpowers/
+.codegraph/
+
 # 调研报告里含第三方接口的公开密钥常量，不适合放进公开仓库
 docs/FluentRead_免费翻译源_移植报告.md
 
