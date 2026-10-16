@@ -1,0 +1,65 @@
+# 发布新版本时，往 Discord 频道推一条消息。
+#
+# 网址存在仓库密钥里（Settings → Secrets and variables → Actions → DISCORD_WEBHOOK），
+# 不写进这个文件 —— 仓库公开之后，写进来等于把发消息的权限公开了。
+#
+# 想补发某次没发成功的版本：Actions 页面手动跑一次这个工作流，
+# 它会自动找最新的已发布版本。
+name: Discord
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send the release to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$WEBHOOK" ]; then
+            echo "::error::仓库密钥 DISCORD_WEBHOOK 没有设置。"
+            exit 1
+          fi
+
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/$REPO/releases/latest" --jq .tag_name)
+          fi
+
+          gh api "repos/$REPO/releases/tags/$TAG" > release.json
+
+          jq -n --slurpfile rel release.json --arg repo "$REPO" '
+            ($rel[0]) as $r
+            | ($r.name // $r.tag_name) as $title
+            | ([$r.assets[] | select(.name | endswith(".zip"))][0].browser_download_url // "") as $zip
+            | {
+                username: "DayZ Translate Tool",
+                allowed_mentions: { parse: [] },
+                embeds: [{
+                  title: ($title + " is out"),
+                  url: $r.html_url,
+                  description: ($r.body // "" | .[0:3500]),
+                  color: 14721854,
+                  fields: (
+                    if $zip == "" then [] else
+                    [{ name: "Download", value: ("[DayZ_Translate_Tool.zip](" + $zip + ")") }]
+                    end
+                  ),
+                  footer: { text: $repo },
+                  timestamp: (now | todate)
+                }]
+              }
+          ' > payload.json
+
+          curl -fsS -H "Content-Type: application/json" -d @payload.json "$WEBHOOK"
